@@ -1,0 +1,40 @@
+# Optional overlay: run the whole bpb container behind Cloudflare WARP.
+#
+#   1) export the tunnel config from the WARP account the panel holds:
+#        docker run --rm -v "$PWD/data:/data" -v "$PWD/warp:/out" bpb-native:1.0.0 \
+#          --export-warp /out/wg0.conf --data /data --assets /assets
+#   2) docker compose -f docker-compose.warp.yml up -d --build
+services:
+  warp:
+    build:
+      context: .
+      dockerfile: warp.Dockerfile
+    image: bpb-warp:latest
+    container_name: bpb-warp
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      net.ipv4.conf.all.src_valid_mark: "1"
+    volumes:
+      - ./warp/wg0.conf:/etc/wireguard-in/wg0.conf:ro
+    ports:
+      - "8080:8080"
+    mem_limit: 32m
+
+  bpb:
+    image: bpb-native:1.0.0
+    container_name: bpb
+    restart: unless-stopped
+    depends_on:
+      - warp
+    network_mode: "service:warp"
+    volumes:
+      - bpb-data:/data
+      - ./warp-resolv.conf:/etc/resolv.conf:ro
+    mem_limit: 64m
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  bpb-data:

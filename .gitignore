@@ -1,0 +1,14 @@
+build/
+build-*/
+cmake-build-*/
+*.o
+*.obj
+*.exe
+bpb
+data/
+warp/
+*.conf
+!warp-resolv.conf
+tmpscripts/
+node_modules/
+*.log

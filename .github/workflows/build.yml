@@ -1,0 +1,143 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "发布 tag（所有架构构建成功后才创建），例如 v1.0.0"
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: linux-${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: arm64
+            platform: linux/arm64
+          - arch: armv7
+            platform: linux/arm/v7
+          - arch: "386"
+            platform: linux/386
+          - arch: riscv64
+            platform: linux/riscv64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        if: matrix.arch != 'amd64'
+        uses: docker/setup-qemu-action@v3
+
+      # 只产出二进制：alpine 镜像仅作为一次性编译环境，不构建也不发布容器镜像。
+      - name: Build static binary
+        run: |
+          mkdir -p dist
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v "$PWD:/src" -w /src alpine:3.22 sh -c '
+              set -e
+              apk add --no-cache g++ musl-dev openssl-dev openssl-libs-static \
+                      zlib-dev zlib-static >/dev/null
+              g++ -O2 -std=c++20 -static -ffunction-sections -fdata-sections \
+                  -Isrc -Ithird_party \
+                  src/*.cpp src/*/*.cpp third_party/qrcodegen.cpp \
+                  -o dist/bpb-linux-${{ matrix.arch }} -lssl -lcrypto -lz -lpthread
+              strip dist/bpb-linux-${{ matrix.arch }}
+            '
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bpb-linux-${{ matrix.arch }}
+          path: dist/bpb-linux-${{ matrix.arch }}
+          if-no-files-found: error
+
+  windows:
+    name: windows-x86_64
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (UCRT64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-zlib
+
+      - name: Configure and build
+        shell: msys2 {0}
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: Collect artifact
+        shell: msys2 {0}
+        run: |
+          mkdir -p dist
+          cp build/bpb.exe dist/bpb-windows-x86_64.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bpb-windows-x86_64
+          path: dist/bpb-windows-x86_64.exe
+          if-no-files-found: error
+
+  release:
+    name: release ${{ inputs.tag }}
+    # 仅手动触发，且必须所有构建（含全部架构）都成功。
+    if: github.event_name == 'workflow_dispatch' && success()
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Package
+        run: |
+          ls -l dist
+          cd dist
+          sha256sum bpb-linux-* bpb-windows-* > SHA256SUMS
+
+      - name: Create tag and GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/bpb-linux-amd64
+            dist/bpb-linux-arm64
+            dist/bpb-linux-armv7
+            dist/bpb-linux-386
+            dist/bpb-linux-riscv64
+            dist/bpb-windows-x86_64.exe
+            dist/SHA256SUMS

@@ -1,0 +1,3336 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BPB Panel v__VERSION__</title>
+    <link id="favicon" rel="icon" type="image/x-icon" href="data:image/x-icon;base64,__ICON__">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Ubuntu:ital,wght@0,300;0,400;0,500;0,700;1,300;1,400;1,500;1,700&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&icon_names=add_circle,autorenew,cancel,check_circle,clock_loader_40,close,cloud_download,cloud_upload,code_xml,content_copy,dashboard,data_usage,delete,dns,download,draft,error,fingerprint,help,info,key_vertical,keyboard_arrow_down,link,logout,open_in_new,qr_code,refresh,save,settings,settings_backup_restore,share,smart_toy,terminal,tune,upgrade,upload,verified,visibility,visibility_off&display=block" />
+    <link id="favicon" rel="icon" type="image/x-icon" href="data:image/x-icon;base64,__ICON__">
+    <style>
+        :root {
+    --color-bg-main: linear-gradient(90deg, #000328, #00458E);
+    --color-bg-card: rgba(15, 23, 42, 0.5);
+    --color-bg-input: #02061780;
+    --color-bg-modal: #08244b;
+    --color-bg-btn: #3b82f629;
+
+    --color-border-ui: #334155;
+    --color-border-accent: color-mix(in srgb, var(--color-brand-hover), transparent 79%);
+
+    --color-icon-green: #3fb950;
+    --color-icon-red: rgb(232, 20, 3);
+
+    --color-text-primary: #f1f5f9;
+    --color-text-secondary: #aec4e2;
+    --color-text-muted: #64748b;
+    --color-text-btn: #a5ccfc;
+
+    --color-brand-primary: #3b82f6;
+    --color-brand-hover: #60a5fa;
+    --color-brand-light-focus: rgba(147, 197, 253, 0.5);
+
+    --radius-card: 1.5rem;
+    --radius-ui: 0.75rem;
+    --radius-btn: 1rem;
+
+    --space-xs: 0.25rem;
+    --space-sm: 0.5rem;
+    --space-md: 0.85rem;
+    --space-lg: 1rem;
+    --space-xl: 1.5rem;
+
+    --font-size-xs: 0.75rem;
+    --font-size-sm: 0.875rem;
+    --font-size-base: 1rem;
+    --font-size-lg: 1.7rem;
+    --font-size-xlg: 2rem;
+
+    --line-height-xs: 1rem;
+    --line-height-sm: 1.25rem;
+    --line-height-lg: 2rem;
+
+    --shadow-header: 0.125rem 0.125rem 0.25rem #000328;
+    --shadow-icon: 0.125rem 0.125rem 0.2rem #000328;
+
+    --shadow-card: 0 4px 6px -1px rgba(0, 0, 0, 0.2), 0 20px 40px -15px rgba(0, 3, 40, 0.5), 0 35px 60px -15px rgba(0, 69, 142, 0.3);
+    --shadow-input: inset 0 2px 4px rgba(0, 0, 0, 0.3), 0 1px 2px rgba(255, 255, 255, 0.05);
+    --shadow-input-focus: 0 0 0 3px rgba(59, 130, 246, 0.4), 0 8px 20px -4px rgba(59, 130, 246, 0.3);
+
+    --transition-standard: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+body {
+    font-family: "Twemoji Country Flags", "Ubuntu", system-ui;
+    text-align: center;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background: var(--color-bg-main);
+}
+
+body.is-loading {
+    cursor: wait;
+}
+
+body.is-loading * {
+    /* eslint-disable-next-line css/no-important */
+    cursor: wait !important;
+    pointer-events: none;
+}
+
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+}
+
+h1 {
+    color: var(--color-text-primary);
+    text-shadow: var(--shadow-header);
+    display: flex;
+    justify-content: center;
+    gap: var(--space-sm);
+    font-size: var(--font-size-lg);
+    margin: 0;
+}
+
+.header {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: var(--space-xl) 0;
+    gap: var(--space-xl);
+}
+
+.header-title {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.panel-version {
+    align-self: flex-start;
+    font-size: large;
+}
+
+h2,
+h3 {
+    display: flex;
+    text-align: center;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    color: var(--color-text-primary);
+    text-shadow: var(--shadow-header);
+}
+
+h2 {
+    margin-top: 0;
+}
+
+h4 {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: var(--space-sm);
+    color: var(--color-text-primary);
+    margin: 0;
+    text-shadow: var(--shadow-header);
+}
+
+.dashboard-info {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    height: var(--line-height-lg);
+}
+
+.dashboard-action {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.dashboard-action span {
+    color: var(--color-text-secondary);
+    gap: var(--space-sm);
+}
+
+.dashboard-action .button {
+    width: 7rem;
+}
+
+.dashboard-info .material-symbols-rounded {
+    color: var(--color-brand-primary);
+    padding-right: var(--space-sm);
+}
+
+.dashboard-info span {
+    text-align: left;
+}
+
+.separator {
+    color: var(--color-brand-hover);
+}
+
+#total-usage,
+#panel-usage {
+    width: fit-content;
+    white-space: nowrap;
+}
+
+.header-container {
+    gap: 6px;
+    display: flex;
+    justify-content: center;
+}
+
+.header-container h3 {
+    display: flex;
+    justify-content: center;
+}
+
+.container {
+    display: flex;
+    flex-direction: column;
+    border-radius: var(--radius-card);
+    padding: var(--space-xl);
+    color: var(--color-text-primary);
+    background: color-mix(in srgb, var(--color-bg-card), #000328 8%);
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.04), 0 2px 6px rgba(0, 0, 0, 0.06), 0 12px 30px rgba(0, 0, 0, 0.08);
+}
+
+.section .container {
+    gap: var(--space-md);
+}
+
+.section.container h3 {
+    color: var(--color-text-secondary);
+    margin: 0;
+}
+
+.container>.section {
+    margin: 0;
+}
+
+.inner-container {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+    border-radius: var(--radius-ui);
+    padding: var(--space-xl);
+    background: color-mix(in srgb, var(--color-bg-card), #000328 15%);
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, .04), 0 2px 6px rgba(0, 0, 0, .06), 0 12px 30px rgba(0, 0, 0, .08);
+}
+
+.form-container {
+    max-width: 95%;
+    margin: 0 auto var(--space-xl) auto;
+    background-color: var(--color-bg-card);
+    border: 1px solid var(--color-border-accent);
+    border-radius: var(--radius-card);
+    padding: var(--space-xl);
+    box-shadow: var(--shadow-card);
+}
+
+.configForm {
+    display: flex;
+    flex-direction: column;
+}
+
+.section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+    margin: var(--space-md) 0;
+}
+
+.section.dashboard {
+    padding-bottom: var(--space-md);
+    border-bottom: 1px solid var(--color-border-accent);
+}
+
+.form-control {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.modal-form-control {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.form-control div {
+    display: flex;
+    flex: 1;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+}
+
+label {
+    display: block;
+}
+
+.form-control label,
+.modal-form-control label,
+.form-control>span {
+    color: var(--color-text-secondary);
+    align-items: center;
+    flex: 1;
+    text-align: left;
+    width: 100%;
+}
+
+div.checkbox-wrapper label {
+    color: var(--color-text-primary);
+    display: inline-block;
+    text-align: left;
+    font-weight: 400;
+    font-size: 100%;
+    white-space: nowrap;
+}
+
+.proto label {
+    width: unset;
+    flex: unset;
+}
+
+.material-symbols-rounded {
+    vertical-align: middle;
+    display: inline-block;
+    text-shadow: var(--shadow-icon);
+    transition: scale 200ms ease;
+    font-variation-settings:
+        'FILL' 0,
+        'wght' 400,
+        'GRAD' 0,
+        'opsz' 24
+}
+
+.value-container .material-symbols-rounded {
+    color: var(--color-brand-primary);
+    font-size: var(--font-size-lg);
+    cursor: pointer;
+}
+
+.material-symbols-rounded.cw-spinning {
+    animation: spin-cw 1s linear infinite;
+}
+
+.material-symbols-rounded.ccw-spinning {
+    animation: spin-ccw 1s linear infinite;
+}
+
+@keyframes spin-cw {
+    from {
+        transform: rotate(0deg);
+    }
+
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+@keyframes spin-ccw {
+    from {
+        transform: rotate(0deg);
+    }
+
+    to {
+        transform: rotate(-360deg);
+    }
+}
+
+table button span.material-symbols-rounded {
+    font-size: var(--font-size-lg);
+    margin: 0;
+    color: var(--color-brand-primary)
+}
+
+table td div span.material-symbols-rounded {
+    color: var(--color-brand-primary);
+}
+
+a {
+    color: var(--color-brand-primary);
+}
+
+a:hover {
+    color: var(--color-brand-hover);
+}
+
+a .material-symbols-rounded {
+    color: var(--color-brand-primary);
+}
+
+label>.material-symbols-rounded,
+span>.material-symbols-rounded {
+    color: var(--color-brand-primary);
+    cursor: pointer;
+    padding-left: var(--space-xs);
+    ;
+}
+
+label>.material-symbols-rounded:hover,
+span>.material-symbols-rounded:hover,
+a .material-symbols-rounded:hover,
+table button .material-symbols-rounded:hover,
+.svg-btn .material-symbols-rounded:hover,
+.refresh-geo-location .material-symbols-rounded:hover {
+    scale: 1.2;
+    color: var(--color-brand-hover);
+}
+
+a.url {
+    width: unset;
+    color: var(--color-brand-primary);
+    text-decoration: none;
+}
+
+.form-control.apply {
+    flex-wrap: wrap;
+    flex-direction: row;
+    padding: var(--space-xl) 0 0;
+    gap: var(--space-md);
+    justify-content: center;
+    flex: unset;
+}
+
+.select-wrapper {
+    display: flex;
+    position: relative;
+    flex: 1;
+    align-items: center;
+    width: 100%;
+}
+
+.select-wrapper span:last-child {
+    position: absolute;
+    right: 6px;
+    pointer-events: none;
+}
+
+.min-max span {
+    text-align: center;
+    white-space: pre;
+}
+
+.panel-settings span {
+    font-size: var(--font-size-xlg);
+}
+
+.github-container span {
+    font-size: var(--font-size-xlg);
+    color: white;
+}
+
+.refresh-geo-location {
+    background: none;
+    margin-bottom: 20px;
+    border: none;
+    cursor: pointer;
+    color: var(--color-brand-primary);
+}
+
+.show-hide {
+    position: absolute;
+    top: 50%;
+    right: 10px;
+    transform: translateY(-50%);
+    cursor: pointer;
+    -webkit-user-select: none;
+    -moz-user-select: none;
+    -ms-user-select: none;
+    /* eslint-disable-next-line css/use-baseline */
+    user-select: none;
+    color: var(--color-text-muted);
+    padding-left: 5px;
+    text-shadow: none;
+}
+
+div.checkbox-wrapper {
+    display: flex;
+    flex: 0 0 calc(50% - 8px);
+    gap: 8px;
+    align-items: center;
+    justify-content: flex-start;
+}
+
+div.checkbox-container {
+    display: flex;
+    justify-content: flex-start;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 16px;
+    width: 100%;
+}
+
+input[type="text"],
+input[type="number"],
+input[type="url"],
+input[type="password"],
+textarea,
+select {
+    width: 100%;
+    text-align: center;
+    padding: 10px;
+    line-height: 1.5;
+    background-color: var(--color-bg-input);
+    border: none;
+    border-radius: var(--radius-ui);
+    outline: none;
+    color: var(--color-text-primary);
+    font-size: var(--font-size-base);
+    font-family: inherit;
+    box-shadow: var(--shadow-input);
+    transition: var(--transition-standard);
+}
+
+input[type="text"]:focus,
+input[type="number"]:focus,
+input[type="url"]:focus,
+input[type="password"]:focus,
+textarea:focus,
+select:focus {
+    outline: none;
+    box-shadow: var(--shadow-input-focus);
+}
+
+input[type="text"]:read-only,
+input[type="number"]:read-only,
+input[type="url"]:read-only,
+textarea:read-only {
+    color: gray;
+    background-color: var(--color-bg-card);
+}
+
+textarea {
+    font-family: inherit;
+    /* eslint-disable-next-line css/use-baseline */
+    scrollbar-color: #ccc transparent;
+    /* eslint-disable-next-line css/use-baseline */
+    scrollbar-width: thin;
+    /* eslint-disable-next-line css/use-baseline */
+    resize: none;
+    max-height: calc(5lh + 10px);
+}
+
+select {
+    appearance: none;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+}
+
+.protocols {
+    flex-direction: row;
+    flex-wrap: wrap;
+}
+
+.proto {
+    gap: 8px;
+    display: flex;
+    align-items: center;
+    flex-direction: row;
+    justify-content: center;
+}
+
+.min-max {
+    flex: 1;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+}
+
+.min-max input {
+    width: 100%;
+}
+
+.ports-block th {
+    white-space: nowrap;
+    background-color: gray;
+}
+
+.ports-block td:first-child {
+    text-align: center;
+    font-size: larger;
+}
+
+.ports-block td:last-child {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr 1fr;
+}
+
+.button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    justify-self: center;
+    gap: 4px;
+    width: max-content;
+    white-space: nowrap;
+    padding: var(--space-md);
+    font-family: inherit;
+    font-size: var(--font-size-base);
+    font-weight: 500;
+    border: 1px solid var(--color-border-accent);
+    border-radius: var(--radius-btn);
+    color: var(--color-text-btn);
+    background: var(--color-bg-btn);
+    cursor: pointer;
+    outline: none;
+    box-shadow: 0 5px 10px rgba(0, 0, 0, 0.2);
+    transition: all 0.3s ease;
+}
+
+.button.delete {
+    color: rgb(246 104 92);
+    background: rgb(232 20 3 / 21%);
+    border: 1px solid rgb(232 20 3 / 26%);
+}
+
+.button .material-symbols-rounded {
+    text-shadow: none;
+    color: var(--color-brand-primary);
+}
+
+.button.delete .material-symbols-rounded {
+    text-shadow: none;
+    color: var(--color-icon-red);
+}
+
+.button:disabled {
+    background: none;
+    color: var(--color-text-muted);
+    border: 1px solid var(--color-text-muted);
+    cursor: not-allowed;
+    box-shadow: none;
+    pointer-events: none;
+}
+
+.button:disabled span,
+.button.delete:disabled span {
+    color: var(--color-text-muted);
+}
+
+.button:hover {
+    background-color: var(--color-brand-primary);
+    box-shadow: 0 8px 15px rgba(0, 0, 0, 0.3);
+    transform: translateY(-2px);
+    color: var(--color-text-primary);
+}
+
+.button.delete:hover {
+    background-color: var(--color-icon-red);
+    color: var(--color-text-primary);
+}
+
+.button:hover span,
+.button.delete:hover span {
+    color: var(--color-text-primary);
+}
+
+.button:active {
+    transform: translateY(1px);
+    box-shadow: 0 3px 7px rgba(0, 0, 0, 0.3);
+}
+
+table button,
+.svg-btn {
+    margin-top: auto;
+    margin-bottom: auto;
+    max-height: fit-content;
+    font-size: 16px;
+    font-weight: 600;
+    border: none;
+    background-color: unset;
+    cursor: pointer;
+    padding: 0;
+    transition: scale 200ms ease;
+}
+
+table button:active {
+    transform: translateY(1px);
+}
+
+.apply .button {
+    padding: var(--space-lg);
+}
+
+.panel-settings {
+    flex: unset;
+    border: none;
+    cursor: pointer;
+    width: fit-content;
+    margin: 0;
+    background: none;
+    color: var(--color-brand-primary);
+    transition: scale 200ms ease;
+}
+
+.panel-settings:hover {
+    scale: 1.2;
+    color: var(--color-brand-hover);
+}
+
+.panel-settings:disabled {
+    color: var(--color-text-muted);
+    cursor: default;
+}
+
+.accordion-item {
+    position: relative;
+    border-bottom: 1px solid var(--color-border-accent);
+}
+
+#subscriptions .accordion-item:last-child,
+#telegramForm .accordion-item:last-child {
+    border: none;
+}
+
+.help-icon {
+    position: absolute;
+    top: 1em;
+    right: 0;
+    display: inline-flex;
+    align-items: center;
+    z-index: 1;
+    text-decoration: none;
+}
+
+.help-icon span,
+.refresh-geo-location span {
+    font-size: var(--font-size-lg);
+}
+
+summary {
+    position: relative;
+    font-weight: bold;
+    cursor: pointer;
+    text-align: left;
+    white-space: nowrap;
+}
+
+/* eslint-disable-next-line css/use-baseline */
+summary::marker,
+summary::-webkit-details-marker {
+    font-size: 1.3rem;
+    color: var(--color-brand-primary);
+}
+
+summary:focus-visible {
+    outline: none;
+}
+
+summary h3 {
+    display: inline-flex;
+    align-items: center;
+    padding-left: var(--space-xs);
+    margin: 1em 0;
+}
+
+.footer-container {
+    overflow: visible;
+    display: flex;
+    justify-content: center;
+    gap: var(--space-xl);
+    margin-bottom: var(--space-xl);
+}
+
+.github-container {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    overflow: hidden;
+}
+
+.table-container {
+    margin-bottom: 20px;
+    border-radius: var(--radius-ui);
+    border: 1px solid var(--color-border-accent);
+    background: color-mix(in srgb, var(--color-bg-card), #000328 8%);
+    overflow-x: auto;
+}
+
+.add-noise,
+.delete-noise {
+    background: none;
+    margin: 0;
+    border: none;
+    cursor: pointer;
+    color: var(--color-brand-primary);
+    transition: scale 200ms ease;
+}
+
+.add-noise:hover,
+.delete-noise:hover {
+    scale: 1.2;
+    color: var(--color-brand-hover);
+}
+
+.table-container tbody {
+    display: flex;
+    flex-direction: column;
+}
+
+.table-container tr {
+    display: flex;
+    flex-direction: row;
+    padding: var(--space-lg);
+    gap: var(--space-sm);
+}
+
+table tr:not(:last-child) {
+    border-bottom: 1px solid var(--color-border-accent);
+}
+
+.table-container tr td:first-child {
+    white-space: nowrap;
+}
+
+.table-container tr td:nth-child(2) {
+    flex-direction: row;
+    gap: 8px;
+    width: fit-content;
+}
+
+.info-table {
+    border-radius: var(--radius-ui);
+    border: 1px solid var(--color-border-accent);
+    background: color-mix(in srgb, var(--color-bg-card), #000328 8%);
+    overflow-x: auto;
+    text-align: left;
+}
+
+.info-table th,
+.info-table td {
+    white-space: nowrap;
+    padding: 10px;
+    border-bottom: inherit;
+}
+
+.info-table th {
+    background-color: var(--color-bg-input);
+    color: var(--color-text-primary);
+    font-weight: 500;
+}
+
+.info-table td:first-child {
+    background-color: var(--color-bg-input);
+    color: var(--color-text-secondary);
+    font-weight: normal;
+}
+
+.info-table td:last-child {
+    display: flex;
+    justify-content: space-between;
+}
+
+.table-container th,
+.table-container td {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    width: 100%;
+    gap: 10px;
+}
+
+.table-container td div {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.table-container tr:hover {
+    background-color: var(--color-bg-input);
+}
+
+.modal {
+    position: fixed;
+    z-index: 1;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    overflow: auto;
+    background-color: rgba(0, 0, 0, 0.7);
+}
+
+.modal-content {
+    display: flex;
+    flex-direction: column;
+    gap: 1.2rem;
+    width: 90%;
+    text-align: center;
+    background-color: var(--color-bg-modal);
+    color: var(--color-text-primary);
+    margin: auto;
+    padding: 1.2rem;
+    border: 1px solid var(--color-border-accent);
+    border-radius: 1.2rem;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+}
+
+.qrcode {
+    width: 256px;
+    height: 256px;
+    border-radius: var(--radius-ui);
+}
+
+#qrModal>.modal-content {
+    width: fit-content;
+}
+
+.modal-header {
+    display: flex;
+    flex-direction: row;
+    position: relative;
+    align-items: center;
+    justify-content: flex-end;
+}
+
+.modal-title {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    font-weight: bold;
+    white-space: nowrap;
+    font-size: large;
+}
+
+.modal-close {
+    align-self: flex-end;
+    color: var(--color-text-primary);
+    float: right;
+}
+
+.modal-close:hover,
+.modal-close:focus {
+    color: var(--color-brand-primary);
+    text-decoration: none;
+    cursor: pointer;
+}
+
+#passwordError {
+    color: var(--color-icon-red);
+    margin-bottom: 10px;
+}
+
+.refresh-my-ip {
+    color: var(--color-brand-primary);
+}
+
+.udp-noise {
+    margin-bottom: 10px;
+}
+
+.password-wrapper {
+    position: relative;
+    width: 100%;
+}
+
+.password-error {
+    color: red;
+    margin-bottom: 10px;
+}
+
+.value-container {
+    color: var(--color-text-primary);
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+    align-items: center;
+    gap: 8px;
+}
+
+.output {
+    white-space: nowrap;
+}
+
+.output-container {
+    width: 100%;
+    padding: 12px;
+    text-align: center;
+    background-color: var(--color-bg-input);
+    border: 1px solid var(--color-border-accent);
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: var(--shadow-input);
+}
+
+.message-header {
+    display: flex;
+    flex-direction: row;
+    justify-content: space-between;
+    color: var(--color-text-primary);
+    border-bottom: 1px solid var(--color-border-accent);
+    padding-bottom: var(--space-md);
+}
+
+.message-heading {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 6px;
+}
+
+.message-title {
+    font-size: large;
+    font-weight: 500;
+}
+
+.message-icon {
+    color: orangered;
+}
+
+.message-close {
+    background: none;
+    border: none;
+    color: var(--color-text-primary);
+    cursor: pointer;
+}
+
+.message-body {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+}
+
+.message-text {
+    text-align: left;
+    line-height: 1.4rem;
+    margin: 0;
+    font-family: inherit;
+    font-size: var(--font-size-sm);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    overflow-x: hidden;
+}
+
+.message-buttons {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    justify-content: center;
+    gap: 1rem;
+}
+
+@media only screen and (min-width: 600px) {
+    .form-control {
+        flex-direction: row;
+    }
+
+    .message-card,
+    .modal-content {
+        width: 70%;
+    }
+}
+
+@media only screen and (min-width: 768px) {
+    .form-container {
+        max-width: calc(768px * 0.9);
+    }
+
+    .message-card,
+    .modal-content {
+        width: 50%;
+    }
+}
+
+@media only screen and (min-width: 1024px) {
+    .form-container {
+        max-width: 768px;
+    }
+
+    .message-card,
+    .modal-content {
+        width: 30%;
+    }
+}
+    </style>
+</head>
+
+<body>
+    <div class="header">
+        <div class="header-title">
+            <img id="header-logo" src="data:image/x-icon;base64,__ICON__" alt="BPB Logo" width="48" height="48">
+            <h1>
+                BPB Panel
+                <span class="panel-version">
+                    v__VERSION__
+                </span>
+            </h1>
+        </div>
+        <a class="link" id="github-link" href="https://github.com/bia-pain-bache/BPB-Worker-Panel" target="_blank">
+            <span>
+                <svg xmlns="http://www.w3.org/2000/svg" width="2rem" height="2rem" viewBox="0 0 24 24" fill="white">
+                    <path
+                        d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z" />
+                </svg>
+            </span>
+        </a>
+        <button type="button" id="logout" class="panel-settings" title="退出登录" onclick="logout(event)">
+            <span class="material-symbols-rounded">logout</span>
+        </button>
+    </div>
+
+    <div class="container form-container">
+
+        <h2><span class="material-symbols-rounded">dashboard</span>管理</h2>
+
+        <div class="container section">
+            <h3>
+                <span class="material-symbols-rounded">clock_loader_40</span>最近 24 小时请求</h3>
+            <div class="dashboard-info">
+                <span><span class="material-symbols-rounded">data_usage</span>BPB</span>
+                <span><b id="panel-usage"></b><span class="separator"> | </span><span id="panel-pct"></span>%</span>
+            </div>
+            <div class="dashboard-info">
+                <span><span class="material-symbols-rounded">data_usage</span>总计</span>
+                <span><b id="total-usage"></b><span class="separator"> | </span><span id="total-pct"></span>%</span>
+            </div>
+        </div>
+
+        <div class="accordion-item">
+            <details>
+                <summary>
+                    <h3>设置</h3>
+                </summary>
+                <div class="section">
+                    <div class="dashboard-action">
+                        <span>更新面板</span>
+                        <button id="updatePanel" class="button" onclick="updatePanel(this)" disabled>
+                            <span class="material-symbols-rounded">upgrade</span>更新</button>
+                    </div>
+                    <div class="dashboard-action">
+                        <span>重置密码</span>
+                        <button id="openResetPass" class="button" onclick="openResetPass(event)">
+                            <span class="material-symbols-rounded">key_vertical</span>重置</button>
+                    </div>
+                    <div class="dashboard-action">
+                        <span>删除面板</span>
+                        <button id="deletePanel" class="button delete" onclick="deletePanel(this)">
+                            <span class="material-symbols-rounded">delete</span>删除</button>
+                    </div>
+                </div>
+            </details>
+            <a class="help-icon" href="https://bia-pain-bache.github.io/BPB-Worker-Panel/configuration/admin-settings/"
+                target="_blank" title="帮助">
+                <span class="material-symbols-rounded">info</span>
+            </a>
+        </div>
+
+        <form id="telegramForm" class="configForm" onsubmit="setupTelegramBot(event)">
+            <div class="accordion-item">
+                <details>
+                    <summary>
+                        <h3>Telegram 机器人</h3>
+                    </summary>
+                    <div class="section">
+                        <div class="form-control">
+                            <label for="telegramBotToken">Telegram Bot Token</label>
+                            <div>
+                                <input type="text" id="telegramBotToken" name="telegramBotToken">
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="telegramUserId">Telegram 用户 ID</label>
+                            <div>
+                                <input type="text" id="telegramUserId" name="telegramUserId">
+                            </div>
+                        </div>
+                        <div id="apply" class="form-control apply">
+                            <button type="submit" id="setup-telegram" class="button" form="telegramForm" disabled>
+                                <span class="material-symbols-rounded">smart_toy</span>设置</button>
+                            <button type="button" id="remove-telegram" class="button delete"
+                                onclick="removeTelegramBot(this)" disabled>
+                                <span class="material-symbols-rounded">delete</span>移除</button>
+                        </div>
+                    </div>
+                </details>
+                <a class="help-icon"
+                    href="https://bia-pain-bache.github.io/BPB-Worker-Panel/configuration/telegram-bot/" target="_blank"
+                    title="帮助">
+                    <span class="material-symbols-rounded">info</span>
+                </a>
+            </div>
+        </form>
+
+    </div>
+
+    <div class="form-container container">
+        <h2><span class="material-symbols-rounded">settings</span>代理设置</h2>
+        <form id="configForm" class="configForm" onsubmit="updateSettings(event)">
+
+            <div class="accordion-item">
+                <details>
+                    <summary>
+                        <h3>通用</h3>
+                    </summary>
+                    <div class="section">
+                        <div class="form-control">
+                            <label for="localDNS">本地 DNS</label>
+                            <div>
+                                <input type="text" id="localDNS" name="localDNS" required>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="antiSanctionDNS">反制裁 DNS</label>
+                            <div>
+                                <input type="text" id="antiSanctionDNS" name="antiSanctionDNS" required>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="fakeDNS">Fake DNS</label>
+                            <div class="select-wrapper">
+                                <select id="fakeDNS" name="fakeDNS">
+                                    <option value="true">启用</option>
+                                    <option value="false">禁用</option>
+                                </select>
+                                <span class="material-symbols-rounded">
+                                    keyboard_arrow_down
+                                </span>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="enableIPv6">IPv6</label>
+                            <div class="select-wrapper">
+                                <select id="enableIPv6" name="enableIPv6">
+                                    <option value="true">启用</option>
+                                    <option value="false">禁用</option>
+                                </select>
+                                <span class="material-symbols-rounded">
+                                    keyboard_arrow_down
+                                </span>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="allowLANConnection">允许局域网连接</label>
+                            <div class="select-wrapper">
+                                <select id="allowLANConnection" name="allowLANConnection">
+                                    <option value="true">启用</option>
+                                    <option value="false">禁用</option>
+                                </select>
+                                <span class="material-symbols-rounded">
+                                    keyboard_arrow_down
+                                </span>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="logLevel">日志级别</label>
+                            <div class="select-wrapper">
+                                <select id="logLevel" name="logLevel">
+                                    <option value="none">禁用</option>
+                                    <option value="warning">警告</option>
+                                    <option value="error">错误</option>
+                                    <option value="info">信息</option>
+                                    <option value="debug">调试</option>
+                                </select>
+                                <span class="material-symbols-rounded">
+                                    keyboard_arrow_down
+                                </span>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="customDomain">自定义域名</label>
+                            <div>
+                                <input type="text" id="customDomain" name="customDomain">
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="dohUrl">底层 DoH</label>
+                            <div>
+                                <input type="text" id="dohUrl" name="dohUrl">
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="securePath">面板 / 订阅路径<span class="material-symbols-rounded"
+                                    onclick="randPath()">refresh</span>
+                            </label>
+                            <div>
+                                <input type="text" id="securePath" name="securePath" required>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="fallback">回退域名</label>
+                            <div>
+                                <input type="text" id="fallback" name="fallback">
+                            </div>
+                        </div>
+                    </div>
+                </details>
+                <a class="help-icon" href="https://bia-pain-bache.github.io/BPB-Worker-Panel/configuration/common/"
+                    target="_blank" title="帮助">
+                    <span class="material-symbols-rounded">info</span>
+                </a>
+            </div>
+
+            <div class="accordion-item">
+                <details>
+                    <summary>
+                        <h3>VLESS / Trojan</h3>
+                    </summary>
+                    <div class="section">
+                        <div class="form-control">
+                            <label for="protocols">协议</label>
+                            <div class="select-wrapper">
+                                <select id="protocols" name="protocols">
+                                    <option value="vless,trojan">VLESS 与 Trojan</option>
+                                    <option value="vless">VLESS</option>
+                                    <option value="trojan">Trojan</option>
+                                </select>
+                                <span class="material-symbols-rounded">
+                                    keyboard_arrow_down
+                                </span>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="vlUUID">VLESS UUID<span class="material-symbols-rounded" onclick="randUUID()">refresh</span>
+                            </label>
+                            <div>
+                                <input type="text" id="vlUUID" name="vlUUID" required>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="trPass">Trojan 密码<span class="material-symbols-rounded"
+                                    onclick="randPassword()">refresh</span>
+                            </label>
+                            <div>
+                                <input type="text" id="trPass" name="trPass" required>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="remoteDNS">远程 DNS</label>
+                            <div>
+                                <input type="text" id="remoteDNS" name="remoteDNS" required>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="upstreamProxy">上游 TCP 代理</label>
+                            <div>
+                                <input type="text" id="upstreamProxy" name="upstreamProxy">
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="chainProxy">链式代理</label>
+                            <div>
+                                <input type="text" id="chainProxy" name="chainProxy">
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="cleanIPs">干净 IP / 域名<a class="url"
+                                    href="https://github.com/bia-pain-bache/Cloudflare-Clean-IP-Scanner" title="扫码"
+                                    target="_blank" rel="noopener noreferrer">
+                                    <span class="material-symbols-rounded">open_in_new</span>
+                                </a>
+                            </label>
+                            <div>
+                                <textarea id="cleanIPs" name="cleanIPs" rows="1"></textarea>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <span>TLS 端口</span>
+                            <div>
+                                <div id="tls-ports" class="checkbox-container inner-container"></div>
+                            </div>
+                        </div>
+                        <div id="none-tls" class="form-control" style="display: none;">
+                            <span>非 TLS 端口</span>
+                            <div>
+                                <div id="non-tls-ports" class="checkbox-container inner-container"></div>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="fingerprint">指纹</label>
+                            <div class="select-wrapper">
+                                <select id="fingerprint" name="fingerprint">
+                                    <option value="chrome">chrome</option>
+                                    <option value="firefox">firefox</option>
+                                    <option value="safari">safari</option>
+                                    <option value="ios">ios</option>
+                                    <option value="android">android</option>
+                                    <option value="edge">edge</option>
+                                    <option value="360">360</option>
+                                    <option value="qq">qq</option>
+                                    <option value="random">random</option>
+                                    <option value="randomized">randomized</option>
+                                </select>
+                                <span class="material-symbols-rounded">
+                                    keyboard_arrow_down
+                                </span>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="bestPingInterval">最优延迟测速间隔</label>
+                            <div>
+                                <input type="number" id="bestPingInterval" name="bestPingInterval" min="10" max="90">
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="enableTFO">TCP Fast Open</label>
+                            <div class="select-wrapper">
+                                <select id="enableTFO" name="enableTFO">
+                                    <option value="true">启用</option>
+                                    <option value="false">禁用</option>
+                                </select>
+                                <span class="material-symbols-rounded">
+                                    keyboard_arrow_down
+                                </span>
+                            </div>
+                        </div>
+                        <div class="container">
+                            <div class="section">
+                                <h4><span class="material-symbols-rounded">tune</span>代理 IP</h4>
+                                <div class="form-control">
+                                    <label for="proxyIpMode">模式</label>
+                                    <div class="select-wrapper">
+                                        <select id="proxyIpMode" name="proxyIpMode">
+                                            <option value="proxyip">代理 IP</option>
+                                            <option value="prefix">NAT64</option>
+                                        </select>
+                                        <span class="material-symbols-rounded">
+                                            keyboard_arrow_down
+                                        </span>
+                                    </div>
+                                </div>
+                                <div class="form-control">
+                                    <label for="proxyIPs">代理 IP / 域名<a class="url" href="./proxy-ip" title="代理 IP"
+                                            target="_blank" rel="noopener noreferrer">
+                                            <span class="material-symbols-rounded">open_in_new</span>
+                                        </a>
+                                    </label>
+                                    <div>
+                                        <textarea id="proxyIPs" name="proxyIPs" rows="1"></textarea>
+                                    </div>
+                                </div>
+                                <div class="form-control">
+                                    <label for="prefixes">NAT64 前缀<a class="url"
+                                            href="https://github.com/bia-pain-bache/BPB-Worker-Panel/blob/main/docs/NAT64Prefixes.md"
+                                            title="NAT64 prefixes" target="_blank" rel="noopener noreferrer">
+                                            <span class="material-symbols-rounded">open_in_new</span>
+                                        </a>
+                                    </label>
+                                    <div>
+                                        <textarea id="prefixes" name="prefixes" rows="1"></textarea>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="container">
+                            <div class="section">
+                                <h4><span class="material-symbols-rounded">tune</span>ECH</h4>
+                                <div class="form-control">
+                                    <label for="enableECH">ECH</label>
+                                    <div class="select-wrapper">
+                                        <select id="enableECH" name="enableECH">
+                                            <option value="true">启用</option>
+                                            <option value="false">禁用</option>
+                                        </select>
+                                        <span class="material-symbols-rounded">
+                                            keyboard_arrow_down
+                                        </span>
+                                    </div>
+                                </div>
+                                <div class="form-control">
+                                    <label for="echServerName">ECH 服务器名称</label>
+                                    <div>
+                                        <input type="text" id="echServerName" name="echServerName">
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="container">
+                            <div class="section">
+                                <h4><span class="material-symbols-rounded">tune</span>自定义 CDN</h4>
+                                <div class="form-control">
+                                    <label for="customCdnAddrs">地址</label>
+                                    <div>
+                                        <textarea id="customCdnAddrs" name="customCdnAddrs" rows="1"></textarea>
+                                    </div>
+                                </div>
+                                <div class="form-control">
+                                    <label for="customCdnHost">主机</label>
+                                    <div>
+                                        <input type="text" id="customCdnHost" name="customCdnHost">
+                                    </div>
+                                </div>
+                                <div class="form-control">
+                                    <label for="customCdnSni">SNI</label>
+                                    <div>
+                                        <input type="text" id="customCdnSni" name="customCdnSni">
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </details>
+                <a class="help-icon"
+                    href="https://bia-pain-bache.github.io/BPB-Worker-Panel/configuration/vless-trojan/" target="_blank"
+                    title="帮助">
+                    <span class="material-symbols-rounded">info</span>
+                </a>
+            </div>
+
+            <div class="accordion-item">
+                <details>
+                    <summary>
+                        <h3>Xray 分片</h3>
+                    </summary>
+                    <div class="section">
+                        <div class="form-control">
+                            <label for="fragmentMode">模式</label>
+                            <div class="select-wrapper">
+                                <select id="fragmentMode" name="fragmentMode" onchange="handleFragmentMode()">
+                                    <option value="custom">自定义</option>
+                                    <option value="low">低</option>
+                                    <option value="medium">中</option>
+                                    <option value="high">高</option>
+                                    <option value="severe">严重</option>
+                                </select>
+                                <span class="material-symbols-rounded">
+                                    keyboard_arrow_down
+                                </span>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="fragmentPackets">分片包类型</label>
+                            <div class="select-wrapper">
+                                <select id="fragmentPackets" name="fragmentPackets">
+                                    <option value="tlshello">tlshello</option>
+                                    <option value="1-1">1-1</option>
+                                    <option value="1-2">1-2</option>
+                                    <option value="1-3">1-3</option>
+                                    <option value="1-5">1-5</option>
+                                </select>
+                                <span class="material-symbols-rounded">
+                                    keyboard_arrow_down
+                                </span>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="fragmentLengthMin">长度</label>
+                            <div class="min-max">
+                                <input type="number" id="fragmentLengthMin" name="fragmentLengthMin" min="1" required>
+                                <span>-</span>
+                                <input type="number" id="fragmentLengthMax" name="fragmentLengthMax" max="500" required>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="fragmentDelayMin">延迟</label>
+                            <div class="min-max">
+                                <input type="number" id="fragmentDelayMin" name="fragmentDelayMin" min="1" max="30"
+                                    required>
+                                <span>-</span>
+                                <input type="number" id="fragmentDelayMax" name="fragmentDelayMax" min="1" max="30"
+                                    required>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="fragmentMaxSplitMin">最大分片</label>
+                            <div class="min-max">
+                                <input type="number" id="fragmentMaxSplitMin" name="fragmentMaxSplitMin" min="2">
+                                <span>-</span>
+                                <input type="number" id="fragmentMaxSplitMax" name="fragmentMaxSplitMax" min="2">
+                            </div>
+                        </div>
+                    </div>
+                </details>
+                <a class="help-icon" href="https://bia-pain-bache.github.io/BPB-Worker-Panel/configuration/fragment/"
+                    target="_blank" title="帮助">
+                    <span class="material-symbols-rounded">info</span>
+                </a>
+            </div>
+
+            <div class="accordion-item">
+                <details>
+                    <summary>
+                        <h3>外部原始配置</h3>
+                    </summary>
+                    <div class="section">
+                        <div class="form-control">
+                            <label for="customSubs">订阅</label>
+                            <div>
+                                <textarea id="customSubs" name="customSubs" rows="1" wrap="off"></textarea>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="customConfigs">单条配置</label>
+                            <div>
+                                <textarea id="customConfigs" name="customConfigs" rows="1" wrap="off"></textarea>
+                            </div>
+                        </div>
+                    </div>
+                </details>
+                <a class="help-icon"
+                    href="https://bia-pain-bache.github.io/BPB-Worker-Panel/configuration/external-configs/"
+                    target="_blank" title="帮助">
+                    <span class="material-symbols-rounded">info</span>
+                </a>
+            </div>
+
+            <div class="accordion-item">
+                <details>
+                    <summary>
+                        <h3>Warp 通用</h3>
+                    </summary>
+                    <div class="section">
+                        <div class="form-control">
+                            <label for="warpRemoteDNS">远程 DNS</label>
+                            <div>
+                                <input type="text" id="warpRemoteDNS" name="warpRemoteDNS" required>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="warpEndpoints">接入点<a class="url" href="https://github.com/bia-pain-bache/BPB-Warp-Scanner"
+                                    title="扫码" target="_blank" rel="noopener noreferrer">
+                                    <span class="material-symbols-rounded">open_in_new</span>
+                                </a>
+                            </label>
+                            <div>
+                                <textarea id="warpEndpoints" name="warpEndpoints" rows="1" required></textarea>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="warpBestPingInterval">最优延迟测速间隔</label>
+                            <div>
+                                <input type="number" id="warpBestPingInterval" name="warpBestPingInterval" min="10"
+                                    max="90">
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="warpReservedBytes">保留字节</label>
+                            <div class="select-wrapper">
+                                <select id="warpReservedBytes" name="warpReservedBytes">
+                                    <option value="true">启用</option>
+                                    <option value="false">禁用</option>
+                                </select>
+                                <span class="material-symbols-rounded">
+                                    keyboard_arrow_down
+                                </span>
+                            </div>
+                        </div>
+                        <div class="dashboard-action">
+                            <span>重新获取 Warp 账号</span>
+                            <button type="button" class="button" onclick="renewWarpAccounts(this)">
+                                <span id="warp-update" class="material-symbols-rounded">autorenew</span>续期</button>
+                        </div>
+                    </div>
+                </details>
+                <a class="help-icon" href="https://bia-pain-bache.github.io/BPB-Worker-Panel/configuration/warp/"
+                    target="_blank" title="帮助">
+                    <span class="material-symbols-rounded">info</span>
+                </a>
+            </div>
+
+            <div class="accordion-item">
+                <details>
+                    <summary>
+                        <h3>Warp PRO</h3>
+                    </summary>
+                    <div class="section">
+                        <div class="container">
+                            <div class="section">
+                                <h4><span class="material-symbols-rounded">tune</span>MahsaNG 噪声</h4>
+                                <div class="form-control">
+                                    <label for="knockerNoiseMode">模式</label>
+                                    <div>
+                                        <input type="text" id="knockerNoiseMode" name="knockerNoiseMode"
+                                            title="Fill in 'none', 'quic', 'random', or any HEX string like 'ee0000000108aaaa'"
+                                            required>
+                                    </div>
+                                </div>
+                                <div class="form-control">
+                                    <label for="knockerNoiseCountMin">数量</label>
+                                    <div class="min-max">
+                                        <input type="number" id="knockerNoiseCountMin" name="knockerNoiseCountMin"
+                                            min="1" required>
+                                        <span>-</span>
+                                        <input type="number" id="knockerNoiseCountMax" name="knockerNoiseCountMax"
+                                            min="1" required>
+                                    </div>
+                                </div>
+                                <div class="form-control">
+                                    <label for="knockerNoiseSizeMin">大小</label>
+                                    <div class="min-max">
+                                        <input type="number" id="knockerNoiseSizeMin" name="knockerNoiseSizeMin" min="1"
+                                            required>
+                                        <span>-</span>
+                                        <input type="number" id="knockerNoiseSizeMax" name="knockerNoiseSizeMax" min="1"
+                                            required>
+                                    </div>
+                                </div>
+                                <div class="form-control">
+                                    <label for="knockerNoiseDelayMin">延迟</label>
+                                    <div class="min-max">
+                                        <input type="number" id="knockerNoiseDelayMin" name="knockerNoiseDelayMin"
+                                            min="1" required>
+                                        <span>-</span>
+                                        <input type="number" id="knockerNoiseDelayMax" name="knockerNoiseDelayMax"
+                                            min="1" required>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="container">
+                            <div class="section">
+                                <h4><span class="material-symbols-rounded">tune</span>Clash - Amnezia 噪声</h4>
+                                <div class="form-control">
+                                    <label for="amneziaNoiseCount">数量</label>
+                                    <div>
+                                        <input type="number" id="amneziaNoiseCount" name="amneziaNoiseCount" min="1"
+                                            required>
+                                    </div>
+                                </div>
+                                <div class="form-control">
+                                    <label for="amneziaNoiseSizeMin">大小</label>
+                                    <div class="min-max">
+                                        <input type="number" id="amneziaNoiseSizeMin" name="amneziaNoiseSizeMin" min="1"
+                                            required>
+                                        <span>-</span>
+                                        <input type="number" id="amneziaNoiseSizeMax" name="amneziaNoiseSizeMax" min="1"
+                                            required>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div id="udp-noise-container" class="container">
+                            <div class="header-container">
+                                <h4><span class="material-symbols-rounded">tune</span>v2ray 噪声</h4>
+                                <button type="button" class="add-noise" onclick="addNoise(true)">
+                                    <span class="material-symbols-rounded">add_circle</span>
+                                </button>
+                            </div>
+                            <div id="noises" class="section"></div>
+                        </div>
+                    </div>
+                </details>
+                <a class="help-icon" href="https://bia-pain-bache.github.io/BPB-Worker-Panel/configuration/warp-pro/"
+                    target="_blank" title="帮助">
+                    <span class="material-symbols-rounded">info</span>
+                </a>
+            </div>
+
+            <div class="accordion-item">
+                <details>
+                    <summary>
+                        <h3>分流规则</h3>
+                    </summary>
+                    <div class="section">
+                        <div class="container">
+                            <h4><span class="material-symbols-rounded">tune</span>预设规则</h4>
+                            <div class="form-control">
+                                <span>绕过规则</span>
+                                <div>
+                                    <div id="bypass-rules" class="checkbox-container inner-container">
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="bypassIran" name="bypassIran" value="true">
+                                            <label for="bypassIran">伊朗</label>
+                                        </div>
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="bypassChina" name="bypassChina" value="true">
+                                            <label for="bypassChina">中国</label>
+                                        </div>
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="bypassRussia" name="bypassRussia" value="true">
+                                            <label for="bypassRussia">俄罗斯</label>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="form-control">
+                                <span>屏蔽规则</span>
+                                <div>
+                                    <div id="block-rules" class="checkbox-container inner-container">
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="blockAds" name="blockAds" value="true">
+                                            <label for="blockAds">广告</label>
+                                        </div>
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="blockPorn" name="blockPorn" value="true">
+                                            <label for="blockPorn">色情</label>
+                                        </div>
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="blockUDP443" name="blockUDP443" value="true">
+                                            <label for="blockUDP443">QUIC</label>
+                                        </div>
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="blockMalware" name="blockMalware" value="true"
+                                                onchange="handleRiskyRules(event)">
+                                            <label for="blockMalware">恶意软件</label>
+                                        </div>
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="blockPhishing" name="blockPhishing" value="true"
+                                                onchange="handleRiskyRules(event)">
+                                            <label for="blockPhishing">钓鱼</label>
+                                        </div>
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="blockCryptominers" name="blockCryptominers"
+                                                value="true" onchange="handleRiskyRules(event)">
+                                            <label for="blockCryptominers">挖矿</label>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="container">
+                            <h4><span class="material-symbols-rounded">tune</span>自定义规则</h4>
+                            <div class="form-control">
+                                <label for="customBypassRules">绕过 IP / 域名</label>
+                                <div>
+                                    <textarea id="customBypassRules" name="customBypassRules" rows="1"></textarea>
+                                </div>
+                            </div>
+                            <div class="form-control">
+                                <label for="customBlockRules">屏蔽 IP / 域名</label>
+                                <div>
+                                    <textarea id="customBlockRules" name="customBlockRules" rows="1"></textarea>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="container">
+                            <h4><span class="material-symbols-rounded">tune</span>制裁规则</h4>
+                            <div class="form-control">
+                                <span>绕过规则</span>
+                                <div>
+                                    <div id="bypass-sanction-rules" class="checkbox-container inner-container">
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="bypassOpenAi" name="bypassOpenAi" value="true">
+                                            <label for="bypassOpenAi">ChatGPT</label>
+                                        </div>
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="bypassGoogleAi" name="bypassGoogleAi"
+                                                value="true">
+                                            <label for="bypassGoogleAi">Google AI</label>
+                                        </div>
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="bypassMicrosoft" name="bypassMicrosoft"
+                                                value="true">
+                                            <label for="bypassMicrosoft">Microsoft</label>
+                                        </div>
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="bypassOracle" name="bypassOracle" value="true">
+                                            <label for="bypassOracle">Oracle</label>
+                                        </div>
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="bypassDocker" name="bypassDocker" value="true">
+                                            <label for="bypassDocker">Docker</label>
+                                        </div>
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="bypassAdobe" name="bypassAdobe" value="true">
+                                            <label for="bypassAdobe">Adobe</label>
+                                        </div>
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="bypassEpicGames" name="bypassEpicGames"
+                                                value="true">
+                                            <label for="bypassEpicGames">Epic Games</label>
+                                        </div>
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="bypassIntel" name="bypassIntel" value="true">
+                                            <label for="bypassIntel">Intel</label>
+                                        </div>
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="bypassAmd" name="bypassAmd" value="true">
+                                            <label for="bypassAmd">AMD</label>
+                                        </div>
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="bypassNvidia" name="bypassNvidia" value="true">
+                                            <label for="bypassNvidia">Nvidia</label>
+                                        </div>
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="bypassAsus" name="bypassAsus" value="true">
+                                            <label for="bypassAsus">Asus</label>
+                                        </div>
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="bypassHp" name="bypassHp" value="true">
+                                            <label for="bypassHp">HP</label>
+                                        </div>
+                                        <div class="checkbox-wrapper">
+                                            <input type="checkbox" id="bypassLenovo" name="bypassLenovo" value="true">
+                                            <label for="bypassLenovo">Lenovo</label>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="form-control">
+                                <label for="customBypassSanctionRules">绕过域名</label>
+                                <div>
+                                    <textarea id="customBypassSanctionRules" name="customBypassSanctionRules"
+                                        rows="1"></textarea>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </details>
+                <a class="help-icon"
+                    href="https://bia-pain-bache.github.io/BPB-Worker-Panel/configuration/routing-rules/"
+                    target="_blank" title="帮助">
+                    <span class="material-symbols-rounded">info</span>
+                </a>
+            </div>
+
+            <div class="accordion-item">
+                <details>
+                    <summary>
+                        <h3>导入 / 导出</h3>
+                    </summary>
+                    <div class="section">
+
+                        <div class="container">
+                            <h4><span class="material-symbols-rounded">link</span>远程设置</h4>
+                            <div class="form-control">
+                                <label for="remoteSettings">远程地址</label>
+                                <div>
+                                    <input type="text" id="remoteSettings" name="remoteSettings">
+                                </div>
+                            </div>
+                            <div class="dashboard-action">
+                                <span>从远程导入</span>
+                                <button type="button" id="fetchSettingsBtn" class="button"
+                                    onclick="importRemoteSettings(event)">
+                                    <span class="material-symbols-rounded">cloud_download</span>导入</button>
+                            </div>
+                            <div class="dashboard-action">
+                                <span>分享你的配置</span>
+                                <button type="button" class="button" onclick="shareSettings()">
+                                    <span class="material-symbols-rounded">share</span>分享</button>
+                            </div>
+                        </div>
+
+                        <div class="container">
+                            <h4><span class="material-symbols-rounded">draft</span>文件设置</h4>
+                            <div class="dashboard-action">
+                                <span>导入文件</span>
+                                <button type="button" class="button" onclick="importFile()">
+                                    <span class="material-symbols-rounded">upload</span>
+                                    <input type="file" id="fileInput" accept=".dat" style="display: none;"
+                                        onchange="importFileSettings(event)" />导入</button>
+                            </div>
+                            <div class="dashboard-action">
+                                <span>导出文件</span>
+                                <button type="button" class="button" onclick="exportFileSettings(event)">
+                                    <span class="material-symbols-rounded">download</span>导出</button>
+                            </div>
+                        </div>
+                    </div>
+                </details>
+                <a class="help-icon"
+                    href="https://bia-pain-bache.github.io/BPB-Worker-Panel/configuration/import-export/"
+                    target="_blank" title="帮助">
+                    <span class="material-symbols-rounded">info</span>
+                </a>
+            </div>
+
+            <div id="apply" class="form-control apply">
+                <button type="submit" id="applyButton" class="button disabled" form="configForm">
+                    <span class="material-symbols-rounded">
+                        check_circle
+                    </span>应用</button>
+                <button type="button" class="panel-settings" title="Reset panel settings to default"
+                    onclick="resetSettings(this)">
+                    <span class="material-symbols-rounded">
+                        settings_backup_restore
+                    </span>
+                </button>
+            </div>
+
+        </form>
+    </div>
+
+    <div id="subscriptions" class="form-container container">
+        <h2><span class="material-symbols-rounded">link</span>订阅</h2>
+    </div>
+
+    <div class="form-container container">
+        <h2><span class="material-symbols-rounded">dns</span>DNS over HTTPS</h2>
+        <div class="value-container">
+            <div class="output-container">
+                <span id="doh" class="output"></span>
+            </div>
+            <button class="svg-btn" onclick="copyDoh()">
+                <span class="material-symbols-rounded">
+                    content_copy
+                </span>
+            </button>
+        </div>
+    </div>
+
+    <template id="message-template">
+        <div class="modal" hidden>
+            <div class="modal-content">
+                <div class="message-header">
+                    <div class="message-heading">
+                        <span class="material-symbols-rounded message-icon"></span>
+                        <span class="message-title"></span>
+                    </div>
+                    <span class="material-symbols-rounded modal-close">
+                        close
+                    </span>
+                </div>
+                <div class="message-body">
+                    <pre class="message-text"></pre>
+                    <div class="message-buttons">
+                        <button class="button message-ok-btn">
+                            <span class="material-symbols-rounded">
+                                check_circle
+                            </span>
+                            Ok
+                        </button>
+                        <button class="button message-cancel-btn">
+                            <span class="material-symbols-rounded">
+                                cancel
+                            </span>取消</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </template>
+
+    <div class="form-container container">
+
+        <div id="resetPassModal" class="modal" hidden>
+            <div class="modal-content">
+                <div class="modal-header">
+                    <span class="modal-title">重置密码</span>
+                    <span id="closeResetPass" class="material-symbols-rounded modal-close">
+                        close
+                    </span>
+                </div>
+                <form class="config-form">
+                    <div class="section">
+                        <div id="usernameContainer" class="modal-form-control" style="display: none;">
+                            <label for="username">Cloudflare 账号邮箱</label>
+                            <input type="text" id="username" name="username" autocomplete="on">
+                        </div>
+                        <div class="modal-form-control">
+                            <label for="newPassword">新密码</label>
+                            <div class="password-wrapper">
+                                <input type="password" id="newPassword" name="newPassword" required>
+                                <span class="material-symbols-rounded show-hide">
+                                    visibility_off
+                                </span>
+                            </div>
+                        </div>
+                        <div class="modal-form-control">
+                            <label for="confirmPassword">确认密码</label>
+                            <div class="password-wrapper">
+                                <input type="password" id="confirmPassword" name="confirmPassword" required>
+                                <span class="material-symbols-rounded show-hide">
+                                    visibility_off
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                    <div id="passwordError" class="password-error"></div>
+                    <button id="changePasswordBtn" type="submit" class="button">
+                        <span class="material-symbols-rounded">
+                            save
+                        </span>保存</button>
+                </form>
+            </div>
+        </div>
+
+        <div id="qrModal" class="modal" hidden>
+            <div class="modal-content">
+                <div class="modal-header">
+                    <span id="qrcodeTitle" class="modal-title"></span>
+                    <span class="material-symbols-rounded modal-close">
+                        close
+                    </span>
+                </div>
+                <div id="qrcode-container"></div>
+            </div>
+        </div>
+
+        <div>
+            <div class="header-container">
+                <h2><span class="material-symbols-rounded">fingerprint</span> My IP</h2>
+                <button type="button" id="refresh-geo-location" class="refresh-geo-location" onclick="fetchIPInfo()">
+                    <span class="material-symbols-rounded">
+                        refresh
+                    </span>
+                </button>
+            </div>
+            <div class="info-table">
+                <table id="ips">
+                    <thead>
+                        <tr>
+                            <th scope="col">说明</th>
+                            <th scope="col">Cloudflare 目标</th>
+                            <th scope="col">其它目标</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>IP</td>
+                            <td id="cf-ip"></td>
+                            <td id="ip"></td>
+                        </tr>
+                        <tr>
+                            <td>国家</td>
+                            <td id="cf-country"></td>
+                            <td id="country"></td>
+                        </tr>
+                        <tr>
+                            <td>城市</td>
+                            <td id="cf-city"></td>
+                            <td id="city"></td>
+                        </tr>
+                        <tr>
+                            <td>ISP</td>
+                            <td id="cf-isp"></td>
+                            <td id="isp"></td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+    </div>
+
+    <div class="form-container container">
+        <div class="header-container">
+            <h2><span class="material-symbols-rounded">verified</span>支持的客户端</h2>
+        </div>
+        <div class="info-table">
+            <table>
+                <thead>
+                    <tr>
+                        <th scope="col">客户端</th>
+                        <th scope="col">最低要求</th>
+                        <th scope="col">获取最新</th>
+                    </tr>
+                </thead>
+                <tbody id="supported-clients"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <script type="module">
+        import { polyfillCountryFlagEmojis } from "https://cdn.skypack.dev/country-flag-emoji-polyfill";
+        polyfillCountryFlagEmojis();
+    </script>
+    <script>const defaultHttpsPorts = [443, 8443, 2053, 2083, 2087, 2096];
+const defaultHttpPorts = [80, 8080, 8880, 2052, 2082, 2086, 2095];
+const proxyForm = document.getElementById('configForm');
+const [
+    selectElements,
+    numInputElements,
+    inputElements,
+    textareaElements,
+    checkboxElements
+] = [
+    'select',
+    'input[type=number]',
+    'input:not([type=file])',
+    'textarea',
+    'input[type=checkbox]'
+].map(query => proxyForm.querySelectorAll(query));
+
+getUsage();
+initPanel();
+fetchIPInfo();
+
+async function initPanel(settings, tgSettings, subscriptions, clients) {
+    try {
+        if (!settings) {
+            const nocache = Date.now();
+            const res = await fetch(`./panel/settings?nocache=${nocache}`, { cache: 'no-store' });
+            const { success, status, message, body } = await res.json();
+
+            if (status === 401 && !body.isPassSet) {
+                const closeBtn = document.querySelector('.modal-close');
+                openResetPass();
+                closeBtn.style.visibility = 'hidden';
+            }
+
+            if (!success) {
+                throw new Error(`status ${status} - ${message}`);
+            }
+
+            settings = body.proxySettings;
+            tgSettings = body.telegramSettings;
+            subscriptions = body.subscriptions;
+            clients = body.clients;
+            checkVersion(settings.panelVersion);
+        }
+
+        renderPanel(settings, tgSettings, subscriptions, clients);
+    } catch (error) {
+        console.error('面板初始化失败：', error);
+    }
+}
+
+async function getUsage() {
+    try {
+        const nocache = Date.now();
+        const res = await fetch(`./panel/usage?nocache=${nocache}`, { cache: 'no-store' });
+        const { success, status, message, body } = await res.json();
+
+        if (!success) {
+            throw new Error(`status ${status} - ${message}`);
+        }
+
+        const { total, worker } = body;
+        const totalReq = document.getElementById('total-usage');
+        totalReq.textContent = total.toLocaleString('en-US');
+        totalReq.style.fontSize = 'larger';
+        const totalPct = document.getElementById('total-pct');
+        const totalPctVal = Math.ceil(Number(total) / 100000 * 100);
+        totalPct.textContent = totalPctVal;
+        if (totalPctVal > 80) totalPct.style.color = 'var(--color-icon-red)';
+
+        const panelReq = document.getElementById('panel-usage');
+        panelReq.textContent = worker.toLocaleString('en-US');
+        panelReq.style.fontSize = 'larger';
+        const panelPct = document.getElementById('panel-pct');
+        const panelPctVal = Math.ceil(Number(worker) / 100000 * 100);
+        panelPct.textContent = panelPctVal;
+        if (panelPctVal > 80) panelPct.style.color = 'var(--color-icon-red)';
+    } catch (error) {
+        console.error('获取用量失败：', error);
+    }
+}
+
+async function checkVersion(panelVersion) {
+    try {
+        const res = await fetch('https://raw.githubusercontent.com/bia-pain-bache/BPB-Worker-Panel/refs/heads/main/package.json', {
+            cache: 'no-store'
+        });
+
+        if (!res.ok) {
+            throw new Error(`status ${res.status}`);
+        }
+
+        const pkg = await res.json();
+        const latest = pkg.version;
+        const updateAvailable = isNewerVersion(latest, panelVersion);
+        if (updateAvailable) {
+            globalThis.latestVersion = latest;
+            const upgradeBtn = document.getElementById('updatePanel');
+            upgradeBtn.disabled = false;
+        }
+    } catch (error) {
+        console.error('获取最新版本失败：', error);
+    }
+}
+
+function isNewerVersion(latest, current) {
+    const lv = latest.split('.').map(Number);
+    const cv = current.split('.').map(Number);
+
+    for (let i = 0; i < Math.max(lv.length, cv.length); i++) {
+        const l = lv[i] ?? 0;
+        const c = cv[i] ?? 0;
+        if (l > c) return true;
+        if (l < c) return false;
+    }
+
+    return false;
+}
+
+function renderPanel(proxySettings, tgSettings, subscriptions, clients) {
+    const {
+        securePath,
+        ports,
+        xrayUdpNoises,
+        remoteSettings
+    } = proxySettings;
+
+    const path = encodeURIComponent(securePath);
+    if (path !== window.location.pathname.split('/')[1]) {
+        setTimeout(() => {
+            window.location.href = `../${path}/panel`;
+        }, 1000);
+    }
+
+    const dohUrl = new URL(`./dns-query`, window.location.href);
+    document.getElementById('doh').textContent = dohUrl.href;
+    document.getElementById('fetchSettingsBtn').disabled = !remoteSettings;
+
+    selectElements.forEach(elm => elm.value = proxySettings[elm.id]);
+    checkboxElements.forEach(elm => elm.checked = proxySettings[elm.id]);
+    inputElements.forEach(elm => elm.value = proxySettings[elm.id] || '');
+    textareaElements.forEach(elm => {
+        const key = elm.id;
+        const element = document.getElementById(key);
+        const value = proxySettings[key]?.join('\r\n');
+        const rowsCount = proxySettings[key].length;
+        element.style.height = 'auto';
+        if (rowsCount) element.rows = rowsCount;
+        element.value = value;
+        elm.addEventListener('input', () => {
+            elm.style.height = 'auto';
+            elm.style.height = `${elm.scrollHeight}px`;
+        });
+    });
+
+    renderPorts(ports.map(Number));
+    renderNoises(xrayUdpNoises);
+    renderSubscriptions(subscriptions);
+    renderClients(clients);
+
+    globalThis.initialFormData = new FormData(proxyForm);
+    handleProxyFormChanges();
+    proxyForm.addEventListener('input', handleProxyFormChanges);
+    proxyForm.addEventListener('change', handleProxyFormChanges);
+    handleFragmentMode();
+
+    if (tgSettings) {
+        const tgForm = document.getElementById('telegramForm');
+        handleTgFormChanges(tgSettings);
+        tgForm.addEventListener('input', () => handleTgFormChanges());
+
+        for (const key in tgSettings) {
+            tgForm.elements[key].value = tgSettings[key];
+        }
+    }
+}
+
+function hasFormDataChanged() {
+    const formDataToObject = (formData) => Object.fromEntries(formData.entries());
+    const configForm = document.getElementById('configForm');
+    const currentFormData = new FormData(configForm);
+
+    const initialFormDataObj = formDataToObject(globalThis.initialFormData);
+    const currentFormDataObj = formDataToObject(currentFormData);
+
+    return JSON.stringify(initialFormDataObj) !== JSON.stringify(currentFormDataObj);
+}
+
+function handleProxyFormChanges(force = false) {
+    const applyButton = document.getElementById('applyButton');
+    const isChanged = hasFormDataChanged();
+    applyButton.disabled = force ? false : !isChanged;
+}
+
+function handleTgFormChanges(settings) {
+    const userId = document.getElementById('telegramUserId');
+    const token = document.getElementById('telegramBotToken');
+    const setupBtn = document.getElementById('setup-telegram');
+    const removeBtn = document.getElementById('remove-telegram');
+
+    if (settings) {
+        const { telegramUserId, telegramBotToken } = settings;
+        removeBtn.disabled = !telegramUserId && !telegramBotToken;
+        setupBtn.disabled = true;
+
+        userId.value = telegramUserId;
+        token.value = telegramBotToken;
+
+        return;
+    }
+
+    setupBtn.disabled = !userId.value.trim() || !token.value.trim();
+}
+
+async function getIpDetails(ip) {
+    try {
+        const response = await fetch('./panel/my-ip', { method: 'POST', body: ip });
+        const { success, status, message, body } = await response.json();
+
+        if (!success) {
+            throw new Error(`status ${status} - ${message}`);
+        }
+
+        return body;
+    } catch (error) {
+        console.error('获取 IP 失败：', error)
+    }
+}
+
+async function fetchIPInfo() {
+    const icons = startWaiting(null, 'refresh-geo-location', '');
+
+    const updateUI = (ip = '-', country = '-', countryCode = '-', city = '-', isp = '-', cfIP) => {
+        const flag = countryCode !== '-' ? String.fromCodePoint(...[...countryCode].map(c => 0x1F1E6 + c.charCodeAt(0) - 65)) : '';
+        const updateContent = (id, content) => document.getElementById(id).textContent = content;
+        updateContent(cfIP ? 'cf-ip' : 'ip', ip);
+        updateContent(cfIP ? 'cf-country' : 'country', `${flag} ${country}`);
+        updateContent(cfIP ? 'cf-city' : 'city', city);
+        updateContent(cfIP ? 'cf-isp' : 'isp', isp);
+    };
+
+    const nocache = Date.now();
+    const othersPromise = fetch(`https://ipv4.geojs.io/v1/ip.json?nocache=${nocache}`, { cache: 'no-store' })
+        .then(async res => {
+            if (!res.ok) throw new Error(`Fetch Other targets IP failed.`);
+            const { ip } = await res.json();
+            const { country, countryCode, city, isp } = await getIpDetails(ip);
+            updateUI(ip, country, countryCode, city, isp);
+        });
+
+    const cfPromise = fetch(`https://ipv4.icanhazip.com/?nocache=${nocache}`, { cache: 'no-store' })
+        .then(async res => {
+            if (!res.ok) throw new Error(`Fetch Cloudflare targets IP failed.`);
+            const ip = await res.text();
+            const { country, countryCode, city, isp } = await getIpDetails(ip.trim());
+            updateUI(ip, country, countryCode, city, isp, true);
+        });
+
+    const results = await Promise.allSettled([othersPromise, cfPromise]);
+    results.forEach(result => {
+        if (result.status === 'rejected') console.error(result.reason);
+    });
+
+    stopWaiting(icons);
+}
+
+function generateSubUrl(type, core, tag) {
+    const url = new URL(`./sub/${type}`, window.location.href);
+    url.searchParams.append('app', core);
+    url.hash = `💦 BPB ${tag}`;
+
+    if (core === 'sing-box' && type !== 'raw') {
+        return `sing-box://import-remote-profile?url=${url.href}`;
+    }
+
+    return url.href;
+}
+
+async function generateQRCode(data) {
+    const url = new URL('./qrcode', window.location.href);
+    url.searchParams.set('data', data);
+    url.searchParams.set('nocache', Date.now().toString());
+
+    const res = await fetch(url, { method: 'POST' });
+    if (!res.ok) {
+        throw new Error(`status ${res.status}`);
+    }
+
+    const blob = await res.blob();
+
+    return elm('img', {
+        id: 'qr',
+        className: 'qrcode',
+        src: URL.createObjectURL(blob)
+    });
+}
+
+function showQRCode(subUrl) {
+    const url = new URL(subUrl);
+    const modal = document.getElementById('qrModal');
+    const close = modal.querySelector('.modal-close');
+    const container = document.getElementById('qrcode-container');
+
+    let qrcodeTitle = document.getElementById('qrcodeTitle');
+    qrcodeTitle.textContent = decodeURIComponent(url.hash).replace('#', '');
+
+    close.onclick = () => {
+        modal.hidden = true;
+        container.lastElementChild.remove();
+        window.onclick = null;
+    };
+
+    window.onclick = (event) => {
+        if (event.target == modal) {
+            modal.hidden = true;
+            container.lastElementChild.remove();
+        }
+    }
+
+    generateQRCode(subUrl).then(qr => {
+        container.appendChild(qr);
+        modal.hidden = false;
+    });
+}
+
+function copyToClipboard(url) {
+    navigator.clipboard.writeText(url)
+        .then(() => notify('info', '已复制到剪贴板', [url]))
+        .catch(error => console.error('复制失败：', error));
+}
+
+function copyDoh() {
+    const url = document.getElementById('doh').textContent;
+    copyToClipboard(url);
+}
+
+async function dlUrl(subUrl) {
+    const url = new URL(subUrl);
+    window.location.href = url.protocol === 'sing-box:' ? url.searchParams.get('url') : subUrl;
+}
+
+async function exportFileSettings(event) {
+    if (hasFormDataChanged()) {
+        notify('error', '导出设置', ['请先应用未保存的修改。']);
+        return;
+    }
+
+    const icons = startWaiting(event.target, '', 'refresh');
+    const url = new URL('./sub/share-settings', window.location.href);
+    window.location.href = url.href;
+    stopWaiting(icons);
+}
+
+function importFile() {
+    const input = document.getElementById('fileInput');
+    input.value = '';
+    input.click();
+}
+
+async function importFileSettings(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    try {
+        const text = await file.text();
+        const data = atob(text);
+        const newSettings = JSON.parse(data);
+        const currentSettings = validateSettings();
+        const settings = { ...currentSettings, ...newSettings };
+
+        renderPanel(settings);
+        handleProxyFormChanges(true);
+
+        notify('success', '导入设置', [
+            '设置导入成功！',
+            '请先检查新设置再应用，尤其是分流规则。'
+        ]);
+    } catch (error) {
+        console.error('导入设置失败：', error);
+        notify('error', '导入设置', ['从文件读取设置失败。']);
+    }
+}
+
+async function importRemoteSettings(event) {
+    if (hasFormDataChanged()) {
+        notify('error', '导入设置', ['请先应用未保存的修改。']);
+        return;
+    }
+
+    const icons = startWaiting(event.target, '', 'refresh');
+    const remote = document.getElementById('remoteSettings').value.trim();
+    const currentSettings = validateSettings();
+
+    try {
+        const newSettings = await fetchSettings(remote);
+        const settings = { ...currentSettings, ...newSettings };
+
+        renderPanel(settings);
+        handleProxyFormChanges(true);
+
+        notify('success', '导入设置', [
+            '设置导入成功！',
+            '请先检查新设置再应用，尤其是分流规则。'
+        ]);
+    } catch (error) {
+        console.error('导入设置失败：', error);
+        notify('error', '导入设置', ['从远程读取设置失败。']);
+    } finally {
+        stopWaiting(icons);
+    }
+}
+
+function shareSettings() {
+    const url = new URL('./sub/share-settings', window.location.href);
+    copyToClipboard(url);
+}
+
+async function fetchSettings(remoteUrl) {
+    const url = new URL(remoteUrl);
+    const remote = `${url.origin + url.pathname}?nocache=${Date.now()}`;
+
+    const res = await fetch(remote, { cache: 'no-store' });
+    if (!res.ok) {
+        throw new Error(`status ${res.status}`);
+    }
+
+    const data = await res.text();
+    return JSON.parse(atob(data));
+}
+
+async function renewWarpAccounts(btn) {
+    const confirm = await notify('confirm', '重新获取 Warp 账号', ['确定吗？'])
+    if (!confirm) return;
+    const icons = startWaiting(btn, '', '');
+
+    try {
+        const response = await fetch('./panel/update-warp', { method: 'POST', credentials: 'include' });
+        const { success, status, message } = await response.json();
+
+        if (!success) {
+            notify('error', '重新获取 Warp 账号', ['出错了，请稍后再试。']);
+            throw new Error(`status ${status} - ${message}`);
+        }
+
+        notify('success', '重新获取 Warp 账号', ['Warp 账号已更新！']);
+    } catch (error) {
+        console.error('更新 Warp 配置失败：', error)
+        notify('error', '重新获取 Warp 账号', ['重新获取 Warp 账号失败。']);
+    } finally {
+        stopWaiting(icons);
+    }
+}
+
+async function handleRiskyRules(event) {
+    if (event.target.checked) {
+        const proceed = await notify('confirm', 'Geo 资源文件', [
+            "v2ray 用户需把 Geo 资源设为 Chocolate4U 并下载，否则配置无法连接。",
+            '仍要继续吗？'
+        ]);
+
+        if (!proceed) {
+            event.target.checked = false;
+            return;
+        }
+    }
+}
+
+function handleFragmentMode() {
+    const fragmentMode = document.getElementById('fragmentMode').value;
+    const formDataObj = Object.fromEntries(globalThis.initialFormData.entries());
+    const inputs = [
+        'fragmentLengthMin',
+        'fragmentLengthMax',
+        'fragmentDelayMin',
+        'fragmentDelayMax'
+    ];
+
+    const configs = {
+        low: [100, 200, 1, 1],
+        medium: [50, 100, 1, 5],
+        high: [10, 20, 10, 20],
+        severe: [1, 5, 1, 5],
+        custom: inputs.map(id => formDataObj[id])
+    };
+
+    inputs.forEach((id, index) => {
+        const elm = document.getElementById(id);
+        elm.value = configs[fragmentMode][index];
+        fragmentMode !== 'custom'
+            ? elm.setAttribute('readonly', 'true')
+            : elm.removeAttribute('readonly');
+    });
+}
+
+async function resetSettings(btn) {
+    const confirm = await notify(
+        'confirm',
+        '重置面板设置',
+        [
+            '这会重置除以下之外的所有设置：',
+            '+ VLESS UUID',
+            '+ Trojan password',
+            '+ Panel - Subscriptions path\n',
+            '确定吗？'
+        ]
+    );
+
+    if (!confirm) return;
+    const icons = startWaiting(btn, '', '', false);
+
+    try {
+        const res = await fetch('./panel/reset-settings', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+        const { success, status, message, body } = await res.json();
+        if (!success) {
+            throw new Error(`status ${status} - ${message}`);
+        }
+
+        notify(
+            'success',
+            '重置面板设置',
+            ['请更新你的订阅。']
+        );
+
+        renderPanel(body);
+    } catch (error) {
+        console.error('重置设置失败：', error);
+    } finally {
+        stopWaiting(icons);
+    }
+}
+
+function updateSettings(event, data) {
+    event.preventDefault();
+    event.stopPropagation();
+
+    const validatedForm = validateSettings();
+    if (!validatedForm) return false;
+    const form = data ?? validatedForm;
+
+    const icons = startWaiting(null, 'applyButton', 'refresh');
+
+    fetch('./panel/update-settings', {
+        method: 'PUT',
+        body: JSON.stringify(form),
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' }
+    })
+        .then(res => res.json())
+        .then(({ success, status, message, body: errors }) => {
+            if (status === 401) {
+                notify(
+                    'error',
+                    '应用设置',
+                    ['会话已过期，请重新登录。']
+                );
+                window.location.href = './login';
+            }
+
+            if (!success) {
+                errors.forEach(error => {
+                    notify('error', error.field, error.message);
+                });
+                throw new Error(`status ${status} - ${message}`);
+            }
+
+            notify(
+                'success',
+                '应用设置',
+                ['请更新你的订阅。']
+            );
+
+            renderPanel(form);
+        })
+        .catch(error => console.error('更新设置失败：', error))
+        .finally(() => stopWaiting(icons));
+}
+
+function setupTelegramBot() {
+    event.preventDefault();
+    event.stopPropagation();
+
+    const formData = new FormData(event.target);
+    const form = Object.fromEntries(formData.entries());
+
+    const setupBtn = document.getElementById('setup-telegram');
+    const icons = startWaiting(setupBtn, '', 'refresh');
+
+    fetch('./telegram/setup', {
+        method: 'PUT',
+        body: JSON.stringify(form),
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' }
+    })
+        .then(res => res.json())
+        .then(({ success, status, message, body }) => {
+            if (status === 401) {
+                notify(
+                    'error',
+                    '绑定 Telegram 机器人',
+                    ['会话已过期，请重新登录。']
+                );
+                window.location.href = './login';
+            }
+
+            if (!success) {
+                throw new Error(`status ${status} - ${message}`);
+            }
+
+            handleTgFormChanges(body);
+            notify(
+                'success',
+                '绑定 Telegram 机器人',
+                ['Telegram 机器人已可用。']
+            );
+        })
+        .catch(error => console.error('绑定 Telegram 机器人失败：', error))
+        .finally(() => {
+            stopWaiting(icons);
+            setupBtn.disabled = true;
+        });
+}
+
+function removeTelegramBot(btn) {
+    const icons = startWaiting(btn, '', 'refresh');
+
+    fetch('./telegram/remove', { method: 'POST', credentials: 'include' })
+        .then(res => res.json())
+        .then(({ success, status, message, body }) => {
+            if (status === 401) {
+                notify(
+                    'error',
+                    '解绑 Telegram 机器人',
+                    ['会话已过期，请重新登录。']
+                );
+                window.location.href = './login';
+            }
+
+            if (!success) {
+                throw new Error(`status ${status} - ${message}`);
+            }
+
+            handleTgFormChanges(body);
+            notify(
+                'success',
+                '解绑 Telegram 机器人',
+                ['Telegram 机器人已解绑！']
+            );
+        })
+        .catch(error => console.error('解绑 Telegram 机器人失败：', error))
+        .finally(() => stopWaiting(icons));
+}
+
+function validateSettings() {
+    const configForm = document.getElementById('configForm');
+    const formData = new FormData(configForm);
+
+    const fields = [
+        'udpXrayNoiseMode',
+        'udpXrayNoisePacket',
+        'udpXrayNoiseDelayMin',
+        'udpXrayNoiseDelayMax',
+        'udpXrayNoiseCount'
+    ].map(field => formData.getAll(field));
+
+    const form = Object.fromEntries(formData.entries());
+    const [modes, packets, delaysMin, delaysMax, counts] = fields;
+
+    form.xrayUdpNoises = modes.map((mode, index) => ({
+        type: mode,
+        packet: packets[index],
+        delay: `${delaysMin[index]}-${delaysMax[index]}`,
+        count: counts[index]
+    }));
+
+    form.ports = [
+        ...defaultHttpPorts,
+        ...defaultHttpsPorts
+    ].filter(port => formData.has(port.toString()));
+
+    checkboxElements.forEach(elm => {
+        form[elm.id] = formData.has(elm.id);
+    });
+
+    selectElements.forEach(elm => {
+        let value = form[elm.id];
+        if (value === 'true') value = true;
+        if (value === 'false') value = false;
+        form[elm.id] = value;
+    });
+
+    inputElements.forEach(elm => {
+        if (typeof form[elm.id] === 'string') {
+            form[elm.id] = form[elm.id].trim();
+        }
+    });
+
+    numInputElements.forEach(elm => {
+        form[elm.id] = Number(form[elm.id].trim());
+    });
+
+    textareaElements.forEach(elm => {
+        const key = elm.id;
+        const value = form[key];
+        form[key] = value?.split('\n').map(val => val.trim()).filter(Boolean) || [];
+    });
+
+    return form;
+}
+
+function logout(event) {
+    event.preventDefault();
+    fetch('./panel/logout', { method: 'GET', credentials: 'same-origin' })
+        .then(response => response.json())
+        .then(({ success, status, message }) => {
+            if (!success) {
+                throw new Error(`status ${status} - ${message}`);
+            }
+
+            window.location.href = './login';
+        })
+        .catch(error => console.error('退出登录失败：', error));
+}
+
+function openResetPass(event) {
+    const modal = document.getElementById('resetPassModal');
+    const close = modal.querySelector('.modal-close');
+    const showHides = modal.querySelectorAll('.show-hide');
+    const title = modal.querySelector('.modal-title');
+    const form = modal.querySelector('.config-form');
+    const username = document.getElementById('usernameContainer');
+    if (!event) {
+        title.textContent = '设置密码';
+        username.style.display = 'flex';
+        username.setAttribute('required', 'true');
+    }
+
+    close.onclick = () => modal.hidden = true;
+    form.onsubmit = resetPassword;
+    showHides.forEach(elm => {
+        elm.onclick = () => {
+            const input = elm.previousElementSibling;
+            const isPassword = input.type === 'password';
+            input.type = isPassword ? 'text' : 'password';
+            elm.textContent = isPassword ? 'visibility' : 'visibility_off';
+        }
+    });
+
+    modal.hidden = false;
+}
+
+function resetPassword(event) {
+    event.preventDefault();
+    const username = document.getElementById('username').value.trim().toLowerCase();
+    const passwordError = document.getElementById('passwordError');
+    const password = document.getElementById('newPassword').value.trim();
+    const confirmPassword = document.getElementById('confirmPassword').value.trim();
+
+    if (password !== confirmPassword) {
+        passwordError.textContent = '两次输入的密码不一致';
+        return false;
+    }
+
+    const valid = /^(?=.*[A-Z])(?=.*\d).{8,}$/.test(password);
+    if (!valid) {
+        passwordError.textContent = '至少 8 位，且包含大写字母与数字。';
+        return false;
+    }
+
+    fetch('./panel/reset-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        credentials: 'same-origin',
+        body: JSON.stringify({
+            username,
+            password
+        })
+    })
+        .then(response => response.json())
+        .then(({ success, status, message }) => {
+            if (!success) {
+                passwordError.textContent = message;
+                throw new Error(`status ${status} - ${message}`);
+            }
+
+            notify('success', '重置密码', ['密码修改成功！']);
+            window.location.href = './login';
+        })
+        .catch(error => console.error('重置密码失败：', error));
+}
+
+function genNoisePacket(mode, packet) {
+    switch (mode.value) {
+        case 'base64':
+            packet.value = randBase64(32, 64);
+            break;
+        case 'rand':
+            packet.value = '50-100';
+            break;
+        case 'hex':
+            packet.value = randHex(32, 64);
+            break;
+        case 'array':
+            packet.value = randArray(32, 64);
+            break;
+        case 'str': {
+            const charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+            packet.value = randString(charset, 32, 64);
+        }
+    }
+
+    handleProxyFormChanges();
+}
+
+function randUUID() {
+    const uuid = document.getElementById('vlUUID');
+    uuid.value = crypto.randomUUID();
+    handleProxyFormChanges();
+}
+
+function randString(charset, minLen, maxLen) {
+    return [...randBytes(minLen, maxLen)]
+        .map(byte => charset[byte % charset.length])
+        .join('');
+}
+
+function randArray(minLen, maxLen) {
+    const length = Math.floor(Math.random() * (maxLen - minLen + 1)) + minLen;
+    const array = Array.from({ length }, () => Math.floor(Math.random() * 256));
+    const field = array.map(String).join(',');
+
+    return field;
+}
+
+function randBytes(minBytes, maxBytes) {
+    const bytes = Math.floor(Math.random() * (maxBytes - minBytes + 1)) + minBytes;
+    const array = new Uint8Array(bytes);
+    crypto.getRandomValues(array);
+
+    return array;
+}
+
+function randHex(minBytes, maxBytes) {
+    return [...randBytes(minBytes, maxBytes)]
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
+}
+
+function randBase64(minBytes, maxBytes) {
+    return btoa(String.fromCharCode(...randBytes(minBytes, maxBytes)));
+}
+
+function randPassword() {
+    const charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@$&*_-+;:,.';
+    const trPass = document.getElementById('trPass');
+    trPass.value = randString(charset, 16, 32);
+    handleProxyFormChanges();
+}
+
+function randPath() {
+    const charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+    const securePath = document.getElementById('securePath');
+    securePath.value = randString(charset, 16, 32);
+    handleProxyFormChanges();
+}
+
+async function updatePanel(btn) {
+    const confirm = await notify('confirm', '更新 BPB 面板', [
+        `BPB Panel verseion ${globalThis.latestVersion} is now available!`,
+        `Please read <a href='https://github.com/bia-pain-bache/BPB-Worker-Panel/releases/latest' target='_blank' rel='noopener noreferrer'>更新日志</a> carefully before updating.`,
+        '确定吗？'
+    ]);
+
+    if (!confirm) return;
+    const icons = startWaiting(btn, '', 'refresh');
+
+    fetch('./panel/update-panel', { method: 'POST' })
+        .then(res => res.json())
+        .then(({ success, status, message }) => {
+            if (!success) throw new Error(`status ${status} - ${message}`);
+            notify('success', '更新面板', ['面板已升级！']);
+            setTimeout(() => {
+                location.reload();
+            }, 3000);
+        })
+        .catch(error => {
+            notify('error', '更新面板', ['更新面板失败，请重试。']);
+            console.error('更新面板失败：', error)
+        })
+        .finally(() => stopWaiting(icons));
+}
+
+async function deletePanel(btn) {
+    const confirm = await notify('confirm', '删除 BPB 面板', [
+        '这会从你的 Cloudflare 账号中永久删除面板',
+        '确定吗？'
+    ]);
+
+    if (!confirm) return;
+    const icons = startWaiting(btn, '', 'refresh');
+
+    fetch('./panel/delete-panel', { method: 'POST' })
+        .then(res => res.json())
+        .then(({ success, status, message }) => {
+            if (!success) throw new Error(`status ${status} - ${message}`);
+            notify('success', '删除面板', ['面板已删除！']);
+        })
+        .catch(error => {
+            notify('error', '删除面板', ['删除面板失败，请重试。']);
+            console.error('删除面板失败：', error)
+        })
+        .finally(() => stopWaiting(icons));
+}
+
+function notify(type, title, text) {
+    return new Promise(resolve => {
+        const fragment = document.getElementById('message-template').content.cloneNode(true);
+        const modal = fragment.querySelector('.modal');
+        modal.hidden = false;
+
+        modal.querySelector('.message-title').textContent = title;
+        modal.querySelector('.message-text').innerHTML = text.join('\n');
+
+        const icon = modal.querySelector('.message-icon');
+        const isOk = type === 'success' || type === 'info';
+        const isConfirm = type === 'confirm';
+
+        icon.textContent = isOk ? 'check_circle' : isConfirm ? 'help' : 'error';
+        icon.style.color = isOk ? 'var(--color-icon-green)' : 'var(--color-icon-red)';
+
+        const okBtn = modal.querySelector('.message-ok-btn');
+        const cancelBtn = modal.querySelector('.message-cancel-btn');
+        const closeBtn = modal.querySelector('.modal-close');
+
+        const handle = (value) => {
+            modal.remove();
+            resolve(value);
+        };
+
+        if (type === 'confirm') {
+            cancelBtn.onclick = () => handle(false);
+        } else {
+            cancelBtn.style.display = 'none';
+        }
+
+        if (type === 'info') {
+            okBtn.style.display = 'none';
+        } else {
+            okBtn.onclick = () => handle(true);
+        }
+
+        closeBtn.onclick = () => handle(false)
+        document.body.appendChild(fragment);
+
+        if (type === 'info') {
+            setTimeout(() => {
+                modal.remove();
+                resolve(null);
+            }, 1000);
+
+            return;
+        }
+    });
+}
+
+function startWaiting(button, id, customIcon, cw = true) {
+    document.body.classList.add('is-loading');
+    const btn = button ?? document.getElementById(id);
+    const icon = btn.querySelector('span');
+    const initIcon = icon.textContent;
+    if (customIcon) icon.textContent = customIcon;
+    icon.classList.add(`${cw ? 'cw' : 'ccw'}-spinning`);
+    return { icon, initIcon };
+}
+
+function stopWaiting(icons) {
+    document.body.classList.remove('is-loading');
+    const { icon, initIcon } = icons;
+    icon.classList.remove('cw-spinning');
+    icon.classList.remove('ccw-spinning');
+    if (initIcon !== icon.textContent) icon.textContent = initIcon;
+}
+
+function elm(tag, props = {}, children = []) {
+    const node = document.createElement(tag);
+    Object.assign(node, props);
+    node.append(...[].concat(children));
+    return node;
+}
+
+const createIcon = (text) => elm('span', {
+    className: 'material-symbols-rounded',
+    textContent: text
+});
+
+function createFormControl(labelText, action) {
+    const label = elm('span', { textContent: labelText }, action ? createIcon('refresh') : []);
+    const control = elm('div', { className: 'form-control' }, [label, elm('div')]);
+
+    return control;
+}
+
+async function deleteNoise(event) {
+    const confirm = await notify('confirm', '删除 UDP 噪声', ['确定吗？']);
+    if (!confirm) return;
+
+    event.target.closest('.inner-container').remove();
+    handleProxyFormChanges();
+}
+
+function addNoise(isManual, noiseIndex, udpNoise) {
+    const index = noiseIndex
+        ? noiseIndex
+        : document.getElementById('noises').childElementCount;
+
+    const noise = udpNoise || {
+        type: 'rand',
+        packet: '50-100',
+        delay: '1-5',
+        count: 5
+    };
+
+    const heading = elm('h4', { textContent: `Noise ${index + 1}` });
+    const headerDiv = elm('div', { className: 'header-container' }, heading);
+
+    if (index !== 0) {
+        const deleteBtn = elm('button', {
+            type: 'button',
+            className: 'delete-noise',
+            onclick: deleteNoise
+        }, createIcon('delete'));
+        headerDiv.appendChild(deleteBtn);
+    }
+
+    const modeOptions = [
+        ['base64', 'Base64'],
+        ['rand', '随机'],
+        ['str', '字符串'],
+        ['hex', 'Hex'],
+        ['array', '数组']
+    ].map(([value, label]) => elm('option', { value, textContent: label, selected: noise.type === value }));
+
+    const modeSelect = elm('select', { name: 'udpXrayNoiseMode' }, modeOptions);
+    const modeControl = createFormControl('模式');
+
+    const selectWrapper = modeControl.querySelector('div');
+    selectWrapper.className = 'select-wrapper';
+    selectWrapper.append(modeSelect, createIcon('keyboard_arrow_down'))
+
+    const packetInput = elm('input', { type: 'text', name: 'udpXrayNoisePacket', value: noise.packet });
+    const packetControl = createFormControl('分片包', true);
+    packetControl.querySelector('div').appendChild(packetInput);
+    const generateBtn = packetControl.querySelector('.material-symbols-rounded');
+
+    modeSelect.onchange = generateBtn.onclick = () => genNoisePacket(modeSelect, packetInput);
+
+    const countInput = elm('input', {
+        type: 'number', name: 'udpXrayNoiseCount', value: String(noise.count), min: '1', required: true
+    });
+    const countControl = createFormControl('数量');
+    countControl.querySelector('div').appendChild(countInput);
+
+    const [delayMin, delayMax] = noise.delay.split('-');
+    const delayMinInput = elm('input', { type: 'number', name: 'udpXrayNoiseDelayMin', value: delayMin, min: '1', required: true });
+    const delayMaxInput = elm('input', { type: 'number', name: 'udpXrayNoiseDelayMax', value: delayMax, min: '1', required: true });
+    const minMaxDiv = elm('div', { className: 'min-max' }, [delayMinInput, elm('span', { textContent: ' - ' }), delayMaxInput]);
+    const delayControl = createFormControl('延迟');
+    delayControl.querySelector('div').appendChild(minMaxDiv);
+
+    const section = elm('div', { className: 'section' }, [modeControl, packetControl, countControl, delayControl]);
+    const container = elm('div', { className: 'inner-container' }, [headerDiv, section]);
+
+    document.getElementById('noises').append(container);
+    if (isManual) handleProxyFormChanges(true);
+}
+
+function renderPorts(ports) {
+    let noneTlsPortsBlock = document.createDocumentFragment();
+    let tlsPortsBlock = document.createDocumentFragment();
+
+    const totalPorts = [
+        ...(window.origin.includes('workers.dev') ? defaultHttpPorts : []),
+        ...defaultHttpsPorts
+    ];
+
+    totalPorts.forEach(port => {
+        const isChecked = ports.includes(port);
+        const isHttpsPort = defaultHttpsPorts.includes(port);
+
+        const checkbox = elm('input', {
+            type: 'checkbox',
+            name: String(port),
+            value: 'true',
+            checked: isChecked
+        });
+
+        const label = elm('span', { textContent: String(port) });
+        const wrapper = elm('div', { className: 'checkbox-wrapper' }, [checkbox, label]);
+
+        if (isHttpsPort) {
+            tlsPortsBlock.appendChild(wrapper);
+        } else {
+            noneTlsPortsBlock.appendChild(wrapper);
+        }
+    });
+
+    const tlsContainer = document.getElementById('tls-ports');
+    tlsContainer.innerHTML = '';
+    tlsContainer.appendChild(tlsPortsBlock);
+
+    const nonTlsContainer = document.getElementById('non-tls-ports');
+    if (noneTlsPortsBlock.childElementCount > 0) {
+        nonTlsContainer.innerHTML = '';
+        nonTlsContainer.appendChild(noneTlsPortsBlock);
+        document.getElementById('none-tls').style.display = 'flex';
+    }
+}
+
+function renderNoises(xrayUdpNoises) {
+    document.getElementById('noises').innerHTML = '';
+    xrayUdpNoises.forEach((noise, index) => {
+        addNoise(false, index, noise);
+    });
+}
+
+function renderSubscriptions(subscriptions) {
+    if (!subscriptions) return;
+    for (const [type, { label, categories }] of Object.entries(subscriptions)) {
+        const help = elm('a', {
+            className: 'help-icon',
+            href: `https://bia-pain-bache.github.io/BPB-Worker-Panel/usage/${type}/`,
+            target: '_blank',
+            title: '帮助'
+        }, createIcon('info'));
+
+        const header = elm('h3', { textContent: label });
+        const summary = elm('summary', {}, header);
+        const section = elm('details', {}, summary);
+        const table = elm('table', {}, categories.map(({ core, clients }) => {
+            const clientSection = elm('td', {}, clients.map(client => {
+                const icon = createIcon('verified');
+                const title = elm('span', { textContent: client });
+                const wrapper = elm('div', {}, [icon, title]);
+                return wrapper;
+            }));
+
+            const url = generateSubUrl(type, core, label);
+            const ctaSection = elm('td');
+
+            const wgCore = ['wireguard', 'amnezia'].includes(core);
+            if (!wgCore) {
+                const qrBtn = elm('button', { title: '显示二维码', onclick: () => showQRCode(url) }, createIcon('qr_code'));
+                const copyBtn = elm('button', { title: '复制订阅链接', onclick: () => copyToClipboard(url) }, createIcon('content_copy'));
+                ctaSection.append(qrBtn, copyBtn);
+            }
+
+            if (type !== 'raw') {
+                const dlBtn = elm('button', { title: '下载配置', onclick: () => dlUrl(url) }, createIcon('download'));
+                ctaSection.appendChild(dlBtn);
+            }
+
+            return elm('tr', {}, [clientSection, ctaSection]);
+        }));
+
+        const container = elm('div', { className: 'table-container' }, table);
+        section.appendChild(container);
+        const item = elm('div', { className: 'accordion-item' }, [section, help]);
+        document.getElementById('subscriptions').appendChild(item);
+    };
+}
+
+function renderClients(clients) {
+    if (!clients) return;
+    clients.forEach(client => {
+        const name = elm('td', { scope: 'col', textContent: client.name });
+        const minVer = elm('td', { scope: 'col', textContent: client.minVer });
+
+        const source = elm('span', { textContent: client.source });
+        const dlBtn = elm('a', {
+            href: atob(client.b64Url),
+            target: '_blank',
+            rel: 'noopener noreferrer'
+        }, createIcon('download'));
+        const download = elm('td', {}, [source, dlBtn]);
+
+        const row = elm('tr', {}, [name, minVer, download])
+
+        document.getElementById('supported-clients').appendChild(row);
+    });
+}</script>
+</body>
+
+</html>

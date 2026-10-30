@@ -1,0 +1,10 @@
+.git
+.github
+build/
+build-*/
+data/
+warp/
+tmpscripts/
+*.exe
+*.o
+*.log

@@ -1,0 +1,32 @@
+services:
+  bpb:
+    build: .
+    image: bpb-native:1.0.0
+    container_name: bpb
+    restart: unless-stopped
+    volumes:
+      - bpb-data:/data
+    expose:
+      - "8080"
+    mem_limit: 64m
+    security_opt:
+      - no-new-privileges:true
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: bpb-caddy
+    restart: unless-stopped
+    depends_on:
+      - bpb
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  bpb-data:
+  caddy-data:
+  caddy-config:

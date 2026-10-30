@@ -1,0 +1,12 @@
+# Replace panel.example.com with your domain (Caddy issues the certificate automatically).
+panel.example.com {
+	encode gzip
+
+	@ws {
+		header Connection *Upgrade*
+		header Upgrade websocket
+	}
+	reverse_proxy @ws bpb:8080
+
+	reverse_proxy bpb:8080
+}

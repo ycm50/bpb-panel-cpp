@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BPB Panel v__VERSION__</title>
+    <link id="favicon" rel="icon" type="image/x-icon" href="data:image/x-icon;base64,__ICON__">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Ubuntu:ital,wght@0,300;0,400;0,500;0,700;1,300;1,400;1,500;1,700&display=swap"
+        rel="stylesheet">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&icon_names=login,visibility,visibility_off&display=block"
+        rel="stylesheet" />
+    <style>:root {
+    --color-bg-main: linear-gradient(90deg, #000328, #00458E);
+    --color-bg-card: rgba(15, 23, 42, 0.5);
+    --color-bg-input: rgba(2, 6, 23, 0.5);
+    --color-bg-btn: #3b82f629;
+
+    --color-text-primary: #f1f5f9;
+    --color-text-secondary: #aec4e2;
+    --color-text-btn: #a5ccfc;
+
+    --color-brand-primary: #3b82f6;
+    --color-brand-hover: #60a5fa;
+    --color-border-accent: color-mix(in srgb, var(--color-brand-hover), transparent 79%);
+
+    --radius-card: 1.5rem;
+    --radius-ui: 0.75rem;
+    --radius-btn: 1rem;
+
+    --shadow-card: 0 4px 6px -1px rgba(0, 0, 0, 0.2), 0 20px 40px -15px rgba(0, 3, 40, 0.5), 0 35px 60px -15px rgba(0, 69, 142, 0.3);
+    --shadow-input: inset 0 2px 4px rgba(0, 0, 0, 0.3), 0 1px 2px rgba(255, 255, 255, 0.05);
+    --shadow-input-focus: 0 0 0 3px rgba(59, 130, 246, 0.4), 0 8px 20px -4px rgba(59, 130, 246, 0.3);
+    --shadow-header: 0.125rem 0.125rem 0.25rem #000328;
+    --shadow-icon: 0.125rem 0.125rem 0.2rem #000328;
+
+    --space-xl: 1.5rem;
+    --space-sm: 0.5rem;
+    --space-md: 0.85rem;
+
+    --font-size-base: 1rem;
+    --transition-standard: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    --element-border-radius: 10px;
+}
+
+html,
+body {
+    height: 100%;
+    margin: 0;
+}
+
+body {
+    font-family: "Ubuntu", system-ui;
+    position: relative;
+    overflow: hidden;
+    text-align: center;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background: var(--color-bg-main);
+}
+
+.container {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 90%;
+}
+
+h1 {
+    color: var(--color-text-primary);
+    text-shadow: var(--shadow-header);
+    display: flex;
+    justify-content: center;
+    align-items: stretch;
+    gap: var(--space-sm);
+}
+
+.header {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.icon {
+    height: 2.5rem;
+}
+
+.panel-version {
+    align-self: flex-start;
+    font-size: large;
+}
+
+h2 {
+    color: var(--color-text-secondary);
+    margin-top: 0;
+}
+
+.form-container {
+    max-width: 95%;
+    margin: 0 auto;
+    margin-bottom: 30px;
+    background-color: var(--color-bg-card);
+    border: 1px solid var(--color-border-accent);
+    border-radius: var(--radius-card);
+    padding: var(--space-xl);
+    box-shadow: var(--shadow-card);
+}
+
+.login-form {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    align-items: center;
+    width: 100%;
+}
+
+.form-control {
+    display: flex;
+    gap: 12px;
+    flex-direction: column;
+    align-items: flex-start;
+    width: 100%;
+}
+
+label {
+    font-weight: 500;
+    color: var(--color-text-secondary);
+}
+
+.input-wrapper {
+    display: flex;
+    width: 100%;
+    position: relative;
+}
+
+.toggle-password {
+    position: absolute;
+    top: 50%;
+    right: 10px;
+    transform: translateY(-50%);
+    cursor: pointer;
+    /* eslint-disable-next-line css/use-baseline */
+    user-select: none;
+    color: darkgray;
+}
+
+input[type="text"],
+input[type="password"] {
+    box-sizing: border-box;
+    width: 100%;
+    text-align: center;
+    margin: 0;
+    padding: 10px;
+    border: none;
+    border-radius: var(--radius-ui);
+    color: var(--color-text-primary);
+    background-color: var(--color-bg-input);
+    line-height: 1.5;
+    outline: none;
+    font-size: var(--font-size-base);
+    font-family: inherit;
+    box-shadow: var(--shadow-input);
+    transition: var(--transition-standard);
+}
+
+input[type="password"]:focus,
+input[type="text"]:focus {
+    border-color: var(--color-brand-primary);
+    box-shadow: var(--shadow-input-focus);
+    outline: none;
+}
+
+.hint {
+    color: red;
+    margin-bottom: 10px;
+}
+
+.button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    justify-self: center;
+    gap: 4px;
+    width: max-content;
+    white-space: nowrap;
+    padding: var(--space-md);
+    font-size: var(--font-size-base);
+    font-weight: 600;
+    border: 1px solid var(--color-border-accent);
+    border-radius: var(--radius-btn);
+    color: var(--color-text-btn);
+    background: var(--color-bg-btn);
+    cursor: pointer;
+    outline: none;
+    box-shadow: 0 5px 10px rgba(0, 0, 0, 0.2);
+    transition: all 0.3s ease;
+}
+
+button:hover {
+    background-color: var(--color-brand-primary);
+    box-shadow: 0 8px 15px rgba(0, 0, 0, 0.3);
+    transform: translateY(-2px);
+    color: var(--color-text-primary);
+}
+
+button:active {
+    transform: translateY(1px);
+    box-shadow: 0 3px 7px rgba(0, 0, 0, 0.3);
+}
+
+.material-symbols-rounded {
+    font-variation-settings:
+        'FILL' 1,
+        'wght' 400,
+        'GRAD' 0,
+        'opsz' 24
+}
+
+@media only screen and (min-width: 576px) {
+    .container {
+        width: 70%;
+    }
+}
+
+@media only screen and (min-width: 768px) {
+    .container {
+        width: 50%;
+    }
+}
+
+@media only screen and (min-width: 992px) {
+    .container {
+        width: 30%;
+    }
+}</style>
+</head>
+
+<body>
+    <div class="container">
+        <div class="header">
+            <img id="header-logo" src="data:image/x-icon;base64,__ICON__" alt="BPB Logo" width="48" height="48">
+            <h1>
+                BPB Panel
+                <span class="panel-version">
+                    v__VERSION__
+                </span>
+            </h1>
+        </div>
+        <div class="form-container">
+            <h2>用户登录</h2>
+            <form id="loginForm" class="login-form">
+                <div class="form-control">
+                    <label for="username">账号邮箱</label>
+                    <input type="text" id="username" class="input-wrapper" name="username" required>
+                </div>
+                <div class="form-control">
+                    <label for="password">密码</label>
+                    <div class="input-wrapper">
+                        <input type="password" id="password" name="password" required>
+                        <span id="togglePassword" class="material-symbols-rounded toggle-password">
+                            visibility_off
+                        </span>
+                    </div>
+                </div>
+                <div id="passwordError" class="hint"></div>
+                <button type="submit" class="button">
+                    <span class="material-symbols-rounded">
+                        login
+                    </span>登录</button>
+            </form>
+        </div>
+    </div>
+    <script>document.getElementById('loginForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const username = document.getElementById('username').value.trim().toLowerCase();
+    const password = document.getElementById('password').value.trim();
+
+    try {
+        const response = await fetch('./login/authenticate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                username,
+                password
+            })
+        });
+
+        const { success, status, message } = await response.json();
+        if (!success) {
+            const passwordError = document.getElementById('passwordError');
+            passwordError.textContent = '⚠️ Wrong Credentials.';
+            throw new Error(`Login failed with status ${status}: ${message}`);
+        }
+
+        window.location.href = './panel';
+    } catch (error) {
+        console.error('Login error:', error.message || error);
+    }
+});
+
+document.getElementById('togglePassword').addEventListener('click', function () {
+    const passwordInput = document.getElementById('password');
+    const isPassword = passwordInput.type === 'password';
+    passwordInput.type = isPassword ? 'text' : 'password';
+    this.textContent = isPassword ? 'visibility_off' : 'visibility';
+});</script>
+</body>
+
+</html>
