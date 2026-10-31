@@ -2,8 +2,11 @@
 #include "http/http.h"
 #include "net/http_client.h"
 #include "net/net.h"
+#include "net/warp_proc.h"
+#include "net/wg_outbound.h"
 #include "proxy/session.h"
 #include "sub/wireguard.h"
+#include "tunnel/integration.h"
 
 #include <fstream>
 #include "settings/store.h"
@@ -99,19 +102,31 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Optional WARP outbound. Disabled by default. When the panel enables it we
+    // render a config for the external warp-rust process, spawn and supervise it
+    // and dial through the SOCKS5 port it publishes. bpb never registers WARP
+    // accounts: warp-rust only registers when data/account.json is missing.
+    std::string wg_error;
+    if (bpb::net::start_wg_outbound(store, wg_error)) {
+        std::printf("warp outbound enabled: %s\n", bpb::net::wg_outbound_status().c_str());
+    } else if (wg_error != "wireguard outbound disabled") {
+        std::fprintf(stderr, "warp outbound not started: %s\n", wg_error.c_str());
+    }
+    std::fflush(stdout);
+
     bpb::http::Server server;
     server.set_handler([&](const bpb::http::Request& req) { return app.handle(req); });
 
     bpb::proxy::SessionConfig session_config;
     session_config.secure_path = store.config().securePath;
     session_config.vl_uuid = store.config().vlUUID;
-    session_config.tr_pass = store.config().trPass;
     session_config.proxy_ip_mode = store.config().proxyIpMode;
     session_config.proxy_ips = store.config().proxyIPs;
     server.set_ws_handler([session_config](bpb::net::socket_t fd, SSL* ssl,
                                            const bpb::http::Request& req,
                                            const std::string& accept_key) {
-        bpb::proxy::run_ws_session(fd, ssl, accept_key, req.path, session_config);
+        bpb::proxy::run_ws_session(fd, ssl, accept_key, req.path,
+                                   req.header("sec-websocket-protocol"), session_config);
     });
 
     if (!tls_cert.empty() && !tls_key.empty()) {
@@ -129,7 +144,23 @@ int main(int argc, char** argv) {
                 tls_cert.empty() ? "http" : "https", host.c_str(), port,
                 store.config().securePath.c_str());
     std::fflush(stdout);
+
+    // Optional embedded Cloudflare Tunnel client. When enabled it registers with
+    // the edge and relays inbound requests back to this panel, replacing the
+    // full cloudflared binary (~40 MB) with a small in-process implementation.
+    {
+        bool tunnel_started = false;
+        std::string tunnel_error;
+        if (bpb::tunnel::start_from_store(store, tunnel_started, tunnel_error)) {
+            if (tunnel_started) std::printf("cloudflare tunnel client started\n");
+        } else {
+            std::fprintf(stderr, "cloudflare tunnel not started: %s\n", tunnel_error.c_str());
+        }
+        std::fflush(stdout);
+    }
+
     server.run();
+    bpb::net::warp_proc_stop();
     bpb::net::shutdown();
     return 0;
 }

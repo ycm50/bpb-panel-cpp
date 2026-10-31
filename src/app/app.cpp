@@ -3,12 +3,14 @@
 #include "assets_gen.h"
 #include "crypto/crypto.h"
 #include "net/http_client.h"
+#include "net/wg_outbound.h"
 #include "sub/clash.h"
 #include "sub/raw.h"
 #include "sub/singbox.h"
 #include "sub/warp.h"
 #include "sub/wireguard.h"
 #include "sub/xray.h"
+#include "tunnel/integration.h"
 #include "util/util.h"
 
 #include <ctime>
@@ -233,9 +235,77 @@ http::Response App::update_settings(const http::Request& req) {
         if (kv.contains(it.key())) kv[it.key()] = it.value();
     }
 
+    // The panel submits the WireGuard outbound as two flat fields; fold them
+    // into the nested wgOutbound object.
+    if (!kv.contains("wgOutbound") || !kv["wgOutbound"].is_object()) {
+        kv["wgOutbound"] = nlohmann::json::object();
+    }
+    auto& wg = kv["wgOutbound"];
+    if (data.contains("wgOutboundEnabled")) {
+        std::string v = data["wgOutboundEnabled"].is_string()
+                            ? data["wgOutboundEnabled"].get<std::string>()
+                            : (data["wgOutboundEnabled"].is_boolean() &&
+                                       data["wgOutboundEnabled"].get<bool>()
+                                   ? "true"
+                                   : "false");
+        wg["enabled"] = (v == "true");
+    }
+    if (data.contains("wgOutboundSocks") && data["wgOutboundSocks"].is_string()) {
+        // "host:port" — the address the external warp-rust process binds its
+        // SOCKS5 listener on. Only the loopback interface is meaningful for a
+        // same-host deployment, but a LAN address is accepted for edge cases.
+        std::string v = data["wgOutboundSocks"].get<std::string>();
+        auto colon = v.rfind(':');
+        if (colon != std::string::npos && colon > 0) {
+            std::string host = v.substr(0, colon);
+            std::string port_s = v.substr(colon + 1);
+            if (!host.empty()) wg["bindHost"] = host;
+            try {
+                int port = std::stoi(port_s);
+                if (port > 0 && port <= 65535) wg["socksPort"] = port;
+            } catch (...) {
+                // keep the previous port when the field is malformed
+            }
+        }
+    }
+
+    // Cloudflare Tunnel: flat panel fields folded into the nested cfTunnel object.
+    if (!kv.contains("cfTunnel") || !kv["cfTunnel"].is_object()) {
+        kv["cfTunnel"] = nlohmann::json::object();
+    }
+    auto& ct = kv["cfTunnel"];
+    if (data.contains("cfTunnelEnabled")) {
+        std::string v = data["cfTunnelEnabled"].is_string()
+                            ? data["cfTunnelEnabled"].get<std::string>()
+                            : (data["cfTunnelEnabled"].is_boolean() &&
+                                       data["cfTunnelEnabled"].get<bool>()
+                                   ? "true"
+                                   : "false");
+        ct["enabled"] = (v == "true");
+    }
+    if (data.contains("cfTunnelToken") && data["cfTunnelToken"].is_string()) {
+        std::string v = data["cfTunnelToken"].get<std::string>();
+        if (!v.empty()) ct["token"] = v;
+    }
+    if (data.contains("cfTunnelOrigin") && data["cfTunnelOrigin"].is_string()) {
+        std::string v = data["cfTunnelOrigin"].get<std::string>();
+        if (!v.empty()) {
+            auto colon = v.find(':');
+            if (colon == std::string::npos) {
+                ct["originHost"] = v;
+            } else {
+                ct["originHost"] = v.substr(0, colon);
+                try {
+                    ct["originPort"] = std::stoi(v.substr(colon + 1));
+                } catch (...) {
+                    // keep the previous port when the value is not numeric
+                }
+            }
+        }
+    }
+
     auto& cfg = store_.config();
     if (data.contains("vlUUID")) cfg.vlUUID = data["vlUUID"].get<std::string>();
-    if (data.contains("trPass")) cfg.trPass = data["trPass"].get<std::string>();
     if (data.contains("securePath")) cfg.securePath = data["securePath"].get<std::string>();
     if (data.contains("proxyIpMode")) cfg.proxyIpMode = data["proxyIpMode"].get<std::string>();
     if (data.contains("proxyIPs")) cfg.proxyIPs = data["proxyIPs"].get<std::vector<std::string>>();
@@ -515,6 +585,82 @@ http::Response App::handle(const http::Request& req) {
         store_.warps() = accounts;
         if (!store_.save(error)) return json_err(500, error);
         return json_ok(accounts);
+    }
+    // ---- WARP outbound ------------------------------------------------------
+    // The backend differs per branch (main: supervised warp-rust process,
+    // warp-built-in: in-tree WG + lwIP), but the panel surface is identical:
+    // status + an explicit registration action. Registration defaults to a dry
+    // run so the whole round trip can be exercised without consuming Cloudflare's
+    // per-IP registration quota.
+    if (path == sp + "/panel/warp-status") {
+        if (needs_auth && !authenticated(req)) return json_err(401, "未授权或会话已过期。");
+        nlohmann::json out;
+        out["enabled"] = false;
+        if (store_.kv().contains("wgOutbound") && store_.kv()["wgOutbound"].is_object())
+            out["enabled"] = store_.kv()["wgOutbound"].value("enabled", false);
+        out["ready"] = net::wg_outbound_ready();
+        out["status"] = net::wg_outbound_status();
+        out["dryRun"] = store_.kv().value("warpRegisterDryRun", true);
+        out["accounts"] = store_.warps().size();
+        return json_ok(out);
+    }
+    if (path == sp + "/panel/warp-register") {
+        if (needs_auth && !authenticated(req)) return json_err(401, "未授权或会话已过期。");
+        if (req.method != "POST") return json_err(405, "请求方法不允许。");
+        const bool dry_run = store_.kv().value("warpRegisterDryRun", true);
+        nlohmann::json accounts;
+        std::string error;
+        if (!sub::fetch_warp_accounts(accounts, error, dry_run))
+            return json_err(500, "注册 WARP 账号失败：" + error);
+        // A dry run must not touch the live account pool: its synthetic account
+        // has no working keys, so persisting it silently breaks the outbound on
+        // the next start (the stack is handed an unusable account).
+        if (!dry_run) {
+            store_.warps() = accounts;
+            if (!store_.save(error)) return json_err(500, "保存设置失败：" + error);
+        }
+        nlohmann::json out;
+        out["dryRun"] = dry_run;
+        out["accounts"] = accounts;
+        out["saved"] = !dry_run;
+        out["note"] = dry_run ? "dry run：未访问 Cloudflare，未写入账号池"
+                              : "已真实注册并写入账号池";
+        return json_ok(out);
+    }
+    // Trimmed Cloudflare Tunnel, woken on demand. It stays parked until asked:
+    // there is no point keeping an edge connection (and a public hostname) alive
+    // when nobody is using the panel. An empty token means "register an ad-hoc
+    // quick tunnel", whose credentials are persisted so waking twice reuses the
+    // same hostname instead of creating a new tunnel every time.
+    if (path == sp + "/panel/tunnel-status") {
+        if (needs_auth && !authenticated(req)) return json_err(401, "未授权或会话已过期。");
+        return http::Response::json(200, tunnel::status_json());
+    }
+    if (path == sp + "/panel/tunnel-wake") {
+        if (needs_auth && !authenticated(req)) return json_err(401, "未授权或会话已过期。");
+        if (req.method != "POST") return json_err(405, "请求方法不允许。");
+        auto& kv = store_.kv();
+        if (!kv.contains("cfTunnel") || !kv["cfTunnel"].is_object())
+            kv["cfTunnel"] = nlohmann::json::object();
+        kv["cfTunnel"]["enabled"] = true;
+        std::string error;
+        if (!store_.save(error)) return json_err(500, "保存设置失败：" + error);
+        bool started = false;
+        if (!tunnel::start_from_store(store_, started, error)) return json_err(500, error);
+        nlohmann::json st = nlohmann::json::parse(tunnel::status_json(), nullptr, false);
+        return json_ok(st.is_discarded() ? nlohmann::json::object() : st);
+    }
+    if (path == sp + "/panel/tunnel-sleep") {
+        if (needs_auth && !authenticated(req)) return json_err(401, "未授权或会话已过期。");
+        if (req.method != "POST") return json_err(405, "请求方法不允许。");
+        auto& kv = store_.kv();
+        if (!kv.contains("cfTunnel") || !kv["cfTunnel"].is_object())
+            kv["cfTunnel"] = nlohmann::json::object();
+        kv["cfTunnel"]["enabled"] = false;
+        std::string error;
+        if (!store_.save(error)) return json_err(500, "保存设置失败：" + error);
+        tunnel::stop();
+        return json_ok(nlohmann::json{{"running", false}});
     }
     if (path == sp + "/panel/update-panel") return not_supported("面板自更新（仅 Cloudflare 版）");
     if (path == sp + "/panel/delete-panel") return not_supported("面板删除（仅 Cloudflare 版）");

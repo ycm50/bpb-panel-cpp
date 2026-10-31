@@ -61,8 +61,11 @@ std::string get_random_string(int length_min, int length_max) {
 }
 
 std::string generate_ws_path(const std::string& protocol) {
+    // A fixed path: the VLESS UUID is the credential, so a random per-request
+    // suffix protected nothing and only made every restart invalidate the
+    // subscription links.
     std::string proto = (protocol == "vless") ? "vl" : "tr";
-    return "/" + proto + "/" + get_random_string(16, 32);
+    return "/" + proto;
 }
 
 bool is_domain(const std::string& address) {
@@ -133,7 +136,7 @@ bool is_https(const nlohmann::json& s, int port) {
 }
 
 std::vector<std::string> get_protocols(const nlohmann::json& s) {
-    return split(s.value("protocols", std::string("vless,trojan")), ',');
+    return split(s.value("protocols", std::string("vless")), ',');
 }
 
 struct CachedDns {
@@ -250,7 +253,7 @@ std::string generate_remark(const nlohmann::json& s, int index, int port, const 
     }
 
     std::string chain_sign = is_chain ? "\xF0\x9F\x94\x97 " : "";
-    std::string proto_sign = (protocol == "vless") ? "VLESS" : "Trojan";
+    std::string proto_sign = "VLESS";
     std::string fragment_sign = is_fragment ? "F " : "";
     std::string custom_domain_sign = (!custom_domain.empty() && domain == custom_domain) ? "D " : "";
     std::string custom_cdn_sign;

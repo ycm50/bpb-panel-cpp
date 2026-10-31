@@ -268,7 +268,6 @@ json build_ws_outbound(const json& s, const std::string& protocol, const std::st
         upstream_server = s["upstreamParams"].value("upstreamServer", std::string());
     }
     bool is_tls = is_https(s, port) || (!upstream_server.empty() && address == upstream_server);
-    if (protocol == "trojan" && !is_tls) return json();
 
     auto sni_host = select_sni_host(s, address, domain);
     json tls = is_tls ? build_tls(s, protocol, "tls", sni_host.allow_insecure, sni_host.sni,
@@ -278,13 +277,9 @@ json build_ws_outbound(const json& s, const std::string& protocol, const std::st
     json transport = build_transport("ws", "", generate_ws_path(protocol), sni_host.host, "", 2560);
 
     json fields = json::object();
-    if (protocol == "vless") {
-        fields["uuid"] = str(s, "vlUUID");
-        fields["packet-encoding"] = "";
-        fields["encryption"] = "";
-    } else {
-        fields["password"] = str(s, "trPass");
-    }
+    fields["uuid"] = str(s, "vlUUID");
+    fields["packet-encoding"] = "";
+    fields["encryption"] = "";
     return build_outbound(remark, protocol, address, port, flag(s, "enableIPv6"), flag(s, "enableTFO"),
                           tls, transport, fields);
 }
@@ -659,7 +654,7 @@ bool build_clash_custom(const json& s, std::string& out_json, std::string& error
         bool is_custom = (!custom_domain.empty() && domain == custom_domain);
 
         for (auto& protocol : protocols) {
-            if (protocol != "vless" && protocol != "trojan") continue;
+            if (protocol != "vless") continue;
             int protocol_index = 1;
             for (int port : total_ports) {
                 for (auto& host : hosts) {

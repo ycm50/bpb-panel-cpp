@@ -10,5 +10,6 @@ warp/
 *.conf
 !warp-resolv.conf
 tmpscripts/
+dist/
 node_modules/
 *.log

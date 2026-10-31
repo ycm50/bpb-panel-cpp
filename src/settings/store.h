@@ -9,7 +9,6 @@ struct Config {
     std::string accID = "native";
     std::string accEmail = "admin";
     std::string vlUUID;
-    std::string trPass;
     std::string securePath = "securepath";
     std::string mainDomain = "localhost";
     std::string fallback;
@@ -28,11 +27,16 @@ public:
     Config& config() { return cfg_; }
 
     nlohmann::json& kv() { return kv_; }
+    const nlohmann::json& kv() const { return kv_; }
     nlohmann::json& telegram() { return telegram_; }
     nlohmann::json& warps() { return warps_; }
     std::string& pwd() { return pwd_; }
     std::string& secret() { return secret_; }
     bool has_pwd() const { return !pwd_.empty(); }
+
+    // Data directory the store was loaded from; used to place auxiliary files
+    // such as the generated warp-rust config.
+    const std::string& dir() const { return dir_; }
 
     static nlohmann::json default_kv();
 

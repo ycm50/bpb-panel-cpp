@@ -274,14 +274,9 @@ json build_ws_outbound(const json& s, const std::string& protocol, const std::st
                       : json();
 
     json fields = json::object();
-    if (protocol == "vless") {
-        fields["uuid"] = str(s, "vlUUID");
-        fields["packet_encoding"] = "";
-        fields["network"] = "tcp";
-    } else {
-        fields["password"] = str(s, "trPass");
-        fields["network"] = "tcp";
-    }
+    fields["uuid"] = str(s, "vlUUID");
+    fields["packet_encoding"] = "";
+    fields["network"] = "tcp";
     return build_outbound_base(remark, protocol, address, port, flag(s, "enableTFO"), fields, tls,
                                transport, false);
 }
@@ -723,7 +718,7 @@ bool build_sb_custom(const json& s, bool is_fragment, std::string& out_json, std
         bool is_custom = (!custom_domain.empty() && domain == custom_domain);
 
         for (auto& protocol : protocols) {
-            if (protocol != "vless" && protocol != "trojan") continue;
+            if (protocol != "vless") continue;
             int protocol_index = 1;
             for (int port : total_ports) {
                 for (auto& host : hosts) {

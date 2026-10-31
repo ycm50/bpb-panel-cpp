@@ -1296,35 +1296,14 @@ table tr:not(:last-child) {
             <div class="accordion-item">
                 <details>
                     <summary>
-                        <h3>VLESS / Trojan</h3>
+                        <h3>VLESS</h3>
                     </summary>
                     <div class="section">
-                        <div class="form-control">
-                            <label for="protocols">协议</label>
-                            <div class="select-wrapper">
-                                <select id="protocols" name="protocols">
-                                    <option value="vless,trojan">VLESS 与 Trojan</option>
-                                    <option value="vless">VLESS</option>
-                                    <option value="trojan">Trojan</option>
-                                </select>
-                                <span class="material-symbols-rounded">
-                                    keyboard_arrow_down
-                                </span>
-                            </div>
-                        </div>
                         <div class="form-control">
                             <label for="vlUUID">VLESS UUID<span class="material-symbols-rounded" onclick="randUUID()">refresh</span>
                             </label>
                             <div>
                                 <input type="text" id="vlUUID" name="vlUUID" required>
-                            </div>
-                        </div>
-                        <div class="form-control">
-                            <label for="trPass">Trojan 密码<span class="material-symbols-rounded"
-                                    onclick="randPassword()">refresh</span>
-                            </label>
-                            <div>
-                                <input type="text" id="trPass" name="trPass" required>
                             </div>
                         </div>
                         <div class="form-control">
@@ -1641,6 +1620,83 @@ table tr:not(:last-child) {
                             <span>重新获取 Warp 账号</span>
                             <button type="button" class="button" onclick="renewWarpAccounts(this)">
                                 <span id="warp-update" class="material-symbols-rounded">autorenew</span>续期</button>
+                        </div>
+                        <div class="dashboard-action">
+                            <span>WARP 出栈状态</span>
+                            <span id="warp-status">未启用</span>
+                        </div>
+                        <div class="form-control">
+                            <label for="warpRegisterDryRun">注册模式</label>
+                            <div class="select-wrapper">
+                                <select id="warpRegisterDryRun" name="warpRegisterDryRun">
+                                    <option value="true">dry run（不真实注册）</option>
+                                    <option value="false">真实注册</option>
+                                </select>
+                                <span class="material-symbols-rounded">
+                                    keyboard_arrow_down
+                                </span>
+                            </div>
+                        </div>
+                        <div class="dashboard-action">
+                            <span>注册 WARP 账号（写入账号池）</span>
+                            <button type="button" class="button" onclick="registerWarpAccount(this)">
+                                <span class="material-symbols-rounded">app_registration</span>注册</button>
+                        </div>
+                        <div class="dashboard-action">
+                            <span>Cloudflare 隧道（按需唤醒）</span>
+                            <span id="tunnel-host">未唤醒</span>
+                        </div>
+                        <div class="dashboard-action">
+                            <span>唤醒 / 休眠</span>
+                            <button type="button" class="button" onclick="tunnelWake(this)">
+                                <span class="material-symbols-rounded">bolt</span>唤醒</button>
+                            <button type="button" class="button" onclick="tunnelSleep(this)">
+                                <span class="material-symbols-rounded">power_settings_new</span>休眠</button>
+                        </div>
+                        <div class="form-control">
+                            <label for="wgOutboundEnabled">WARP 出栈（warp-rust）</label>
+                            <div class="select-wrapper">
+                                <select id="wgOutboundEnabled" name="wgOutboundEnabled">
+                                    <option value="false">禁用</option>
+                                    <option value="true">启用</option>
+                                </select>
+                                <span class="material-symbols-rounded">
+                                    keyboard_arrow_down
+                                </span>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="wgOutboundSocks">出栈本地 SOCKS5</label>
+                            <div>
+                                <input type="text" id="wgOutboundSocks" name="wgOutboundSocks"
+                                    placeholder="127.0.0.1:11080">
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="cfTunnelEnabled">Cloudflare 隧道</label>
+                            <div class="select-wrapper">
+                                <select id="cfTunnelEnabled" name="cfTunnelEnabled">
+                                    <option value="false">禁用</option>
+                                    <option value="true">启用</option>
+                                </select>
+                                <span class="material-symbols-rounded">
+                                    keyboard_arrow_down
+                                </span>
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="cfTunnelToken">隧道 Token</label>
+                            <div>
+                                <input type="text" id="cfTunnelToken" name="cfTunnelToken"
+                                    placeholder="粘贴 cloudflared service install 后面的 token">
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="cfTunnelOrigin">本地回源地址</label>
+                            <div>
+                                <input type="text" id="cfTunnelOrigin" name="cfTunnelOrigin"
+                                    placeholder="127.0.0.1:8080">
+                            </div>
                         </div>
                     </div>
                 </details>
@@ -2590,6 +2646,78 @@ async function renewWarpAccounts(btn) {
     }
 }
 
+async function refreshWarpAndTunnel() {
+    try {
+        const r = await fetch('./panel/warp-status', { credentials: 'include', cache: 'no-store' });
+        const j = await r.json();
+        const b = j.body || {};
+        const el = document.getElementById('warp-status');
+        if (el) el.textContent = (b.enabled ? '已启用' : '已禁用') +
+            ' / ' + (b.ready ? '就绪' : '未就绪') +
+            ' / 账号 ' + (b.accounts || 0) +
+            (b.dryRun ? ' / dry run' : '');
+        const sel = document.getElementById('warpRegisterDryRun');
+        if (sel && b.dryRun !== undefined) sel.value = b.dryRun ? 'true' : 'false';
+        if (b.status) console.log('warp outbound:', b.status);
+    } catch (e) { console.error('warp-status', e); }
+    try {
+        const r = await fetch('./panel/tunnel-status', { credentials: 'include', cache: 'no-store' });
+        const j = await r.json();
+        const b = j.body || j;
+        const el = document.getElementById('tunnel-host');
+        if (el) el.textContent = b.url ? b.url : (b.running ? '运行中（无公网地址）' : '未唤醒');
+    } catch (e) { console.error('tunnel-status', e); }
+}
+
+async function registerWarpAccount(btn) {
+    const sel = document.getElementById('warpRegisterDryRun');
+    const dry = sel ? sel.value === 'true' : true;
+    const ok = await notify('confirm', '注册 WARP 账号',
+        [dry ? '当前是 dry run：只构造请求体，不会真实注册。' : '当前是真实注册：会调用 Cloudflare 接口。']);
+    if (!ok) return;
+    const icons = startWaiting(btn, '', '');
+    try {
+        const res = await fetch('./panel/warp-register', { method: 'POST', credentials: 'include' });
+        const j = await res.json();
+        if (!j.success) {
+            notify('error', '注册 WARP 账号', [j.message || '失败']);
+        } else {
+            const note = (j.body && j.body.note) || '完成';
+            notify('success', '注册 WARP 账号', [note]);
+        }
+        refreshWarpAndTunnel();
+    } catch (e) {
+        console.error('warp-register', e);
+        notify('error', '注册 WARP 账号', ['请求失败']);
+    } finally {
+        stopWaiting(icons);
+    }
+}
+
+async function tunnelWake(btn) {
+    const icons = startWaiting(btn, '', '');
+    try {
+        const res = await fetch('./panel/tunnel-wake', { method: 'POST', credentials: 'include' });
+        const j = await res.json();
+        if (!j.success) notify('error', '唤醒隧道', [j.message || '失败']);
+        else notify('success', '唤醒隧道', [(j.body && j.body.url) ? j.body.url : '已唤醒']);
+        refreshWarpAndTunnel();
+    } catch (e) { notify('error', '唤醒隧道', ['请求失败']); }
+    finally { stopWaiting(icons); }
+}
+
+async function tunnelSleep(btn) {
+    const icons = startWaiting(btn, '', '');
+    try {
+        const res = await fetch('./panel/tunnel-sleep', { method: 'POST', credentials: 'include' });
+        const j = await res.json();
+        if (!j.success) notify('error', '休眠隧道', [j.message || '失败']);
+        else notify('success', '休眠隧道', ['已休眠']);
+        refreshWarpAndTunnel();
+    } catch (e) { notify('error', '休眠隧道', ['请求失败']); }
+    finally { stopWaiting(icons); }
+}
+
 async function handleRiskyRules(event) {
     if (event.target.checked) {
         const proceed = await notify('confirm', 'Geo 资源文件', [
@@ -2638,7 +2766,6 @@ async function resetSettings(btn) {
         [
             '这会重置除以下之外的所有设置：',
             '+ VLESS UUID',
-            '+ Trojan password',
             '+ Panel - Subscriptions path\n',
             '确定吗？'
         ]
@@ -2993,13 +3120,6 @@ function randBase64(minBytes, maxBytes) {
     return btoa(String.fromCharCode(...randBytes(minBytes, maxBytes)));
 }
 
-function randPassword() {
-    const charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@$&*_-+;:,.';
-    const trPass = document.getElementById('trPass');
-    trPass.value = randString(charset, 16, 32);
-    handleProxyFormChanges();
-}
-
 function randPath() {
     const charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
     const securePath = document.getElementById('securePath');
@@ -3330,7 +3450,11 @@ function renderClients(clients) {
 
         document.getElementById('supported-clients').appendChild(row);
     });
-}</script>
+}
+
+// WARP outbound + on-demand tunnel: show their real state on load instead of
+// waiting for the operator to press something.
+refreshWarpAndTunnel();</script>
 </body>
 
 </html>

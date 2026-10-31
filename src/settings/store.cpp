@@ -2,6 +2,7 @@
 #include "crypto/crypto.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -16,7 +17,7 @@ static const char* kDefaultKvJson = R"({
   "allowLANConnection": false,
   "logLevel": "warning",
   "customDomain": "",
-  "protocols": "vless,trojan",
+  "protocols": "vless",
   "remoteDNS": "https://8.8.8.8/dns-query",
   "remoteDnsHost": { "isDomain": false, "host": "8.8.8.8", "ipv4": [], "ipv6": [] },
   "upstreamProxy": "",
@@ -47,6 +48,24 @@ static const char* kDefaultKvJson = R"({
   "warpEndpoints": ["engage.cloudflareclient.com:2408"],
   "warpBestPingInterval": 30,
   "warpReservedBytes": true,
+  "warpRegisterDryRun": true,
+  "wgOutbound": {
+    "enabled": false,
+    "binary": "",
+    "bindHost": "127.0.0.1",
+    "socksPort": 11080,
+    "dataDir": "",
+    "mtu": 1280,
+    "maxConnections": 0
+  },
+  "cfTunnel": {
+    "enabled": false,
+    "token": "",
+    "edgeHost": "region1.v2.argotunnel.com",
+    "edgePort": 7844,
+    "originHost": "127.0.0.1",
+    "originPort": 8080
+  },
   "xrayUdpNoises": [{ "type": "rand", "packet": "50-100", "delay": "1-5", "count": 5 }],
   "knockerNoiseMode": "quic",
   "knockerNoiseCountMin": 10,
@@ -90,8 +109,12 @@ static const char* kDefaultKvJson = R"({
 nlohmann::json Store::default_kv() {
     try {
         return nlohmann::json::parse(kDefaultKvJson);
-    } catch (...) {
-        return nlohmann::json::object();
+    } catch (const std::exception& e) {
+        // Never swallow this: an unparsable default blob silently yields an
+        // empty settings object and every panel default disappears.
+        std::fprintf(stderr, "fatal: built-in default settings are not valid JSON: %s\n",
+                     e.what());
+        std::abort();
     }
 }
 
@@ -149,7 +172,6 @@ bool Store::load(const std::string& dir, std::string& error) {
             if (j.contains("accID")) cfg_.accID = j["accID"].get<std::string>();
             if (j.contains("accEmail")) cfg_.accEmail = j["accEmail"].get<std::string>();
             if (j.contains("vlUUID")) cfg_.vlUUID = j["vlUUID"].get<std::string>();
-            if (j.contains("trPass")) cfg_.trPass = j["trPass"].get<std::string>();
             if (j.contains("securePath")) cfg_.securePath = j["securePath"].get<std::string>();
             if (j.contains("mainDomain")) cfg_.mainDomain = j["mainDomain"].get<std::string>();
             if (j.contains("fallback")) cfg_.fallback = j["fallback"].get<std::string>();
@@ -164,7 +186,6 @@ bool Store::load(const std::string& dir, std::string& error) {
     }
 
     if (cfg_.vlUUID.empty()) cfg_.vlUUID = crypto::random_hex(16);
-    if (cfg_.trPass.empty()) cfg_.trPass = crypto::random_hex(8);
 
     if (read_file(storePath, text)) {
         try {
@@ -209,7 +230,6 @@ bool Store::save(std::string& error) {
     cfg["accID"] = cfg_.accID;
     cfg["accEmail"] = cfg_.accEmail;
     cfg["vlUUID"] = cfg_.vlUUID;
-    cfg["trPass"] = cfg_.trPass;
     cfg["securePath"] = cfg_.securePath;
     cfg["mainDomain"] = cfg_.mainDomain;
     cfg["fallback"] = cfg_.fallback;
@@ -223,7 +243,6 @@ bool Store::save(std::string& error) {
 nlohmann::json Store::merged() const {
     nlohmann::json out = kv_;
     out["vlUUID"] = cfg_.vlUUID;
-    out["trPass"] = cfg_.trPass;
     out["securePath"] = cfg_.securePath;
     out["mainDomain"] = cfg_.mainDomain;
     out["fallback"] = cfg_.fallback;
@@ -232,6 +251,24 @@ nlohmann::json Store::merged() const {
     out["proxyIPs"] = cfg_.proxyIPs;
     out["prefixes"] = cfg_.prefixes;
     out["accEmail"] = cfg_.accEmail;
+
+    // The panel binds form controls by flat id, so expose the nested objects as
+    // flat fields as well.
+    if (out.contains("wgOutbound") && out["wgOutbound"].is_object()) {
+        const auto& wg = out["wgOutbound"];
+        out["wgOutboundEnabled"] = wg.value("enabled", false) ? "true" : "false";
+        const std::string bh = wg.value("bindHost", std::string{"127.0.0.1"});
+        const int sp = wg.value("socksPort", 11080);
+        out["wgOutboundSocks"] = bh + ":" + std::to_string(sp);
+    }
+    if (out.contains("cfTunnel") && out["cfTunnel"].is_object()) {
+        const auto& ct = out["cfTunnel"];
+        out["cfTunnelEnabled"] = ct.value("enabled", false) ? "true" : "false";
+        out["cfTunnelToken"] = ct.value("token", std::string{});
+        const std::string oh = ct.value("originHost", std::string{"127.0.0.1"});
+        const int op = ct.value("originPort", 8080);
+        out["cfTunnelOrigin"] = oh + ":" + std::to_string(op);
+    }
     return out;
 }
 

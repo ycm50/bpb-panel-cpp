@@ -31,6 +31,13 @@ bool tls_init_server(const std::string& cert_path, const std::string& key_path, 
         return false;
     }
     SSL_CTX_set_session_cache_mode(g_ctx, SSL_SESS_CACHE_SERVER);
+    // The server side is non-blocking. Without partial-write mode SSL_write()
+    // buffers a whole record internally and reports WANT_WRITE having consumed
+    // nothing, so flushing a large response stalls until the peer's socket
+    // happens to become writable again. Enabling partial writes lets it return
+    // the bytes it actually managed to encode, which is what our flush() loop
+    // expects (it erases exactly n bytes and retries the remainder).
+    SSL_CTX_set_mode(g_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
     return true;
 }
 

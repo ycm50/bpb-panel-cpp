@@ -1,29 +1,141 @@
 name: build
 
+# 本工作流只产出**可执行二进制**，不构建、不推送任何容器镜像。
+# alpine 容器仅作为一次性的编译环境（提供 musl 与静态库），跑完即弃。
+#
+# 触发方式：**只有手动**（Actions -> build -> Run workflow），没有 push / PR 触发。
+# 5 个架构各要在 QEMU 下编一遍，不值得为每次提交都跑。
+#
+# 手动运行时填：
+#   branch   —— 要编译的分支（默认 main；也可填 tag / 提交 SHA，留空则用触发这次
+#               运行时所选的分支）。页面右上角 "Use workflow from" 只决定跑哪份
+#               workflow 文件，真正 checkout 哪份代码由这个输入框决定。
+#   tag      —— 发布 tag 号。**必须等全部架构都构建成功**之后，release 任务才会用
+#               它创建 tag 并建 Release；任一架构失败，仓库里不会出现这个 tag。
+#   warp_tag —— 可选。要把哪个上游 cf-warp-rust 版本塞进发布包；留空 = 上游最新
+#               release。填了就按该 tag 取（便于复现历史发布）。
+#
+# 为什么 CI 不编译 warp-rust（WARP 出栈那个独立进程）：
+#   它的 TLS 栈由 rustls 拉进 aws-lc-sys（reqwest 0.13 的 rustls feature 就是
+#   __rustls-aws-lc-rs）以及 ring 0.17 -- 两者都是"Rust 包一层 C 库"。
+#   AWS-LC 官方活跃测试的 Linux 平台只有 aarch64 / x86-64（arm32 / x86 /
+#   risc-v64 属 best-effort），pregenerated bindings 也只覆盖 aarch64 / x86-64
+#   的 gnu 与 musl；上游 Shannon-x/cf-warp-rust 自己的 release 同样只产出
+#   x86_64-unknown-linux-musl 与 aarch64-unknown-linux-musl（+ Windows）。
+#   所以这里改成：release 时直接从上游 release 取那两个静态 musl 二进制，
+#   校验上游 sha256 后跟 bpb 一起发。其余架构只发 bpb —— 缺 warp-rust 时面板把
+#   WARP 出栈标记为不可用，其它功能不受影响。
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
     inputs:
+      branch:
+        description: "要构建的分支（也可填 tag 或提交 SHA；留空 = 用触发这次运行时所选的分支）"
+        required: false
+        default: "main"
+        type: string
       tag:
-        description: "发布 tag（所有架构构建成功后才创建），例如 v1.0.0"
+        description: "发布 tag（等全部架构构建成功后才创建），例如 v1.0.0"
         required: true
         type: string
+      warp_tag:
+        description: "打包用的上游 cf-warp-rust 版本（留空 = 上游最新 release）"
+        required: false
+        default: ""
+        type: string
 
+# 同一分支同时只跑一份。故意不开启 cancel-in-progress：release 跑到一半被新的
+# 手动触发顶掉，会留下「产物没上传、tag 没建」的中间态。
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ inputs.branch || github.ref_name }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
+env:
+  # C++ 侧固定用 alpine 3.22（当前已验证五个架构都能编过 musl 静态二进制）。
+  CPP_IMAGE: alpine:3.22
+  # warp-rust 二进制的来源仓库。
+  UPSTREAM_WARP: Shannon-x/cf-warp-rust
+
 jobs:
+  # ---------------------------------------------------------------------------
+  # 前置校验：解析要构建的提交，并把 tag 号 / 上游版本号校验完。
+  # 早失败，别等 5 个架构编了 20 分钟才发现 tag 打错或已被占用。
+  # ---------------------------------------------------------------------------
+  preflight:
+    name: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      ref: ${{ steps.resolve.outputs.ref }}
+    steps:
+      # branch 留空时退回「这次运行所选的分支」，所以两种选法都成立：
+      #   · 页面右上角 "Use workflow from" 选分支（决定跑哪份 workflow 文件）
+      #   · 输入框 branch 填要编译的分支（决定 checkout 哪份代码）
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Resolve commit
+        id: resolve
+        env:
+          REF: ${{ inputs.branch || github.ref_name }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "ref=${REF}" >> "$GITHUB_OUTPUT"
+          echo "build ref=${REF} sha=${sha} tag=${{ inputs.tag }}"
+          git log -1 --pretty='%H %s'
+
+      - name: Validate tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$TAG" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+]+)?$'; then
+            echo "::error::tag '$TAG' 不是合法版本号（示例：v1.0.0、v1.2.3-rc1）"
+            exit 1
+          fi
+          # 已存在的 tag 一律拒绝：release 不覆盖历史版本。
+          if [ -n "$(git ls-remote --tags origin "refs/tags/$TAG")" ]; then
+            echo "::error::tag '$TAG' 已存在于仓库，发布任务不会覆盖已有 tag"
+            exit 1
+          fi
+          echo "tag '$TAG' OK"
+
+      # warp_tag 是可选的，但只要填了就必须真的存在，否则等打包时才炸就白编了。
+      - name: Validate upstream warp-rust tag
+        if: inputs.warp_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WANT: ${{ inputs.warp_tag }}
+        run: |
+          set -euo pipefail
+          gh release view "$WANT" --repo "${{ env.UPSTREAM_WARP }}" >/dev/null \
+            || { echo "::error::upstream release '$WANT' not found in ${{ env.UPSTREAM_WARP }}"; exit 1; }
+          echo "upstream warp-rust tag '$WANT' OK"
+
+  # ---------------------------------------------------------------------------
+  # 各架构的静态 Linux 二进制（只有 bpb）。
+  #
+  # 用 CMake 而不是裸 g++：CMake 负责配置 include 路径，裸命令容易漏。
+  # 用 -DBPB_STATIC=ON 而不是只加 -static：否则 CMake 仍解析到 libssl.so，
+  # 链接会报 "attempted static link of dynamic object"。
+  #
+  # 不拉子模块：warp-rust 不再由 CI 编译（见文件顶部说明），checkout 只要源码。
+  # ---------------------------------------------------------------------------
   linux:
     name: linux-${{ matrix.arch }}
+    needs: preflight
     runs-on: ubuntu-24.04
+    # riscv64 / armv7 走 QEMU，光 apk 装依赖就要十几分钟；给足时间但别无限挂着。
+    timeout-minutes: 60
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           - arch: amd64
@@ -37,40 +149,64 @@ jobs:
           - arch: riscv64
             platform: linux/riscv64
     steps:
+      # 按 preflight 解析出的 SHA 构建：分支在构建期间被推新提交也不影响产物与 tag 的对应关系。
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Set up QEMU
         if: matrix.arch != 'amd64'
         uses: docker/setup-qemu-action@v3
 
-      # 只产出二进制：alpine 镜像仅作为一次性编译环境，不构建也不发布容器镜像。
-      - name: Build static binary
+      - name: Build bpb (C++, static)
         run: |
+          set -euo pipefail
           mkdir -p dist
           docker run --rm --platform ${{ matrix.platform }} \
-            -v "$PWD:/src" -w /src alpine:3.22 sh -c '
+            -v "$PWD:/src" -w /src \
+            "$CPP_IMAGE" sh -c '
               set -e
-              apk add --no-cache g++ musl-dev openssl-dev openssl-libs-static \
-                      zlib-dev zlib-static >/dev/null
-              g++ -O2 -std=c++20 -static -ffunction-sections -fdata-sections \
-                  -Isrc -Ithird_party \
-                  src/*.cpp src/*/*.cpp third_party/qrcodegen.cpp \
-                  -o dist/bpb-linux-${{ matrix.arch }} -lssl -lcrypto -lz -lpthread
-              strip dist/bpb-linux-${{ matrix.arch }}
+              apk add --no-cache g++ musl-dev cmake samurai \
+                      openssl-dev openssl-libs-static zlib-dev zlib-static >/dev/null
+              cmake -S . -B /tmp/b -G Ninja -DCMAKE_BUILD_TYPE=Release -DBPB_STATIC=ON
+              cmake --build /tmp/b
+              strip /tmp/b/bpb
+              cp /tmp/b/bpb dist/bpb-linux-${{ matrix.arch }}
             '
           ls -l dist
+
+      # 产物必须能真正跑起来，且不依赖动态库。
+      - name: Verify the binary runs and is static
+        run: |
+          set -euo pipefail
+          test -s "dist/bpb-linux-${{ matrix.arch }}" \
+            || { echo "::error::dist/bpb-linux-${{ matrix.arch }} is empty"; exit 1; }
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v "$PWD/dist:/dist:ro" -w /dist "$CPP_IMAGE" sh -c "
+              ./bpb-linux-${{ matrix.arch }} --help >/dev/null
+              echo 'runs OK'
+            "
 
       - uses: actions/upload-artifact@v4
         with:
           name: bpb-linux-${{ matrix.arch }}
-          path: dist/bpb-linux-${{ matrix.arch }}
+          path: dist/*
           if-no-files-found: error
 
+  # ---------------------------------------------------------------------------
+  # Windows（MSYS2 UCRT64；CMake 会拒绝 MSVC）
+  # ---------------------------------------------------------------------------
   windows:
     name: windows-x86_64
+    needs: preflight
     runs-on: windows-2022
+    timeout-minutes: 60
     steps:
+      # Windows 上 bpb 把 WARP 出栈降级为 "unsupported"（见 src/net/warp_proc.cpp
+      # 的 _WIN32 分支），所以这里也不需要 warp-rust，不需要子模块。
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
 
       - name: Set up MSYS2 (UCRT64)
         uses: msys2/setup-msys2@v2
@@ -96,21 +232,56 @@ jobs:
           mkdir -p dist
           cp build/bpb.exe dist/bpb-windows-x86_64.exe
 
+      # 必须用 --help/--port 在 MSYS2 环境里跑：UCRT64 产物依赖 MSYS2 的
+      # runtime DLL，直接在 pwsh 里启动会因缺 DLL 立刻退出（表现为端口拒绝连接）。
+      - name: Smoke test
+        shell: msys2 {0}
+        run: |
+          set -e
+          mkdir -p smoke-data
+          ./dist/bpb-windows-x86_64.exe --help > /dev/null
+          ./dist/bpb-windows-x86_64.exe --port 18080 --data ./smoke-data &
+          pid=$!
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            sleep 1
+            if curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/securepath/panel 2>/dev/null | grep -q 200; then
+              echo "panel OK"
+              kill $pid 2>/dev/null || true
+              exit 0
+            fi
+          done
+          echo "::error::panel did not answer on 18080"
+          kill $pid 2>/dev/null || true
+          exit 1
+
       - uses: actions/upload-artifact@v4
         with:
           name: bpb-windows-x86_64
           path: dist/bpb-windows-x86_64.exe
           if-no-files-found: error
 
+  # ---------------------------------------------------------------------------
+  # 发布：
+  #   1. 只有手动触发、且 preflight + 全部架构都成功时才跑；
+  #   2. 从上游 cf-warp-rust 的 release 取 amd64 / arm64 的静态 musl 二进制，
+  #      校验上游 sha256 后放进本次发布；
+  #   3. 全部产物齐了才算 SHA256SUMS，**最后**才创建 tag 与 Release。
+  #   编译没全过，仓库里就不会多出一个 tag。
+  # ---------------------------------------------------------------------------
   release:
-    name: release ${{ inputs.tag }}
-    # 仅手动触发，且必须所有构建（含全部架构）都成功。
-    if: github.event_name == 'workflow_dispatch' && success()
-    needs: [linux, windows]
+    name: release
+    needs: [preflight, linux, windows]
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      needs.preflight.result == 'success' &&
+      needs.linux.result == 'success' &&
+      needs.windows.result == 'success'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.preflight.outputs.sha }}
           fetch-depth: 0
 
       - name: Download all build artifacts
@@ -119,18 +290,89 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # 上游只提供 x86_64 / aarch64 两个 musl 静态包，正好对应 bpb 的 amd64 / arm64。
+      - name: Fetch warp-rust from upstream release
+        id: warp
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WANT: ${{ inputs.warp_tag }}
+        run: |
+          set -euo pipefail
+          upstream="${{ env.UPSTREAM_WARP }}"
+          if [ -n "$WANT" ]; then
+            tag="$WANT"
+            gh release view "$tag" --repo "$upstream" >/dev/null
+          else
+            tag="$(gh release view --repo "$upstream" --json tagName -q .tagName)"
+          fi
+          echo "upstream=${upstream} tag=${tag}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+          tmp="$(mktemp -d)"
+          gh release download "$tag" --repo "$upstream" --dir "$tmp" \
+            --pattern '*unknown-linux-musl.tar.gz' \
+            --pattern '*unknown-linux-musl.tar.gz.sha256'
+          ls -l "$tmp"
+
+          # 上游给了 sha256：拿不到就直接失败，绝不把没校验的第三方二进制混进发布。
+          ( cd "$tmp" && sha256sum -c ./*.tar.gz.sha256 )
+
+          for triple in x86_64 aarch64; do
+            tarball="$(ls "$tmp"/*-"$triple"-unknown-linux-musl.tar.gz)"
+            unpack="$(mktemp -d)"
+            tar xzf "$tarball" -C "$unpack"
+            src="$(find "$unpack" -type f -name warp-rust -print -quit)"
+            [ -n "$src" ] || { echo "::error::no warp-rust binary inside $tarball"; exit 1; }
+            case "$triple" in
+              x86_64)  dst=dist/warp-rust-linux-amd64 ;;
+              aarch64) dst=dist/warp-rust-linux-arm64 ;;
+            esac
+            cp "$src" "$dst"
+            chmod +x "$dst"
+            echo "$dst <- $(basename "$tarball")"
+          done
+
+          {
+            echo "warp-rust 来自 https://github.com/$upstream 的 release $tag"
+            echo "（本仓库的 CI 不编译 warp-rust，原因见 .github/workflows/build.yml 顶部注释）"
+            echo
+            echo "上游校验和："
+            ( cd "$tmp" && cat ./*.tar.gz.sha256 )
+          } > dist/warp-rust-source.txt
+          cat dist/warp-rust-source.txt
+
+      # amd64 在 runner 上直接跑（musl 静态，x86_64 runner 原生可执行）；
+      # arm64 没法执行，就核对 ELF 头的 e_machine（0xb7 = AArch64，0x3e = x86-64），
+      # 比依赖 file(1) 的字符串更硬。
+      - name: Smoke test upstream warp-rust
+        run: |
+          set -euo pipefail
+          ./dist/warp-rust-linux-amd64 --version
+          file dist/warp-rust-linux-* || true
+          machine="$(od -An -tx1 -j18 -N2 dist/warp-rust-linux-arm64 | tr -d ' \n')"
+          [ "$machine" = "b700" ] \
+            || { echo "::error::dist/warp-rust-linux-arm64 is not aarch64 (e_machine=$machine)"; exit 1; }
+
       - name: Package
         run: |
-          ls -l dist
+          set -euo pipefail
+          for f in \
+            bpb-linux-amd64 bpb-linux-arm64 bpb-linux-armv7 bpb-linux-386 bpb-linux-riscv64 \
+            warp-rust-linux-amd64 warp-rust-linux-arm64 \
+            bpb-windows-x86_64.exe; do
+            test -s "dist/$f" || { echo "::error::missing or empty artifact dist/$f"; exit 1; }
+          done
           cd dist
-          sha256sum bpb-linux-* bpb-windows-* > SHA256SUMS
+          sha256sum bpb-linux-* warp-rust-linux-* bpb-windows-* > SHA256SUMS
+          cat SHA256SUMS
 
+      # tag 在这里第一次被创建（同时建 Release）。跑到这一步说明全部架构已成功。
       - name: Create tag and GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag }}
           name: ${{ inputs.tag }}
-          target_commitish: ${{ github.sha }}
+          target_commitish: ${{ needs.preflight.outputs.sha }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
@@ -139,5 +381,15 @@ jobs:
             dist/bpb-linux-armv7
             dist/bpb-linux-386
             dist/bpb-linux-riscv64
+            dist/warp-rust-linux-amd64
+            dist/warp-rust-linux-arm64
             dist/bpb-windows-x86_64.exe
+            dist/warp-rust-source.txt
             dist/SHA256SUMS
+
+      - name: Summary
+        run: |
+          echo "### released ${{ inputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- branch/ref: \`${{ needs.preflight.outputs.ref }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- commit: \`${{ needs.preflight.outputs.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- warp-rust: \`${{ steps.warp.outputs.tag }}\` (upstream)" >> "$GITHUB_STEP_SUMMARY"

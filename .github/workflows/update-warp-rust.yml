@@ -1,0 +1,85 @@
+name: update-warp-rust
+
+# 把 third_party/cf-warp-rust 子模块前进到上游最新的 release tag。
+#
+# 只改子模块指针、不碰源码：真正的校验（能否编译、能否跑起来）交给 build
+# 工作流——它现在**只有手动触发**，所以升级后需要手动 Run 一次 build（选分支、
+# 填 tag），编译失败才会在那里暴露；在那之前不算验证过。
+on:
+  schedule:
+    # 每周一 04:17 UTC，避开整点高峰
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "目标 tag（留空 = 上游最新 tag）"
+        required: false
+        type: string
+
+concurrency:
+  group: update-warp-rust
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve target tag
+        id: target
+        run: |
+          set -euo pipefail
+          cd third_party/cf-warp-rust
+          git fetch --tags --prune origin
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+            git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1 || {
+              echo "::error::tag ${TAG} not found upstream"; exit 1; }
+          else
+            TAG="$(git tag --list 'v*' --sort=-v:refname | head -n1)"
+          fi
+          [ -n "$TAG" ] || { echo "::error::no upstream tags found"; exit 1; }
+          CUR="$(git describe --tags --always)"
+          echo "current=$CUR target=$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [ "$CUR" = "$TAG" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Move submodule pointer
+        if: steps.target.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          cd third_party/cf-warp-rust
+          git checkout --detach "refs/tags/${{ steps.target.outputs.tag }}"
+          git describe --tags
+          cd ../..
+          git add third_party/cf-warp-rust
+
+      - name: Commit
+        if: steps.target.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(warp): bump cf-warp-rust to ${{ steps.target.outputs.tag }}" \
+                     -m "Automated submodule bump. build.yml 是手动触发的：需要手动 Run 一次才会重新编译该子模块并做静态/运行校验。"
+          git push origin HEAD:${{ github.ref_name }}
+
+      - name: Report
+        run: |
+          if [ "${{ steps.target.outputs.changed }}" = "true" ]; then
+            echo "bumped to ${{ steps.target.outputs.tag }}"
+          else
+            echo "already at ${{ steps.target.outputs.tag }}, nothing to do"
+          fi

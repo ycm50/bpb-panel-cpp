@@ -24,9 +24,8 @@ static std::string encode_fragment(const std::string& in) {
 static std::string build_config_url(const std::string& protocol, const std::string& address,
                                     int port, const std::string& host, const std::string& sni,
                                     const std::string& remark, bool is_tls, const std::string& client,
-                                    const std::string& uuid, const std::string& tr_pass,
-                                    const std::string& fingerprint) {
-    std::string user = (protocol == "vless") ? uuid : tr_pass;
+                                    const std::string& uuid, const std::string& fingerprint) {
+    std::string user = uuid;
     std::string path = generate_ws_path(protocol);
 
     std::string url = protocol + "://" + user + "@" + address + ":" + std::to_string(port) + "?";
@@ -61,7 +60,6 @@ SubResult build_raw_configs(const nlohmann::json& s, const std::string& client) 
     std::string custom_domain = s.value("customDomain", std::string());
     std::string main_domain = s.value("mainDomain", std::string("localhost"));
     std::string vl_uuid = s.value("vlUUID", std::string());
-    std::string tr_pass = s.value("trPass", std::string());
 
     std::string upstream_server;
     int upstream_port = 0;
@@ -81,7 +79,7 @@ SubResult build_raw_configs(const nlohmann::json& s, const std::string& client) 
     if (!custom_domain.empty()) domains.push_back(custom_domain);
 
     auto protocols = get_protocols(s);
-    std::string vl_confs, tr_confs;
+    std::string vl_confs;
     int proxy_index = 1;
 
     for (auto& domain : domains) {
@@ -114,21 +112,19 @@ SubResult build_raw_configs(const nlohmann::json& s, const std::string& client) 
                 bool is_tls = is_https(s, port) || (!upstream_server.empty() && addr == upstream_server);
 
                 for (auto& proto : protocols) {
-                    if (proto != "vless" && proto != "trojan") continue;
+                    if (proto != "vless") continue;
                     std::string remark =
                         generate_remark(s, proxy_index, port, addr, proto, domain, false, false);
                     std::string url = build_config_url(proto, addr, port, sni_host.host, sni_host.sni,
-                                                       remark, is_tls, client, vl_uuid, tr_pass,
-                                                       fingerprint);
-                    if (proto == "vless") vl_confs += url + "\n";
-                    else tr_confs += url + "\n";
+                                                       remark, is_tls, client, vl_uuid, fingerprint);
+                    vl_confs += url + "\n";
                 }
                 ++proxy_index;
             }
         }
     }
 
-    result.body = vl_confs + tr_confs;
+    result.body = vl_confs;
     result.dns = s.value("remoteDNS", std::string());
     result.profile_title = "base64:" + base64_encode(std::string("\xF0\x9F\x92\xA6 BPB Raw"));
     return result;

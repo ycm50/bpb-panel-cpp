@@ -1,14 +1,18 @@
 #include "proxy/session.h"
 #include "crypto/crypto.h"
 #include "net/tls.h"
+#include "net/warp_proc.h"
+#include "net/wg_outbound.h"
 #include "util/util.h"
 
 #include <openssl/ssl.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <random>
 #include <thread>
 
@@ -36,6 +40,7 @@ int64_t now_ms() {
 
 bool send_all(SSL* ssl, socket_t fd, const char* data, std::size_t len) {
     std::size_t sent = 0;
+    int stalls = 0;
     while (sent < len) {
         net::IoResult result = net::IoResult::Error;
         int n = net::tls_write(ssl, fd, data + sent, static_cast<int>(len - sent), result);
@@ -44,8 +49,18 @@ bool send_all(SSL* ssl, socket_t fd, const char* data, std::size_t len) {
             continue;
         }
         if (result == net::IoResult::WouldBlock) {
-            net::PollFd pfd{fd, static_cast<short>(net::kWrite | net::kRead), 0};
-            if (net::poll_fds(&pfd, 1, 10000) <= 0) return false;
+            // A partially written websocket frame MUST be finished: bailing out
+            // half-way tears the stream and the caller closes the origin, which
+            // is exactly the "up=80 down=3380 then upstream closed" signature.
+            // Wait for writability in bounded slices and keep retrying for a
+            // while; only a truly stuck peer (TCP zero window for 10s) is
+            // treated as a dead connection.
+            net::PollFd pfd{fd, net::kWrite, 0};
+            if (net::poll_fds(&pfd, 1, 500) <= 0) {
+                if (++stalls > 20) return false;   // ~10s of no progress
+                continue;
+            }
+            stalls = 0;
             continue;
         }
         return false;
@@ -75,6 +90,36 @@ bool ws_send(SSL* ssl, socket_t fd, const char* data, std::size_t len, int opcod
     if (len == 0) return true;
     return send_all(ssl, fd, data, len);
 }
+
+// Outbound abstraction. Both a direct connection and a WARP one are ordinary
+// sockets now: the WARP path is a SOCKS5 tunnel opened against the supervised
+// warp-rust process, so the relay code below needs no special casing and the
+// panel keeps working when that process is unavailable.
+struct Outbound {
+    socket_t fd = net::kInvalid;
+    bool via_socks = false;
+
+    bool valid() const { return fd != net::kInvalid; }
+    bool viaWarp() const { return via_socks; }
+
+    // Reads up to len bytes. Returns >0, 0 on timeout, -1 on close.
+    int read(char* buf, int len, int /*timeout_ms*/) {
+        // Deliberately non-blocking: the caller loops with a short sleep and
+        // holds upstreamMutex around this call, so waiting here would stall the
+        // upload direction.
+        int n = static_cast<int>(::recv(fd, buf, len, 0));
+        if (n > 0) return n;
+        if (n == 0) return -1;
+        if (net::would_block(net::last_error())) return 0;
+        return -1;
+    }
+    bool write(const char* buf, std::size_t len) {
+        return send_all(nullptr, fd, buf, len);
+    }
+    void close() {
+        if (fd != net::kInvalid) { net::close(fd); fd = net::kInvalid; }
+    }
+};
 
 socket_t connect_tcp(const std::string& host, int port, int timeout_ms) {
     addrinfo hints{};
@@ -118,17 +163,38 @@ socket_t connect_tcp(const std::string& host, int port, int timeout_ms) {
     return out;
 }
 
+// Connects to host:port, preferring the WARP tunnel when it is ready. Falls back
+// to a direct socket so the panel keeps working if WARP is unavailable.
+Outbound connect_outbound(const std::string& host, int port, int timeout_ms) {
+    Outbound ob;
+    // Prefer WARP: warp-rust resolves the name inside the tunnel, so the panel
+    // never leaks the destination DNS query.
+    if (net::wg_outbound_ready()) {
+        socket_t s = net::warp_socks_connect(host, port, timeout_ms);
+        if (s != net::kInvalid) {
+            ob.fd = s;
+            ob.via_socks = true;
+            return ob;
+        }
+    }
+    ob.fd = connect_tcp(host, port, timeout_ms);
+    return ob;
+}
+
 struct Addr {
     std::string host;
     int port = 0;
+    // Set when parsing stopped only because more bytes are needed; early data
+    // often ends mid-address.
+    bool need_more = false;
 };
 
 // Parses atyp + address starting at pos (no port). Returns false when incomplete.
 bool parse_atyp_addr(const std::string& buf, std::size_t& pos, Addr& addr) {
-    if (pos >= buf.size()) return false;
+    if (pos >= buf.size()) { addr.need_more = true; return false; }
     int atyp = static_cast<unsigned char>(buf[pos++]);
     if (atyp == 1) {
-        if (pos + 4 > buf.size()) return false;
+        if (pos + 4 > buf.size()) { addr.need_more = true; return false; }
         char ip[32];
         std::snprintf(ip, sizeof(ip), "%u.%u.%u.%u", static_cast<unsigned char>(buf[pos]),
                       static_cast<unsigned char>(buf[pos + 1]),
@@ -137,13 +203,13 @@ bool parse_atyp_addr(const std::string& buf, std::size_t& pos, Addr& addr) {
         addr.host = ip;
         pos += 4;
     } else if (atyp == 2) {
-        if (pos >= buf.size()) return false;
+        if (pos >= buf.size()) { addr.need_more = true; return false; }
         std::size_t len = static_cast<unsigned char>(buf[pos++]);
-        if (pos + len > buf.size()) return false;
+        if (pos + len > buf.size()) { addr.need_more = true; return false; }
         addr.host = buf.substr(pos, len);
         pos += len;
     } else if (atyp == 3) {
-        if (pos + 16 > buf.size()) return false;
+        if (pos + 16 > buf.size()) { addr.need_more = true; return false; }
         char ip[64];
         std::snprintf(ip, sizeof(ip), "[%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x]",
                       static_cast<unsigned char>(buf[pos]), static_cast<unsigned char>(buf[pos + 1]),
@@ -169,9 +235,13 @@ bool read_port(const std::string& buf, std::size_t& pos, Addr& addr) {
     return true;
 }
 
+// urgent=true means "not enough bytes yet, wait for more"; false means the
+// bytes are wrong and the session must be dropped. Early data routinely
+// delivers a truncated header, so the two cases must not be conflated.
 bool parse_vless(const std::string& buf, const std::string& uuid, Addr& addr, std::size_t& header_len,
-                 std::string& response_header) {
-    if (buf.size() < 24) return false;
+                 std::string& response_header, bool& need_more) {
+    need_more = false;
+    if (buf.size() < 18) { need_more = true; return false; }
     int version = static_cast<unsigned char>(buf[0]);
     std::string uuid_bytes = buf.substr(1, 16);
     std::string expected;
@@ -188,12 +258,13 @@ bool parse_vless(const std::string& buf, const std::string& uuid, Addr& addr, st
 
     std::size_t pos = 17;
     std::size_t addons_len = static_cast<unsigned char>(buf[pos++]);
-    if (buf.size() < pos + addons_len + 1) return false;
+    if (buf.size() < pos + addons_len + 1) { need_more = true; return false; }
     pos += addons_len;
     int command = static_cast<unsigned char>(buf[pos++]);
     if (command != 1) return false;  // only TCP
+    if (pos + 2 > buf.size()) { need_more = true; return false; }
     if (!read_port(buf, pos, addr)) return false;
-    if (!parse_atyp_addr(buf, pos, addr)) return false;
+    if (!parse_atyp_addr(buf, pos, addr)) { need_more = addr.need_more; return false; }
     header_len = pos;
 
     response_header.push_back(static_cast<char>(version));
@@ -201,25 +272,10 @@ bool parse_vless(const std::string& buf, const std::string& uuid, Addr& addr, st
     return true;
 }
 
-bool parse_trojan(const std::string& buf, const std::string& password, Addr& addr,
-                  std::size_t& header_len) {
-    std::string hash = crypto::sha224_hex(password);
-    if (buf.size() < 56 + 2) return false;
-    if (buf.compare(0, 56, hash) != 0) return false;
-    if (buf.compare(56, 2, "\r\n") != 0) return false;
-    std::size_t pos = 58;
-    if (pos >= buf.size()) return false;
-    int command = static_cast<unsigned char>(buf[pos++]);
-    if (command != 1) return false;
-    if (!parse_atyp_addr(buf, pos, addr)) return false;
-    if (!read_port(buf, pos, addr)) return false;
-    if (buf.compare(pos, 2, "\r\n") != 0) return false;
-    header_len = pos + 2;
-    return true;
-}
-
 // Reads one websocket frame payload into out. Returns false on close/error.
-enum class FrameState { Ok, Closed, Error };
+//   Ok       -- a whole frame was decoded
+//   NeedMore -- no complete frame yet; the caller must poll and retry
+enum class FrameState { Ok, Closed, Error, NeedMore };
 
 FrameState read_frame(SSL* ssl, socket_t fd, std::string& pending, std::string& payload,
                        int& opcode) {
@@ -268,9 +324,11 @@ FrameState read_frame(SSL* ssl, socket_t fd, std::string& pending, std::string& 
         } else if (result == net::IoResult::WouldBlock) {
             // TLS can hold decrypted bytes that never trigger a socket readable event.
             if (net::tls_pending(ssl) > 0) continue;
-            net::PollFd pfd{fd, net::kRead, 0};
-            if (net::poll_fds(&pfd, 1, 60000) <= 0) return FrameState::Error;
-            continue;
+            // Nothing buffered: return to the caller instead of sleeping here.
+            // Blocking inside read_frame meant the reverse direction (origin ->
+            // eyeball) got no service until a full websocket frame arrived,
+            // which is what froze large downloads mid-flight.
+            return FrameState::NeedMore;
         } else {
             return FrameState::Closed;
         }
@@ -305,98 +363,175 @@ bool resolve_target(const std::string& host, int port, const SessionConfig& conf
     return true;
 }
 
-void session_loop(SSL* client_ssl, socket_t client, const std::string& protocol,
-                  const SessionConfig& config) {
-    std::string pending;
-    std::string handshake_buffer;
-    bool connected = false;
-    socket_t upstream = net::kInvalid;
-    bool vless = (protocol == "vl");
+// early holds the bytes Xray delivered in Sec-WebSocket-Protocol; they are
+// replayed as the first frame payload so the VLESS handshake sees one
+// continuous stream.
+void session_loop(SSL* client_ssl, socket_t client, const SessionConfig& config,
+                  std::string early = std::string()) {
+    Outbound upstream;
     std::string response_header;
+    unsigned long long to_upstream = 0;   // WS payload bytes handed to the target
+    unsigned long long to_client = 0;     // payload bytes written back to the client
+    // Why the loop ended. Every exit path sets this so a stalled session can be
+    // diagnosed from the log instead of guessed at.
+    // Written by whichever direction ends first; reported once both joined.
+    std::atomic<const char*> exitReason{"session finished"};
 
+    bool need_more = false;
     auto try_connect = [&](const std::string& data) -> bool {
         Addr addr;
         std::size_t header_len = 0;
-        bool ok = vless ? parse_vless(data, config.vl_uuid, addr, header_len, response_header)
-                        : parse_trojan(data, config.tr_pass, addr, header_len);
-        if (!ok) return false;
+        need_more = false;
+        if (!parse_vless(data, config.vl_uuid, addr, header_len, response_header, need_more))
+            return false;
 
         Addr target;
         resolve_target(addr.host, addr.port, config, target);
-        upstream = connect_tcp(target.host, target.port, 5000);
-        if (upstream == net::kInvalid) return false;
+        upstream = connect_outbound(target.host, target.port, 8000);
+        if (!upstream.valid()) return false;
 
         if (!response_header.empty()) {
             if (!ws_send(client_ssl, client, response_header.data(), response_header.size())) return false;
         }
         if (data.size() > header_len) {
             std::string rest = data.substr(header_len);
-            if (!send_all(nullptr, upstream, rest.data(), rest.size())) return false;
+            if (!upstream.write(rest.data(), rest.size())) return false;
         }
-        connected = true;
         return true;
     };
 
-    while (true) {
-        net::PollFd fds[2];
-        std::size_t count = 0;
-        bool client_pending = (net::tls_pending(client_ssl) > 0);
-        if (client_pending) {
-            fds[0] = {client, net::kRead, net::kRead};
-            fds[1] = {upstream, net::kRead, 0};
-            count = 2;
-        } else {
-            fds[0] = {client, net::kRead, 0};
-            fds[1] = {net::kInvalid, 0, 0};
-            count = 1;
-            if (connected && upstream != net::kInvalid) {
-                fds[1] = {upstream, net::kRead, 0};
-                count = 2;
-            }
-            int rc = net::poll_fds(fds, count, 60000);
-            if (rc <= 0) break;
-        }
+    // Mirrors cloudflared's stream.Pipe: one blocking transfer per direction.
+    //
+    // The single-threaded poll loop this replaces had to hand-schedule both
+    // directions, and every attempt to tune it (poll timeout, backlog flags,
+    // partial reads) only shifted the failure rate: a slow or momentarily
+    // unwritable peer in one direction starved the other and the edge gave up
+    // 15s later. Two threads cannot starve each other by construction.
+    std::atomic<bool> finished{false};
+    std::atomic<bool> upstreamReady{false};
+    std::mutex upstreamMutex;
 
-        if (fds[0].revents & (net::kRead | net::kError)) {
-            std::string payload;
-            int opcode = 0;
-            FrameState state = read_frame(client_ssl, client, pending, payload, opcode);
-            if (state != FrameState::Ok) {
-                if (!connected && !handshake_buffer.empty()) {
-                    // try again with what we have
-                    if (!try_connect(handshake_buffer)) break;
+    // ---- client -> upstream ------------------------------------------------
+    // Also owns the VLESS handshake: the target address only becomes known once
+    // the first websocket frame (or early data) has been parsed.
+    std::thread toUpstream([&] {
+        std::string hasBuf = early;
+        std::string framePending;
+        try {
+            while (!finished.load()) {
+                if (!upstreamReady.load()) {
+                    if (!hasBuf.empty()) {
+                        bool ok = false;
+                        {
+                            std::lock_guard<std::mutex> lk(upstreamMutex);
+                            ok = try_connect(hasBuf);
+                        }
+                        if (ok) {
+                            hasBuf.clear();
+                            upstreamReady.store(true);
+                        } else if (!need_more || hasBuf.size() > 8192) {
+                            exitReason = "handshake rejected";
+                            break;
+                        }
+                    }
+                }
+                std::string payload;
+                int opcode = 0;
+                FrameState st = read_frame(client_ssl, client, framePending, payload, opcode);
+                if (st == FrameState::NeedMore) {
+                    // Nothing complete yet; a short sleep keeps this thread from
+                    // spinning while the other direction keeps flowing.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     continue;
                 }
-                break;
-            }
-            if (opcode == 0x8) break;              // close
-            if (opcode == 0x9) {                   // ping
-                ws_send(client_ssl, client, payload.data(), payload.size(), 0xA);
-                continue;
-            }
-            if (opcode == 0xA) continue;           // pong
-
-            if (!connected) {
-                handshake_buffer += payload;
-                if (!try_connect(handshake_buffer)) {
-                    if (handshake_buffer.size() > 64) break;
+                if (st != FrameState::Ok) {
+                    exitReason = (st == FrameState::Closed) ? "client closed" : "client frame error";
+                    break;
+                }
+                if (opcode == 0x8) { exitReason = "ws close frame"; break; }
+                if (opcode == 0x9) {
+                    ws_send(client_ssl, client, payload.data(), payload.size(), 0xA);
                     continue;
                 }
-                handshake_buffer.clear();
-            } else if (!payload.empty()) {
-                if (!send_all(nullptr, upstream, payload.data(), payload.size())) break;
-            }
-        }
+                if (opcode == 0xA) continue;
 
-        if (connected && count > 1 && (fds[1].revents & (net::kRead | net::kError))) {
-            char buf[kChunk];
-            int n = static_cast<int>(::recv(upstream, buf, sizeof(buf), 0));
-            if (n <= 0) break;
-            if (!ws_send(client_ssl, client, buf, static_cast<std::size_t>(n))) break;
+                if (!upstreamReady.load()) {
+                    hasBuf += payload;
+                    if (hasBuf.size() > 8192) { exitReason = "handshake buffer overflow"; break; }
+                    continue;
+                }
+                if (!payload.empty()) {
+                    // No lock: this thread is the only writer on the outbound.
+                    // Sharing one mutex with the download thread let its 100 ms
+                    // read poll (re-acquiring immediately) starve this direction
+                    // for seconds, so the client's request sat unforwarded while
+                    // the origin waited and then gave up - the "TLS handshake
+                    // completes, response never arrives" failure.
+                    if (!upstream.write(payload.data(), payload.size())) {
+                        exitReason = "upstream write failed";
+                        break;
+                    }
+                    to_upstream += payload.size();
+                }
+            }
+        } catch (...) {
+            exitReason = "exception in upload thread";
         }
+        finished.store(true);
+    });
+
+    // ---- upstream -> client ------------------------------------------------
+    std::thread toClient([&] {
+        try {
+            while (!finished.load()) {
+                if (!upstreamReady.load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    continue;
+                }
+                char buf[kChunk];
+                // No lock: this thread is the only reader, and holding it across
+                // a blocking read starved the upload direction.
+                int n = upstream.read(buf, sizeof(buf), 100);
+                if (n < 0) { exitReason = "upstream closed"; break; }
+                if (n == 0) continue;
+                {
+                    if (!ws_send(client_ssl, client, buf, static_cast<std::size_t>(n))) {
+                        exitReason = "client write failed";
+                        break;
+                    }
+                    to_client += static_cast<unsigned long long>(n);
+                }
+            }
+        } catch (...) {
+            exitReason = "exception in download thread";
+        }
+        finished.store(true);
+    });
+
+    // Join both. Whichever thread stops first sets `finished`, and the other
+    // notices it on its next iteration: the client read is non-blocking and the
+    // upstream read is capped at 100 ms, so neither can hang the session.
+    toUpstream.join();
+    finished.store(true);
+    toClient.join();
+
+    if (getenv("BPB_WS_TRACE"))
+        std::fprintf(stderr, "[ws] session end: up=%llu down=%llu reason=%s\n", to_upstream,
+                     to_client, exitReason.load());
+    upstream.close();
+
+    // Close the websocket properly (RFC 6455 5.5.1: opcode 0x8). Dropping the
+    // TCP connection without this makes the peer report "close 1006 (abnormal
+    // closure): unexpected EOF" even when every payload byte was delivered --
+    // the data is fine, the shutdown looks like a crash.
+    if (client_ssl || client != net::kInvalid) {
+        // Payload = 2-byte big-endian status code 1000 (normal closure).
+        // Sending an empty payload yields 1005 ("no status") on the peer, which
+        // xray logs at Info level as a failed transfer even though the data was
+        // complete; 1000 is the correct, quiet form.
+        const unsigned char closeFrame[4] = {0x88, 0x02, 0x03, 0xE8};
+        send_all(client_ssl, client, reinterpret_cast<const char*>(closeFrame), sizeof(closeFrame));
     }
-
-    if (upstream != net::kInvalid) net::close(upstream);
     if (client_ssl) {
         SSL_shutdown(client_ssl);
         net::tls_free(client_ssl);
@@ -406,24 +541,88 @@ void session_loop(SSL* client_ssl, socket_t client, const std::string& protocol,
 
 } // namespace
 
+// Xray's "ed" (early data) optimisation sends the first bytes of the stream in
+// the Sec-WebSocket-Protocol request header, base64url without padding, so the
+// VLESS handshake can start without waiting for a round trip. Mirrors
+// transport/internet/websocket/hub.go: decode with RawURLEncoding and echo the
+// original string back on the 101 so the client knows it was understood.
+std::string decode_early_data(const std::string& b64url) {
+    // Xray normalises the header before decoding, so a client may legitimately
+    // send standard base64 (+ / =) as well as base64url. hub.go:
+    //   var replacer = strings.NewReplacer("+","-", "/","_", "=","")
+    // Rejecting '=' silently disabled early data for such clients.
+    std::string in;
+    in.reserve(b64url.size());
+    for (char ch : b64url) {
+        if (ch == '=') continue;
+        if (ch == '+') in.push_back('-');
+        else if (ch == '/') in.push_back('_');
+        else in.push_back(ch);
+    }
+    const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    int rev[256];
+    for (int i = 0; i < 256; ++i) rev[i] = -1;
+    for (int i = 0; i < 64; ++i) rev[static_cast<unsigned char>(tbl[i])] = i;
+    std::string out;
+    int buf = 0, bits = 0;
+    for (char ch : in) {
+        int v = rev[static_cast<unsigned char>(ch)];
+        if (v < 0) return {};   // genuinely not base64: no early data
+        buf = (buf << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<char>((buf >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
 void run_ws_session(net::socket_t client_fd, SSL* client_ssl, std::string accept_key,
-                    std::string path, SessionConfig config) {
+                    std::string path, std::string ws_protocol, SessionConfig config) {
+    // Accept "/vl", "/vl/", "/vl/<anything>" and "/vl?ed=2560": strip the query
+    // string first, then take the first path segment. The path carries no
+    // secret -- the VLESS UUID is the credential -- so only the prefix matters.
     std::string protocol = path;
+    auto q = protocol.find('?');
+    if (q != std::string::npos) protocol.resize(q);
     if (!protocol.empty() && protocol[0] == '/') protocol = protocol.substr(1);
     auto slash = protocol.find('/');
     if (slash != std::string::npos) protocol = protocol.substr(0, slash);
 
+    // Only VLESS inbound is served; anything else is refused before the upgrade.
+    if (protocol != "vl") {
+        static const char kReject[] =
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        send_all(client_ssl, client_fd, kReject, sizeof(kReject) - 1);
+        if (client_ssl) {
+            SSL_shutdown(client_ssl);
+            net::tls_free(client_ssl);
+        }
+        net::close(client_fd);
+        return;
+    }
+
+    std::string early = ws_protocol.empty() ? std::string() : decode_early_data(ws_protocol);
     std::string response = "HTTP/1.1 101 Switching Protocols\r\n"
                            "Upgrade: websocket\r\n"
-                           "Connection: Upgrade\r\n"
-                           "Sec-WebSocket-Accept: " + accept_key + "\r\n\r\n";
+                           "Connection: Upgrade\r\n";
+    // cloudflared's AckConnection only emits Sec-Websocket-Accept when the
+    // request actually carried a key (NewResponseHeader hashes it). The tunnel
+    // edge does not forward one, so accept_key is meaningless here and must not
+    // be advertised.
+    if (!accept_key.empty()) response += "Sec-WebSocket-Accept: " + accept_key + "\r\n";
+    // Echo the header only when the client sent usable early data, exactly as
+    // Xray does; otherwise the client would think its padding was accepted.
+    if (!early.empty()) response += "Sec-WebSocket-Protocol: " + ws_protocol + "\r\n";
+    response += "\r\n";
     if (!send_all(client_ssl, client_fd, response.data(), response.size())) {
         if (client_ssl) net::tls_free(client_ssl);
         net::close(client_fd);
         return;
     }
-    std::thread([client_fd, client_ssl, protocol, config]() {
-        session_loop(client_ssl, client_fd, protocol, config);
+    std::thread([client_fd, client_ssl, config, early]() {
+        session_loop(client_ssl, client_fd, config, early);
     }).detach();
 }
 
