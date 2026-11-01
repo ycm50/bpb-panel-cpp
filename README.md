@@ -33,8 +33,8 @@ Cloudflare Tunnel 客户端。**服务端没有任何 JavaScript/TypeScript**，
 
 | 分支 | WARP 出栈 | 特点 |
 |---|---|---|
-| `main` | 独立进程 `warp-rust`（Rust，自带用户态栈） | bpb 负责渲染配置、监督生命周期，经本地 SOCKS5 转发 |
-| `warp-built-in` | 进程内 `src/wg` + lwIP | 单二进制、零外部依赖、内存更省 |
+| `warp-built-in`（默认分支） | 进程内 `src/wg` + lwIP | 单二进制、零外部依赖、内存更省 |
+| `warp-rust` | 独立进程 `warp-rust`（Rust，自带用户态栈） | bpb 负责渲染配置、监督生命周期，经本地 SOCKS5 转发 |
 
 两个分支的**面板、订阅、隧道功能完全一致**，差异只在 WARP 数据面。
 
@@ -49,8 +49,8 @@ Cloudflare Tunnel 客户端。**服务端没有任何 JavaScript/TypeScript**，
 - **可选内置 TLS**（`--tls-cert` / `--tls-key`），https 与 wss 都支持；也可交给 Caddy 终止
 - **内置 Cloudflare Tunnel 客户端**：不需要 cloudflared，注册、转发、断线重连全在进程内
 - **WARP 出口**：两种实现，见 [WARP 出口](#warp-出口) ——
-  独立进程 `warp-rust`（`main` 分支）或**内置用户态 WireGuard**
-  （`warp-built-in` 分支，Noise IK + lwIP，无需特权）
+  独立进程 `warp-rust`（`warp-rust` 分支）或**内置用户态 WireGuard**
+  （`warp-built-in` 分支也就是默认分支，Noise IK + lwIP，无需特权）
 - **面板内注册 WARP 账号**：默认 **dry run** —— 只构造并打印请求体、
   返回合成账号，**不访问 Cloudflare**、不写账号池
 - **隧道按需唤醒 / 休眠**：临时隧道不常驻，用的时候一句话拉起；
@@ -192,8 +192,8 @@ Cloudflare Tunnel 客户端。**服务端没有任何 JavaScript/TypeScript**，
 
 | 后端 | 分支 | 形态 |
 |---|---|---|
-| `warp-rust` | `main` | 外部独立进程；bpb 渲染 `warp-rust.toml`、监督生命周期，数据经本地 SOCKS5（`127.0.0.1:11080`）转发 |
-| 内置 `src/wg` + lwIP | `warp-built-in` | 进程内用户态 TCP/IP 栈直连 WireGuard，不需要外部程序也不需要 `NET_ADMIN` |
+| 内置 `src/wg` + lwIP | `warp-built-in`（默认分支） | 进程内用户态 TCP/IP 栈直连 WireGuard，不需要外部程序也不需要 `NET_ADMIN` |
+| `warp-rust` | `warp-rust` | 外部独立进程；bpb 渲染 `warp-rust.toml`、监督生命周期，数据经本地 SOCKS5（`127.0.0.1:11080`）转发 |
 
 另有 **侧车容器**（整机出网，需 `NET_ADMIN`）：
 
@@ -230,7 +230,7 @@ Cloudflare Tunnel 客户端。**服务端没有任何 JavaScript/TypeScript**，
 | 后端 | 结果 |
 |---|---|
 | 内置（`warp-built-in`） | 连续 10 次 HTTPS 经 VLESS → bpb → WARP 全部成功，出口均为 WARP 地址，平均 1.5 秒；100 KB 下载完整 |
-| `warp-rust`（`main`） | 常驻约 **7.4 MB**（bpb 2.4 MB + warp-rust 5.2 MB），同样 10 次连续成功 |
+| `warp-rust` 后端（`warp-rust` 分支） | 常驻约 **7.4 MB**（bpb 2.4 MB + warp-rust 5.2 MB），同样 10 次连续成功 |
 
 ### 踩过的坑（都已修掉，列出来便于以后排查）
 
@@ -276,7 +276,7 @@ Cloudflare Tunnel 客户端。**服务端没有任何 JavaScript/TypeScript**，
 `.github/workflows/build.yml`：**只有手动触发**（Actions → build → Run workflow），
 没有 push / PR 自动构建。
 
-- 手动运行时填两项：`branch`（要编译的分支，默认 main；也可填 tag / 提交 SHA，
+- 手动运行时填两项：`branch`（要编译的分支，默认 warp-built-in；也可填 tag / 提交 SHA，
   留空则用触发这次运行时所选的分支）与 `tag`（发布 tag 号）。页面右上角的
   "Use workflow from" 只决定跑哪份 workflow 文件，checkout 哪份代码看 `branch`。
 - **构建**：5 个架构的 Linux 静态二进制（amd64 / arm64 / armv7 / 386 / riscv64）

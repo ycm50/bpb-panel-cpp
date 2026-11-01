@@ -7,7 +7,7 @@ name: build
 # 5 个架构各要在 QEMU 下编一遍，不值得为每次提交都跑。
 #
 # 手动运行时填：
-#   branch   —— 要编译的分支（默认 main；也可填 tag / 提交 SHA，留空则用触发这次
+#   branch   —— 要编译的分支（默认 warp-built-in；也可填 tag / 提交 SHA，留空则用触发这次
 #               运行时所选的分支）。页面右上角 "Use workflow from" 只决定跑哪份
 #               workflow 文件，真正 checkout 哪份代码由这个输入框决定。
 #   tag      —— 发布 tag 号。**必须等全部架构都构建成功**之后，release 任务才会用
@@ -29,9 +29,9 @@ on:
   workflow_dispatch:
     inputs:
       branch:
-        description: "要构建的分支（也可填 tag 或提交 SHA；留空 = 用触发这次运行时所选的分支）"
+        description: "要构建的分支（默认 warp-built-in；也可填 tag 或提交 SHA；留空 = 用触发这次运行时所选的分支）"
         required: false
-        default: "main"
+        default: "warp-built-in"
         type: string
       tag:
         description: "发布 tag（等全部架构构建成功后才创建），例如 v1.0.0"
