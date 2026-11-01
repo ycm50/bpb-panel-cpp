@@ -1,5 +1,8 @@
 #include "tunnel/proxy.h"
 
+#include "tunnel/h2.h"
+#include "util/log.h"
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -120,7 +123,7 @@ bool OriginStream::begin(const std::string& host, std::uint16_t port, const std:
     req << "\r\n";
     requestHead_ = req.str();
     headSent_ = 0;
-    if (::getenv("BPB_TUNNEL_TRACE")) {
+    if (h2_trace_enabled()) {
         std::fprintf(stderr, "[origin] head -> %s:%u\n%.600s---\n", host.c_str(),
                      static_cast<unsigned>(port), requestHead_.c_str());
         std::fflush(stderr);

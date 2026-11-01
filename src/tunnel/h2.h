@@ -81,6 +81,12 @@ public:
     virtual std::size_t write_data_some(std::uint32_t streamId, const std::uint8_t* data,
                                         std::size_t len, bool endStream) = 0;
 
+    // True when the peer has granted credit on this stream right now. Callers
+    // use it to tell "cannot write yet because the window is closed" apart from
+    // "nothing to write": the former must block waiting for WINDOW_UPDATE, while
+    // treating it as backlog made the relay spin at poll(0) and burn CPU.
+    virtual bool send_credit_available(std::uint32_t streamId) = 0;
+
     // Resets a stream. Used when the local origin is gone, so the edge tears
     // the eyeball connection down instead of waiting for a body that will
     // never arrive.

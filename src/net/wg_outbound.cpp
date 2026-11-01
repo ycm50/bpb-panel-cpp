@@ -20,6 +20,27 @@ bool start_wg_outbound(Store& store, std::string& error) {
     return warp_proc_start(store, error);
 }
 
+// Hot apply: the session lives in a separate process which renders/reads its
+// config once at startup, so a settings change means stopping the child and
+// starting it again. warp_proc_stop() is safe when nothing is running, and the
+// "disabled" reason matches start_wg_outbound so callers only special-case one
+// string.
+bool apply_wg_outbound(Store& store, std::string& error) {
+    const nlohmann::json kv = store.merged();
+    bool enabled = false;
+    if (kv.contains("wgOutbound") && kv["wgOutbound"].is_object()) {
+        enabled = kv["wgOutbound"].value("enabled", false);
+    }
+    warp_proc_stop();
+    if (!enabled) {
+        error = "wireguard outbound disabled";
+        return false;
+    }
+    return warp_proc_start(store, error);
+}
+
+void stop_wg_outbound() { warp_proc_stop(); }
+
 bool wg_outbound_ready() { return warp_proc_ready(); }
 
 std::string wg_outbound_status() { return warp_proc_status(); }

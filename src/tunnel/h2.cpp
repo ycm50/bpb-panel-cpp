@@ -1,4 +1,5 @@
 #include "tunnel/h2.h"
+#include "util/log.h"
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -17,11 +18,19 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 
 namespace bpb::tunnel {
 
+// Frame-level tracing is OPT-IN and off by default. It used to be missing a
+// default-off guarantee in one path (the relay's per-iteration tracing), which
+// turned a closed flow-control window into tens of thousands of journal lines.
+// BPB_TRACE=1 enables everything; BPB_TUNNEL_TRACE=1 is kept for compatibility.
 bool h2_trace_enabled() {
-    static const bool on = (::getenv("BPB_TUNNEL_TRACE") != nullptr);
+    // One switch to rule them: --log trace / BPB_LOG=trace turns on frame
+    // tracing, and the historical BPB_TRACE / BPB_TUNNEL_TRACE variables are
+    // still honoured so existing debug recipes keep working.
+    static const bool on = bpb::log::level() >= bpb::log::kTrace;
     return on;
 }
 
@@ -294,6 +303,7 @@ public:
                     bool endStream) override;
     std::size_t write_data_some(std::uint32_t streamId, const std::uint8_t* data, std::size_t len,
                                 bool endStream) override;
+    bool send_credit_available(std::uint32_t streamId) override;
     bool write_rst_stream(std::uint32_t streamId, std::uint32_t errorCode) override;
     void close() override;
 
@@ -302,6 +312,8 @@ private:
     // at least one byte, consuming frames that arrive meanwhile.
     bool await_send_window(std::uint32_t streamId, int timeout_ms);
     void apply_settings(const std::uint8_t* payload, std::size_t len);
+    // Emits at most one "waiting for credit" line per stream per second.
+    void trace_credit_wait(std::uint32_t streamId, std::int64_t sw, std::size_t pending);
     void deliver_request(std::uint32_t streamId, std::uint8_t flags);
     bool send_all(const void* data, std::size_t len);
     bool recv_exact(void* buf, std::size_t len);
@@ -335,9 +347,15 @@ private:
     // stream; the connection window starts at the protocol default 65535 and is
     // only raised by WINDOW_UPDATE. Without tracking these we would happily push
     // a long-lived WebSocket past 64 KiB and get the stream reset.
+    // RFC 7540 s6.9.1: a flow-control window must never exceed 2^31-1.
+    static constexpr std::int64_t kMaxWindow = 0x7FFFFFFF;
     std::int64_t connSendWindow_ = 65535;
     std::map<std::uint32_t, std::int64_t> streamSendWindow_;
     std::int64_t peerInitialWindow_ = 65535;
+    std::map<std::uint32_t, std::chrono::steady_clock::time_point> creditWaitLast_;
+    // Streams the edge has reset. Writing DATA on them is a protocol violation
+    // and gets the connection killed, so remember them for the stream's life.
+    std::set<std::uint32_t> resetStreams_;
 
     // The HEADERS block being assembled across CONTINUATION frames.
     std::uint32_t contStream_ = 0;
@@ -612,7 +630,18 @@ void H2ServerImpl::dispatch(std::uint8_t type, std::uint8_t flags, std::uint32_t
         }
         case kFrameRstStream: {
             // The edge gave up on this stream; release its window bookkeeping
-            // and let the owner close the origin side.
+            // and let the owner close the origin side. Remember it so the relay
+            // cannot send DATA here afterwards (see write_data_some).
+            if (len >= 4) {
+                const std::uint32_t code = (static_cast<std::uint32_t>(payload[0]) << 24) |
+                                           (static_cast<std::uint32_t>(payload[1]) << 16) |
+                                           (static_cast<std::uint32_t>(payload[2]) << 8) |
+                                           static_cast<std::uint32_t>(payload[3]);
+                // 0 NO_ERROR, 1 PROTOCOL_ERROR, 2 INTERNAL_ERROR, 7 REFUSED,
+                // 8 CANCEL, 11 ENHANCE_YOUR_CALM (rate limit), 13 INTERNAL
+                h2_trace("[h2] RST_STREAM stream=%u code=%u", streamId, code);
+            }
+            resetStreams_.insert(streamId);
             streamSendWindow_.erase(streamId);
             if (cb_.on_reset) cb_.on_reset(streamId);
             break;
@@ -626,10 +655,33 @@ void H2ServerImpl::dispatch(std::uint8_t type, std::uint8_t flags, std::uint32_t
                                       0x7FFFFFFF;
             if (streamId == 0) {
                 connSendWindow_ += inc;
+                // The connection window is a 31-bit counter by definition. Going
+                // past that means our accounting has drifted (a credit applied
+                // twice), and continuing would silently overrun the peer's real
+                // buffer. Treat it as a broken connection and let the supervisor
+                // rebuild it rather than shipping garbage downstream.
+                if (connSendWindow_ > kMaxWindow) {
+                    fatal_ = true;
+                    fatalReason_ = "connection window overflow";
+                    if (cb_.on_error) cb_.on_error(fatalReason_);
+                }
             } else {
-                auto& w = streamSendWindow_[streamId];
-                if (w == 0) w = peerInitialWindow_;
-                w += inc;
+                // A stream window of exactly 0 is a LEGAL state: it means the
+                // peer has not granted more credit yet. Treating 0 as "not
+                // initialised" and reinstating peerInitialWindow_ here invented
+                // megabytes of credit that the edge never granted, which then
+                // desynchronised the whole connection (observed as sw=0 with a
+                // billion-byte connection window, i.e. a permanent stall).
+                auto it = streamSendWindow_.find(streamId);
+                if (it == streamSendWindow_.end()) {
+                    it = streamSendWindow_.emplace(streamId, peerInitialWindow_).first;
+                }
+                it->second += inc;
+                if (it->second > kMaxWindow) {
+                    fatal_ = true;
+                    fatalReason_ = "stream window overflow";
+                    if (cb_.on_error) cb_.on_error(fatalReason_);
+                }
             }
             break;
         }
@@ -673,6 +725,12 @@ void H2ServerImpl::apply_settings(const std::uint8_t* payload, std::size_t len) 
         const std::int64_t next = static_cast<std::int64_t>(v & 0x7FFFFFFF);
         const std::int64_t delta = next - peerInitialWindow_;
         peerInitialWindow_ = next;
+        // RFC 7540 s6.9.2: a new INITIAL_WINDOW_SIZE retroactively adjusts every
+        // existing stream by the delta, and the result may go NEGATIVE (a
+        // smaller window than we have already spent). Clamping at 0 here would
+        // hand out credit the peer never granted, exactly like the bug this
+        // whole file just had, so the value is left alone and the negative
+        // window simply blocks writes until WINDOW_UPDATE catches up.
         for (auto& kv : streamSendWindow_) kv.second += delta;
         h2_trace("[h2] peer INITIAL_WINDOW_SIZE=%lld (delta %lld)", (long long)next,
                  (long long)delta);
@@ -761,6 +819,7 @@ bool H2ServerImpl::write_data(std::uint32_t streamId, const std::uint8_t* data, 
     if (len == 0) {
         return send_frame(kFrameData, endStream ? kFlagEndStream : 0, streamId, nullptr, 0);
     }
+    if (resetStreams_.count(streamId)) return false;
     std::size_t off = 0;
     while (off < len) {
         if (!await_send_window(streamId, 30000)) {
@@ -768,8 +827,18 @@ bool H2ServerImpl::write_data(std::uint32_t streamId, const std::uint8_t* data, 
             return false;
         }
         auto it = streamSendWindow_.find(streamId);
-        std::int64_t& sw = (it == streamSendWindow_.end()) ? streamSendWindow_[streamId] : it->second;
-        if (sw == 0) sw = peerInitialWindow_;
+        if (it == streamSendWindow_.end()) {
+            it = streamSendWindow_.emplace(streamId, peerInitialWindow_).first;
+        }
+        std::int64_t& sw = it->second;
+        // No "if (sw == 0) sw = peerInitialWindow_" here: 0 is a normal state
+        // (credit not granted yet). Reinstating the initial window invented
+        // credit the edge never granted; the windows then overran the peer's
+        // real buffer, which is what killed long single-connection transfers.
+        // await_send_window guarantees credit only for *some* write; a
+        // SETTINGS shrink can still leave this stream negative, in which case
+        // there is nothing to send yet.
+        if (sw <= 0 || connSendWindow_ <= 0) continue;
         std::size_t n = len - off;
         if (n > kMaxFrame) n = kMaxFrame;
         if (static_cast<std::int64_t>(n) > sw) n = static_cast<std::size_t>(sw);
@@ -788,6 +857,13 @@ bool H2ServerImpl::write_data(std::uint32_t streamId, const std::uint8_t* data, 
 std::size_t H2ServerImpl::write_data_some(std::uint32_t streamId, const std::uint8_t* data,
                                            std::size_t len, bool endStream) {
     constexpr std::size_t kMaxFrame = 16384;
+    // The edge reset this stream (RST_STREAM). RFC 7540 s5.1: after sending
+    // RST_STREAM the sender must not transmit further frames on it, and the
+    // receiver must ignore any it receives. Without this guard the relay kept
+    // pushing DATA for a dead stream -- 239 frames in one observed run -- which
+    // the edge answers by tearing down the whole connection, so a long download
+    // died with no local error at all.
+    if (resetStreams_.count(streamId)) return static_cast<std::size_t>(-1);
     if (len == 0) {
         // With no payload only the END_STREAM marker can be sent, which needs
         // no window credit.
@@ -801,11 +877,11 @@ std::size_t H2ServerImpl::write_data_some(std::uint32_t streamId, const std::uin
     }
     std::int64_t& sw = it->second;
     if (sw <= 0 || connSendWindow_ <= 0) {
-        // Stalling here with no credit is the difference between "slow" and
-        // "dead": the peer only replenishes via WINDOW_UPDATE, so trace both
-        // windows to tell a genuine zero from an accounting leak.
-        h2_trace("[h2] no credit stream=%u conn=%lld sw=%lld pending=%zu", streamId,
-                 (long long)connSendWindow_, (long long)sw, len);
+        // This runs on every relay iteration while a window is closed, so it
+        // must not log each time: a single long download produced >200k lines
+        // and filled the journal. Report the transition only, and rate-limit
+        // repeats to once a second per stream.
+        trace_credit_wait(streamId, sw, len);
         return 0;  // caller retries later
     }
 
@@ -821,6 +897,27 @@ std::size_t H2ServerImpl::write_data_some(std::uint32_t streamId, const std::uin
     sw -= static_cast<std::int64_t>(n);
     connSendWindow_ -= static_cast<std::int64_t>(n);
     return n;
+}
+
+void H2ServerImpl::trace_credit_wait(std::uint32_t streamId, std::int64_t sw,
+                                       std::size_t pending) {
+    if (!h2_trace_enabled()) return;
+    const auto now = std::chrono::steady_clock::now();
+    auto& last = creditWaitLast_;
+    auto it = last.find(streamId);
+    if (it != last.end() && now - it->second < std::chrono::seconds(1)) return;
+    last[streamId] = now;
+    h2_trace("[h2] waiting for credit stream=%u conn=%lld sw=%lld pending=%zu", streamId,
+             (long long)connSendWindow_, (long long)sw, pending);
+}
+
+bool H2ServerImpl::send_credit_available(std::uint32_t streamId) {
+    if (connSendWindow_ <= 0) return false;
+    auto it = streamSendWindow_.find(streamId);
+    // An unknown stream has not been opened by request yet; treat it as
+    // available so the first write establishes the window.
+    if (it == streamSendWindow_.end()) return true;
+    return it->second > 0;
 }
 
 bool H2ServerImpl::write_rst_stream(std::uint32_t streamId, std::uint32_t errorCode) {

@@ -274,12 +274,18 @@ json build_ws_outbound(const json& s, const std::string& protocol, const std::st
                                   flag(s, "enableECH"), str(s, "echServerName"), "http/1.1",
                                   str(s, "fingerprint", "chrome"))
                       : json::object();
-    json transport = build_transport("ws", "", generate_ws_path(protocol), sni_host.host, "", 2560);
+    json transport = build_transport("ws", "", generate_ws_path(protocol, s.value("vlUUID", std::string())), sni_host.host, "", 2560);
 
     json fields = json::object();
     fields["uuid"] = str(s, "vlUUID");
     fields["packet-encoding"] = "";
-    fields["encryption"] = "";
+    if (protocol == "vmess") {
+        // Clash.Meta spelling for the same credential.
+        fields["cipher"] = "auto";
+        fields["alterId"] = 0;
+    } else {
+        fields["encryption"] = "";
+    }
     return build_outbound(remark, protocol, address, port, flag(s, "enableIPv6"), flag(s, "enableTFO"),
                           tls, transport, fields);
 }
@@ -654,7 +660,7 @@ bool build_clash_custom(const json& s, std::string& out_json, std::string& error
         bool is_custom = (!custom_domain.empty() && domain == custom_domain);
 
         for (auto& protocol : protocols) {
-            if (protocol != "vless") continue;
+            if (protocol != "vless" && protocol != "vmess") continue;
             int protocol_index = 1;
             for (int port : total_ports) {
                 for (auto& host : hosts) {

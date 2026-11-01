@@ -8,6 +8,9 @@ typedef struct ssl_st SSL;
 
 namespace bpb::proxy {
 
+// Settings an inbound protocol needs in order to serve a connection. Kept
+// protocol agnostic on purpose: whatever a protocol does with these, the
+// dispatcher only has to hand them over.
 struct SessionConfig {
     std::string secure_path;
     std::string vl_uuid;
@@ -15,13 +18,8 @@ struct SessionConfig {
     std::vector<std::string> proxy_ips;
 };
 
-// Takes ownership of the client socket (already upgraded to websocket).
-//
-// ws_protocol carries the client's Sec-WebSocket-Protocol request header. Xray
-// puts the first VLESS bytes ("early data"/ed) there, base64url-encoded; the
-// value must be echoed back in the 101 response and the decoded bytes replayed
-// as if they had arrived in a WebSocket frame. Empty means no early data.
-void run_ws_session(net::socket_t client_fd, SSL* client_ssl, std::string accept_key,
-                    std::string path, std::string ws_protocol, SessionConfig config);
+// Serving a WebSocket connection is protocol specific and lives in
+// src/inbound/proto/<protocol>_ws.cpp; see src/inbound/inbound.h for the table
+// that decides which ones this binary was built with.
 
 } // namespace bpb::proxy

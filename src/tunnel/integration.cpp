@@ -1,8 +1,10 @@
 #include "tunnel/integration.h"
+#include "util/log.h"
 
 #include "net/http_client.h"
 #include "settings/store.h"
 #include "tunnel/client.h"
+#include "tunnel/ingress.h"
 #include "util/util.h"
 
 #include <algorithm>
@@ -24,10 +26,20 @@ std::atomic<bool> g_running{false};
 TunnelStatus g_status;
 std::unique_ptr<TunnelClient> g_client;
 std::thread g_thread;
-// Public hostname of the ad-hoc tunnel, when the credentials came from the
-// quick-tunnel API rather than a user-supplied named-tunnel token.
+// Public hostname of this tunnel. Set by the quick-tunnel API for an ad-hoc
+// tunnel, or from the edge's ingress configuration for a named one.
 std::string g_hostname;
 bool g_quick = false;
+// Ingress hostnames pushed by the edge for a named tunnel. This is the only
+// source for them: the connector token has no hostname, and the REST API that
+// would return one needs an account API token the panel does not have.
+std::vector<std::string> g_ingress;
+std::string g_ingress_used;   // mainDomain value this supervisor last adopted
+// Monotonic id of the current supervisor run. A sleeping tunnel's thread can
+// still be unwinding when wake() starts a new one, and without this its exit
+// would publish g_running=false over the fresh connection (observed: status
+// reported connected=true with running=false right after wake).
+std::uint64_t g_generation = 0;
 
 // A quick tunnel needs no account: POST an empty body and Cloudflare hands back
 // a tunnel id plus the {account_tag, secret} pair the connector authenticates
@@ -128,48 +140,47 @@ bool start_from_store(Store& store, bool& started, std::string& error) {
     if (token.empty()) {
         if (!quick_tunnel_register(store.dir(), token, hostname, error)) return false;
         quick = true;
-        std::fprintf(stderr, "[cf-tunnel] quick tunnel registered: https://%s\n",
-                     hostname.c_str());
+        // The public hostname is reported by install.sh, not on every start:
+        // see log.h -- bpb is silent by default unless asked.
+        bpb::log::info("[cf-tunnel] quick tunnel registered: https://%s", hostname.c_str());
     }
     {
         std::lock_guard<std::mutex> lk(g_mutex);
-        g_hostname = hostname;
+        // A named tunnel learns its hostname from the edge's ingress push, which
+        // has not arrived yet at this point. Overwriting with an empty value here
+        // made a re-wake look like "no public URL" until the next poll, and lost
+        // the hostname the previous session had already learned.
+        if (quick || !hostname.empty()) g_hostname = hostname;
         g_quick = quick;
     }
 
     // Keep the published domain in step with the tunnel.
     //
-    // The subscription generators read Config::mainDomain, which is a static
-    // field loaded from config.json at startup. Nothing tied it to the tunnel, so
-    // after the named tunnel died the panel kept handing out configs pointing at
-    // rd.5704524.xyz and every client was dead even though the connector itself
-    // was healthy. Adopt the tunnel hostname automatically, but only while the
-    // current value is still ours to touch: empty/loopback, or the hostname we
-    // adopted previously. A domain the operator typed by hand is left alone.
+    // The subscription generators read Config::mainDomain, a static field loaded
+    // from config.json at startup. Nothing tied it to the tunnel, so after the
+    // named tunnel died the panel kept handing out configs pointing at
+    // rd.5704524.xyz and every client was dead even though the connector was
+    // healthy. An ad-hoc quick tunnel IS the public entrance, so adopt its
+    // hostname; the override is logged with the previous value.
     if (quick && !hostname.empty()) {
         auto& kvRef = store.kv();
         const std::string cur = store.config().mainDomain;
-        const std::string adopted = kvRef.value("tunnelAdoptedDomain", std::string());
         bool dirty = false;
-        // An ad-hoc quick tunnel IS the public entrance: no other hostname can
-        // reach this panel, so keeping a stale mainDomain (rd.5704524.xyz, whose
-        // named tunnel is gone) only produces configs that cannot connect. The
-        // override is logged with the previous value instead of being silent.
         if (cur != hostname) {
             store.config().mainDomain = hostname;
             dirty = true;
-            std::fprintf(stderr, "[cf-tunnel] mainDomain: \"%s\" -> \"%s\"\n", cur.c_str(),
-                         hostname.c_str());
+            bpb::log::info("[cf-tunnel] mainDomain: \"%s\" -> \"%s\"", cur.c_str(),
+                           hostname.c_str());
         }
-        if (adopted != hostname) {
+        if (kvRef.value("tunnelAdoptedDomain", std::string()) != hostname) {
             kvRef["tunnelAdoptedDomain"] = hostname;
             dirty = true;
         }
         if (dirty) {
             std::string saveError;
             if (!store.save(saveError))
-                std::fprintf(stderr, "[cf-tunnel] could not persist mainDomain: %s\n",
-                             saveError.c_str());
+                bpb::log::error("[cf-tunnel] could not persist mainDomain: %s",
+                                saveError.c_str());
         }
     }
 
@@ -187,12 +198,40 @@ bool start_from_store(Store& store, bool& started, std::string& error) {
     }
     g_client = std::make_unique<TunnelClient>();
     TunnelClient* raw = g_client.get();
+    const std::uint64_t generation = ++g_generation;
     g_running.store(true);
+    // Fresh attempt: never report the previous session's registration as
+    // current. The ingress hostnames are kept -- they describe the tunnel, not
+    // the connection.
+    g_status.connected = false;
+    g_status.registered = false;
+    g_status.error.clear();
     started = true;
 
-    g_thread = std::thread([raw, cfg]() {
+    g_thread = std::thread([raw, cfg, generation]() {
         auto log = [](const std::string& line) {
             std::fprintf(stderr, "[cf-tunnel] %s\n", line.c_str());
+        };
+        // The edge owns the public hostname: for a named tunnel the only place
+        // it is written down is the ingress configuration pushed on the control
+        // stream. Only record it here -- the store is owned by the HTTP thread,
+        // so the adoption happens there (see sync_ingress_domain) instead of
+        // mutating JSON from this thread.
+        auto on_status = [generation](const tunnel::TunnelStatus& st) {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            if (generation != g_generation) return;
+            // Live view: the panel polls status while run() is still going, and
+            // the old code only copied the status after the run ended, so a
+            // healthy tunnel reported connected=false forever.
+            g_status = st;
+            if (!st.hostnames.empty()) g_ingress = st.hostnames;
+            // The hostnames describe the tunnel, not the connection, so they
+            // survive a reconnect: run() starts each attempt with an empty
+            // status and would otherwise report "unknown" until the edge
+            // resends the ingress configuration.
+            g_status.hostnames = g_ingress;
+            const std::string picked = tunnel::first_usable_hostname(g_ingress);
+            if (!g_quick && !picked.empty()) g_hostname = picked;
         };
         // Supervisor: a tunnel that loses its edge connection must re-register,
         // otherwise the panel answers 530 for every request until the process is
@@ -202,15 +241,21 @@ bool start_from_store(Store& store, bool& started, std::string& error) {
         int delayMs = 1000;
         for (;;) {
             TunnelStatus local;
-            raw->run(cfg, local, log);
+            raw->run(cfg, local, log, on_status);
             {
                 std::lock_guard<std::mutex> lk(g_mutex);
+                // Only this generation may publish its own teardown. After a
+                // sleep+wake the old thread can still be returning from run()
+                // here, and overwriting the fresh connection's state is exactly
+                // what made status report connected=true with running=false.
+                if (generation != g_generation) break;
                 g_status = local;
                 g_status.connected = false;
+                g_status.hostnames = g_ingress;
             }
             if (raw->stopping()) break;
             const std::string backoff = "reconnecting in " + std::to_string(delayMs / 1000) + "s";
-            log("[tunnel] " + backoff);
+            if (bpb::log::enabled(bpb::log::kWarn)) log("[tunnel] " + backoff);
             // Sleep in short slices so stop() takes effect promptly.
             for (int waited = 0; waited < delayMs && !raw->stopping(); waited += 200) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -219,7 +264,8 @@ bool start_from_store(Store& store, bool& started, std::string& error) {
             delayMs = local.registered ? 1000 : std::min(delayMs * 2, 30000);
         }
         std::lock_guard<std::mutex> lk(g_mutex);
-        g_running.store(false);
+        // A stale thread must not clear the flag of the run that replaced it.
+        if (generation == g_generation) g_running.store(false);
     });
     g_thread.detach();
     return true;
@@ -237,8 +283,47 @@ std::string status_json() {
        << ",\"quick\":" << (g_quick ? "true" : "false")
        << ",\"hostname\":\"" << json_escape(g_hostname) << "\""
        << ",\"url\":\"" << json_escape(g_hostname.empty() ? std::string() : "https://" + g_hostname) << "\""
+       << ",\"hostnames\":[";
+    for (std::size_t i = 0; i < g_ingress.size(); ++i) {
+        if (i) os << ",";
+        os << "\"" << json_escape(g_ingress[i]) << "\"";
+    }
+    os << "]"
+       << ",\"mainDomain\":\"" << json_escape(g_hostname) << "\""
        << ",\"error\":\"" << json_escape(g_status.error) << "\"}";
     return os.str();
+}
+
+void sync_ingress_domain(Store& store) {
+    std::string picked;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_ingress.empty()) return;
+        picked = first_usable_hostname(g_ingress);
+        if (picked.empty()) return;
+        if (g_ingress_used == picked && store.config().mainDomain == picked) return;
+    }
+    const std::string cur = store.config().mainDomain;
+    // Only take the ingress hostname over when the published domain is unset,
+    // still the factory default, or was itself adopted from a previous ingress
+    // update. A domain the user typed by hand wins: they may be pointing the
+    // subscriptions somewhere the connector's ingress does not mention.
+    const std::string adopted = store.kv().value("tunnelAdoptedDomain", std::string());
+    const bool weOwnIt = (cur.empty() || cur == "localhost" || cur == adopted);
+    {
+        // Remember the hostname either way, so a later poll does not redo this
+        // work; adoption itself stays a no-op while the user's value stands.
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_ingress_used = picked;
+    }
+    if (!weOwnIt) return;
+    store.config().mainDomain = picked;
+    store.kv()["tunnelAdoptedDomain"] = picked;
+    bpb::log::info("[cf-tunnel] mainDomain: \"%s\" -> \"%s\" (ingress)", cur.c_str(),
+                   picked.c_str());
+    std::string saveError;
+    if (!store.save(saveError))
+        bpb::log::error("[cf-tunnel] could not persist mainDomain: %s", saveError.c_str());
 }
 
 void stop() {
@@ -246,6 +331,12 @@ void stop() {
     // The client is owned by the supervisor thread; only the flag is touched
     // here, so nothing can be freed underneath a running run().
     if (g_client) g_client->stop();
+    // Report the tunnel as down right away. The supervisor only clears its own
+    // copy once run() returns, and until then the panel kept showing a sleeping
+    // tunnel as running/connected.
+    g_running.store(false);
+    g_status.connected = false;
+    g_status.registered = false;
 }
 
 } // namespace bpb::tunnel

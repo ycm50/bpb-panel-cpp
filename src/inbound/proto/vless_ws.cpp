@@ -1,8 +1,11 @@
+#include "inbound/inbound.h"
+
 #include "proxy/session.h"
 #include "crypto/crypto.h"
 #include "net/tls.h"
 #include "net/warp_proc.h"
 #include "net/wg_outbound.h"
+#include "util/log.h"
 #include "util/util.h"
 
 #include <openssl/ssl.h>
@@ -57,7 +60,10 @@ bool send_all(SSL* ssl, socket_t fd, const char* data, std::size_t len) {
             // treated as a dead connection.
             net::PollFd pfd{fd, net::kWrite, 0};
             if (net::poll_fds(&pfd, 1, 500) <= 0) {
-                if (++stalls > 20) return false;   // ~10s of no progress
+                // 60s of zero progress. 10s was enough to kill a legitimate slow
+                // client mid-download on a congested path; nothing is sent in that
+                // window, so a longer budget costs nothing.
+                if (++stalls > 120) return false;
                 continue;
             }
             stalls = 0;
@@ -515,7 +521,9 @@ void session_loop(SSL* client_ssl, socket_t client, const SessionConfig& config,
     finished.store(true);
     toClient.join();
 
-    if (getenv("BPB_WS_TRACE"))
+    // Only with --log debug (or the old BPB_WS_TRACE): one line per closed
+    // session is pure noise for an operator and used to fill the journal.
+    if (bpb::log::enabled(bpb::log::kDebug))
         std::fprintf(stderr, "[ws] session end: up=%llu down=%llu reason=%s\n", to_upstream,
                      to_client, exitReason.load());
     upstream.close();
@@ -578,31 +586,11 @@ std::string decode_early_data(const std::string& b64url) {
     return out;
 }
 
-void run_ws_session(net::socket_t client_fd, SSL* client_ssl, std::string accept_key,
-                    std::string path, std::string ws_protocol, SessionConfig config) {
-    // Accept "/vl", "/vl/", "/vl/<anything>" and "/vl?ed=2560": strip the query
-    // string first, then take the first path segment. The path carries no
-    // secret -- the VLESS UUID is the credential -- so only the prefix matters.
-    std::string protocol = path;
-    auto q = protocol.find('?');
-    if (q != std::string::npos) protocol.resize(q);
-    if (!protocol.empty() && protocol[0] == '/') protocol = protocol.substr(1);
-    auto slash = protocol.find('/');
-    if (slash != std::string::npos) protocol = protocol.substr(0, slash);
-
-    // Only VLESS inbound is served; anything else is refused before the upgrade.
-    if (protocol != "vl") {
-        static const char kReject[] =
-            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        send_all(client_ssl, client_fd, kReject, sizeof(kReject) - 1);
-        if (client_ssl) {
-            SSL_shutdown(client_ssl);
-            net::tls_free(client_ssl);
-        }
-        net::close(client_fd);
-        return;
-    }
-
+// Entry point for this protocol. The dispatcher (src/inbound/registry.cpp) has
+// already matched the "/vl" segment and refused everything else.
+void vless_serve(net::socket_t client_fd, SSL* client_ssl, std::string accept_key,
+                 std::string path, std::string ws_protocol, SessionConfig config) {
+    (void)path;
     std::string early = ws_protocol.empty() ? std::string() : decode_early_data(ws_protocol);
     std::string response = "HTTP/1.1 101 Switching Protocols\r\n"
                            "Upgrade: websocket\r\n"
@@ -627,3 +615,9 @@ void run_ws_session(net::socket_t client_fd, SSL* client_ssl, std::string accept
 }
 
 } // namespace bpb::proxy
+
+// Registered by src/inbound/registry.cpp when -DBPB_INBOUNDS includes vless.
+namespace bpb::inbound {
+// extern: a plain const at namespace scope has internal linkage.
+extern const Inbound vless_inbound = {"vless", "vl", "VLESS", &::bpb::proxy::vless_serve};
+} // namespace bpb::inbound

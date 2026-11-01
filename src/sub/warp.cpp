@@ -1,5 +1,6 @@
 #include "sub/warp.h"
 #include "net/http_client.h"
+#include "util/log.h"
 #include "util/util.h"
 
 #include <openssl/evp.h>
@@ -56,10 +57,11 @@ bool register_account(const WarpKeys& keys, nlohmann::json& out, std::string& er
         // No network. Log exactly what would be sent, then hand back a synthetic
         // response shaped like the real one so the caller's parsing path (and the
         // panel round trip) is exercised for real.
-        std::fprintf(stderr,
-                     "[warp][dry-run] POST https://api.cloudflareclient.com/v0a4005/reg\n"
-                     "[warp][dry-run] body = %s\n",
-                     body.dump().c_str());
+        if (bpb::log::enabled(bpb::log::kDebug))
+            bpb::log::write(bpb::log::kDebug,
+                            "[warp][dry-run] POST https://api.cloudflareclient.com/v0a4005/reg\n"
+                            "[warp][dry-run] body = %s",
+                            body.dump().c_str());
         out = nlohmann::json{
             {"config",
              {{"client_id", "dryRun"},

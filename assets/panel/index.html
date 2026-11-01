@@ -12,7 +12,7 @@
         href="https://fonts.googleapis.com/css2?family=Ubuntu:ital,wght@0,300;0,400;0,500;0,700;1,300;1,400;1,500;1,700&display=swap"
         rel="stylesheet">
     <link rel="stylesheet"
-        href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&icon_names=add_circle,autorenew,cancel,check_circle,clock_loader_40,close,cloud_download,cloud_upload,code_xml,content_copy,dashboard,data_usage,delete,dns,download,draft,error,fingerprint,help,info,key_vertical,keyboard_arrow_down,link,logout,open_in_new,qr_code,refresh,save,settings,settings_backup_restore,share,smart_toy,terminal,tune,upgrade,upload,verified,visibility,visibility_off&display=block" />
+        href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&display=block" />
     <link id="favicon" rel="icon" type="image/x-icon" href="data:image/x-icon;base64,__ICON__">
     <style>
         :root {
@@ -1622,7 +1622,7 @@ table tr:not(:last-child) {
                                 <span id="warp-update" class="material-symbols-rounded">autorenew</span>续期</button>
                         </div>
                         <div class="dashboard-action">
-                            <span>WARP 出栈状态</span>
+                            <span>WARP 出栈状态（内建 WG + lwIP）</span>
                             <span id="warp-status">未启用</span>
                         </div>
                         <div class="form-control">
@@ -1647,6 +1647,14 @@ table tr:not(:last-child) {
                             <span id="tunnel-host">未唤醒</span>
                         </div>
                         <div class="dashboard-action">
+                            <span>隧道域名（回源入口）</span>
+                            <span id="tunnel-domains">—</span>
+                        </div>
+                        <div class="dashboard-action">
+                            <span>订阅使用的域名</span>
+                            <span id="tunnel-sub-domain">—</span>
+                        </div>
+                        <div class="dashboard-action">
                             <span>唤醒 / 休眠</span>
                             <button type="button" class="button" onclick="tunnelWake(this)">
                                 <span class="material-symbols-rounded">bolt</span>唤醒</button>
@@ -1654,7 +1662,7 @@ table tr:not(:last-child) {
                                 <span class="material-symbols-rounded">power_settings_new</span>休眠</button>
                         </div>
                         <div class="form-control">
-                            <label for="wgOutboundEnabled">WARP 出栈（warp-rust）</label>
+                            <label for="wgOutboundEnabled">WireGuard 出栈</label>
                             <div class="select-wrapper">
                                 <select id="wgOutboundEnabled" name="wgOutboundEnabled">
                                     <option value="false">禁用</option>
@@ -1666,10 +1674,10 @@ table tr:not(:last-child) {
                             </div>
                         </div>
                         <div class="form-control">
-                            <label for="wgOutboundSocks">出栈本地 SOCKS5</label>
+                            <label for="wgOutboundEndpoint">出栈接入点</label>
                             <div>
-                                <input type="text" id="wgOutboundSocks" name="wgOutboundSocks"
-                                    placeholder="127.0.0.1:11080">
+                                <input type="text" id="wgOutboundEndpoint" name="wgOutboundEndpoint"
+                                    placeholder="162.159.192.1:2408">
                             </div>
                         </div>
                         <div class="form-control">
@@ -2221,7 +2229,7 @@ async function initPanel(settings, tgSettings, subscriptions, clients) {
             const res = await fetch(`./panel/settings?nocache=${nocache}`, { cache: 'no-store' });
             const { success, status, message, body } = await res.json();
 
-            if (status === 401 && !body.isPassSet) {
+            if (status === 401 & !body.isPassSet) {
                 const closeBtn = document.querySelector('.modal-close');
                 openResetPass();
                 closeBtn.style.visibility = 'hidden';
@@ -2395,7 +2403,7 @@ function handleTgFormChanges(settings) {
 
     if (settings) {
         const { telegramUserId, telegramBotToken } = settings;
-        removeBtn.disabled = !telegramUserId && !telegramBotToken;
+        removeBtn.disabled = !telegramUserId & !telegramBotToken;
         setupBtn.disabled = true;
 
         userId.value = telegramUserId;
@@ -2464,7 +2472,7 @@ function generateSubUrl(type, core, tag) {
     url.searchParams.append('app', core);
     url.hash = `💦 BPB ${tag}`;
 
-    if (core === 'sing-box' && type !== 'raw') {
+    if (core === 'sing-box' & type !== 'raw') {
         return `sing-box://import-remote-profile?url=${url.href}`;
     }
 
@@ -2657,15 +2665,38 @@ async function refreshWarpAndTunnel() {
             ' / 账号 ' + (b.accounts || 0) +
             (b.dryRun ? ' / dry run' : '');
         const sel = document.getElementById('warpRegisterDryRun');
-        if (sel && b.dryRun !== undefined) sel.value = b.dryRun ? 'true' : 'false';
-        if (b.status) console.log('warp outbound:', b.status);
+        if (sel & b.dryRun !== undefined) sel.value = b.dryRun ? 'true' : 'false';
     } catch (e) { console.error('warp-status', e); }
     try {
         const r = await fetch('./panel/tunnel-status', { credentials: 'include', cache: 'no-store' });
         const j = await r.json();
         const b = j.body || j;
         const el = document.getElementById('tunnel-host');
-        if (el) el.textContent = b.url ? b.url : (b.running ? '运行中（无公网地址）' : '未唤醒');
+        if (el) {
+            // The URL only exists once the edge accepted the registration; show
+            // the connection state so a running-but-broken tunnel is obvious
+            // instead of looking identical to a sleeping one.
+            if (b.url) {
+                el.textContent = b.url + (b.registered ? '' : '（未注册）');
+            } else {
+                el.textContent = b.running
+                    ? (b.connected ? '运行中（无公网地址）' : '连接中…')
+                    : '未唤醒';
+            }
+        }
+        // Ingress hostnames pushed by the edge. For a named tunnel this is the
+        // only place the panel can learn them: the connector token does not
+        // carry a hostname and the REST API needs an account API token.
+        const hosts = Array.isArray(b.hostnames) ? b.hostnames : [];
+        const hostsEl = document.getElementById('tunnel-domains');
+        if (hostsEl) hostsEl.textContent = hosts.length ? hosts.join(', ') : '—';
+        const subEl = document.getElementById('tunnel-sub-domain');
+        if (subEl) {
+            subEl.textContent = b.mainDomain || '—';
+            subEl.title = hosts.length
+                ? '订阅里的 SNI/域名取自该值；可用自定义域名覆盖'
+                : '隧道未提供域名时，订阅使用自定义域名或 localhost';
+        }
     } catch (e) { console.error('tunnel-status', e); }
 }
 
@@ -2679,12 +2710,8 @@ async function registerWarpAccount(btn) {
     try {
         const res = await fetch('./panel/warp-register', { method: 'POST', credentials: 'include' });
         const j = await res.json();
-        if (!j.success) {
-            notify('error', '注册 WARP 账号', [j.message || '失败']);
-        } else {
-            const note = (j.body && j.body.note) || '完成';
-            notify('success', '注册 WARP 账号', [note]);
-        }
+        if (!j.success) notify('error', '注册 WARP 账号', [j.message || '失败']);
+        else notify('success', '注册 WARP 账号', [(j.body & j.body.note) || '完成']);
         refreshWarpAndTunnel();
     } catch (e) {
         console.error('warp-register', e);
@@ -2700,7 +2727,7 @@ async function tunnelWake(btn) {
         const res = await fetch('./panel/tunnel-wake', { method: 'POST', credentials: 'include' });
         const j = await res.json();
         if (!j.success) notify('error', '唤醒隧道', [j.message || '失败']);
-        else notify('success', '唤醒隧道', [(j.body && j.body.url) ? j.body.url : '已唤醒']);
+        else notify('success', '唤醒隧道', [(j.body & j.body.url) ? j.body.url : '已唤醒']);
         refreshWarpAndTunnel();
     } catch (e) { notify('error', '唤醒隧道', ['请求失败']); }
     finally { stopWaiting(icons); }
@@ -2840,7 +2867,19 @@ function updateSettings(event, data) {
                 ['请更新你的订阅。']
             );
 
+            // The WireGuard switch is applied live; surface the real outcome so
+            // "enabled" never looks applied while the tunnel is still down.
+            const wgResult = body && body.wgOutbound;
+            if (wgResult) {
+                if (wgResult.ready) {
+                    notify('success', 'WireGuard 出栈', ['已生效：' + wgResult.status]);
+                } else {
+                    notify('error', 'WireGuard 出栈未生效', [wgResult.error || wgResult.status]);
+                }
+            }
+
             renderPanel(form);
+            refreshWarpAndTunnel();
         })
         .catch(error => console.error('更新设置失败：', error))
         .finally(() => stopWaiting(icons));
@@ -3452,8 +3491,7 @@ function renderClients(clients) {
     });
 }
 
-// WARP outbound + on-demand tunnel: show their real state on load instead of
-// waiting for the operator to press something.
+// Show WARP outbound and on-demand tunnel state on load.
 refreshWarpAndTunnel();</script>
 </body>
 

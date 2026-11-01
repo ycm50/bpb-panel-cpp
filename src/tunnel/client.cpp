@@ -1,7 +1,9 @@
 #include "tunnel/client.h"
+#include "util/log.h"
 
 #include "tunnel/capnp.h"
 #include "tunnel/h2.h"
+#include "tunnel/ingress.h"
 #include "tunnel/proxy.h"
 #include "tunnel/rpc.h"
 
@@ -243,8 +245,17 @@ void send_ws_close(const std::shared_ptr<OriginStream>& origin) {
 } // namespace
 
 bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
-                       const std::function<void(const std::string&)>& log) {
+                       const std::function<void(const std::string&)>& log,
+                       const std::function<void(const TunnelStatus&)>& on_status) {
     auto L = [&](const std::string& s) { if (log) log(s); };
+    // Every narration goes through the log switch (off unless BPB_LOG/--log asks
+    // for it). L is errors only; these two are the noisy tiers.
+    auto LI = [&](const std::string& s) { if (bpb::log::enabled(bpb::log::kInfo)) L(s); };
+    auto LD = [&](const std::string& s) { if (bpb::log::enabled(bpb::log::kDebug)) L(s); };
+    // Pushes the live status out. Without this the panel only ever saw the
+    // snapshot taken right after the first attempt, which is before the edge
+    // accepts the registration, so a healthy tunnel displayed "not connected".
+    auto publish = [&]() { if (on_status) on_status(status); };
 
     // Per-stream request accumulation.
     struct StreamCtx {
@@ -254,6 +265,12 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
         bool isControl = false;
         bool isConfig = false;     // edge-pushed ingress configuration
         std::string configBody;
+        // END_STREAM seen for this stream. The configuration update arrives as
+        // HEADERS followed by DATA, and the HEADERS frame carries END_STREAM
+        // only for the (empty) control dialogue; acking on the HEADERS frame
+        // dropped the body before the edge sent it, which is why the ingress
+        // hostnames used to come back empty.
+        bool endSeen = false;
         bool responded = false;    // origin head already relayed
         bool failed = false;       // origin unreachable
         bool headSeen = false;
@@ -317,7 +334,7 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
         if (it != r.headers.end() && it->second == kUpgradeControlStream) {
             s.isControl = true;
             ctrlStream = r.streamId;
-            log("[tunnel] control stream opened (id " + std::to_string(r.streamId) + ")");
+            LD("[tunnel] control stream opened (id " + std::to_string(r.streamId) + ")");
             needBootstrap = true;
             return;
         }
@@ -325,16 +342,16 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
         // reaches the origin: we just acknowledge it and keep the tunnel alive.
         if (it != r.headers.end() && it->second == kUpgradeConfiguration) {
             s.isConfig = true;
-            log("[tunnel] configuration update from edge (stream " +
-                std::to_string(r.streamId) + ")");
+            LD("[tunnel] configuration update from edge (stream " +
+               std::to_string(r.streamId) + ")");
             return;
         }
 
         // Proxied request: connect to the origin immediately and relay the
         // request head. The body is pumped as DATA arrives, so long-lived
         // protocols (VLESS over WebSocket) work without buffering.
-        log("[tunnel] request " + r.method + " " + r.path);
-        if (getenv("BPB_TUNNEL_TRACE")) {
+        LD("[tunnel] request " + r.method + " " + r.path);
+        if (h2_trace_enabled()) {
             std::fprintf(stderr, "[tunnel] --- request headers (%zu) ---\n", r.headers.size());
             for (auto& kv : r.headers)
                 std::fprintf(stderr, "  '%s' = '%.100s'\n", kv.first.c_str(), kv.second.c_str());
@@ -463,7 +480,7 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
         h2hdrs.emplace_back("cf-cloudflared-response-meta",
                             "{\"src\":\"origin\",\"flow_rate_limited\":false}");
 
-        if (getenv("BPB_TUNNEL_TRACE")) {
+        if (h2_trace_enabled()) {
             std::fprintf(stderr, "[tunnel] response %s (%zu h2 hdrs)\n",
                          statusOut.c_str(), h2hdrs.size());
             for (auto& kv : h2hdrs)
@@ -473,8 +490,8 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
         srvWriteHdrs(id, statusOut, h2hdrs, false);
         s.responded = true;
         ++status.requestsServed;
-        log("[tunnel] origin " + std::to_string(statusCode) + " -> h2 " + statusOut + " on " +
-            s.reqPath);
+        LD("[tunnel] origin " + std::to_string(statusCode) + " -> h2 " + statusOut + " on " +
+           s.reqPath);
     };
     cb.on_data = [&](std::uint32_t id, const std::uint8_t* d, std::size_t n) {
         auto it = streams.find(id);
@@ -496,6 +513,14 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
     cb.on_end = [&](std::uint32_t id) {
         auto it = streams.find(id);
         if (it == streams.end()) return;
+        // The configuration update is HEADERS + DATA + END_STREAM and has no
+        // origin at all. Record the end so the pump acknowledges it only once
+        // the body is complete; acking on the HEADERS frame dropped the config
+        // body entirely, so the ingress hostnames never reached the panel.
+        if (it->second.isConfig) {
+            it->second.endSeen = true;
+            return;
+        }
         if (it->second.isControl || !it->second.origin) return;
         // cloudflared never half-closes a hijacked WebSocket: it just stops
         // reading from the eyeball (stream.Pipe's reader sees EOF). Shutting
@@ -548,7 +573,8 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
         return false;
     }
     status.connected = true;
-    log("[tunnel] connected to edge");
+    LI("[tunnel] connected to edge");
+    publish();
 
     // Relays whatever the origin has produced back to the edge. Runs every
     // loop iteration so a long-lived stream stays responsive in both directions.
@@ -564,19 +590,47 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
             if (found == streams.end()) continue;
             auto& s = found->second;
             if (s.isConfig) {
-                // Acknowledge with an empty 200 and drop the stream.
+                // Wait for the whole body. The edge sends the update as
+                // HEADERS, then DATA carrying
+                // {"version":N,"config":{"ingress":[...]}} , then END_STREAM.
+                // Answering before the DATA arrives (the old behaviour) threw
+                // the ingress list away, so a named tunnel could never learn
+                // its own public hostname.
+                if (!s.endSeen) continue;
                 if (!s.responded) {
                     s.responded = true;
-                    srvWriteHdrs(id, "200", {{"content-length", "0"}}, true);
-                    if (getenv("BPB_TUNNEL_TRACE"))
-                        std::fprintf(stderr, "[tunnel] config body: %.200s\n",
-                                     s.configBody.c_str());
+                    const auto hosts = ingress_hostnames(s.configBody);
+                    const int version = ingress_version(s.configBody);
+                    if (!hosts.empty()) {
+                        // Publish the hostnames so the panel can show them and
+                        // the subscription generators can use them.
+                        status.hostnames = hosts;
+                        std::string joined;
+                        for (std::size_t i = 0; i < hosts.size(); ++i) {
+                            if (i) joined += ", ";
+                            joined += hosts[i];
+                        }
+                        LI("[tunnel] ingress hostnames: " + joined);
+                        publish();
+                    }
+                    // Mirror cloudflared: it writes the marshalled
+                    // pogs.UpdateConfigurationResponse as the response body.
+                    const std::string ack = config_update_ack(version);
+                    srvWriteHdrs(id, "200",
+                                  {{"content-type", "application/json"},
+                                   {"content-length", std::to_string(ack.size())}},
+                                  false);
+                    srvWriteData(id, reinterpret_cast<const std::uint8_t*>(ack.data()),
+                                 ack.size(), true);
+                    if (h2_trace_enabled())
+                        std::fprintf(stderr, "[tunnel] config body (%zu bytes): %.400s\n",
+                                     s.configBody.size(), s.configBody.c_str());
                 }
                 dead.push_back(id);
                 continue;
             }
             if (s.resetByEdge) {
-                log("[tunnel] edge reset stream " + std::to_string(id) + " (down=" +
+                LD("[tunnel] edge reset stream " + std::to_string(id) + " (down=" +
                     std::to_string(s.downBytes) + " up=" + std::to_string(s.upBytes) + ")");
                 if (s.origin) s.origin->close();
                 dead.push_back(id);
@@ -695,6 +749,13 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
                 }
                 s.toEdgeOff += took;
                 s.upBytes += static_cast<std::uint64_t>(took);
+                // write_data_some already attached END_STREAM when it accepted
+                // the final bytes of a finished origin. Remember that, or the
+                // tail block below sends a SECOND empty END_STREAM on the same
+                // stream, which the edge rejects with PROTOCOL_ERROR (code=1)
+                // and closes the whole connection -- seen as a download dying
+                // at a random offset with no local error.
+                if (isLast && took == left) s.endSent = true;
                 if (s.toEdgeOff >= s.toEdge.size()) {
                     s.toEdge.clear();
                     s.toEdgeOff = 0;
@@ -750,16 +811,23 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
                 }
                 s.toEdgeOff += took;
                 s.upBytes += static_cast<std::uint64_t>(took);
+                // Same duplicate-END_STREAM guard as above. These two blocks run
+                // back to back in one iteration, so without it a normal reply
+                // ending inside gotData emitted END_STREAM twice.
+                if (isLast && took == left) s.endSent = true;
                 if (s.toEdgeOff >= s.toEdge.size()) {
                     s.toEdge.clear();
                     s.toEdgeOff = 0;
                 }
             }
-            // Origin finished and everything reached the edge: close the stream.
-            // Guarded so a second pass cannot emit a duplicate END_STREAM.
-            if (s.originDone && !s.endSent && s.toEdgeOff >= s.toEdge.size()) {
-                s.endSent = true;
-                if (srvWriteDataSome) srvWriteDataSome(id, nullptr, 0, true);
+            // Origin finished and everything reached the edge: retire the stream,
+            // emitting END_STREAM only if one was not already sent with the last
+            // data frame.
+            if (s.originDone && s.toEdgeOff >= s.toEdge.size()) {
+                if (!s.endSent) {
+                    s.endSent = true;
+                    if (srvWriteDataSome) srvWriteDataSome(id, nullptr, 0, true);
+                }
                 dead.push_back(id);
             }
         }
@@ -787,9 +855,28 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
         // state machine moving without monopolising the core.
         bool backlog = false;
         bool hasPendingOrigin = false;
+        // True while any proxied stream is open. srv->poll() only waits on the
+        // EDGE socket, so nothing wakes us when the origin receives bytes: they
+        // sit in the origin socket until the next pumpOrigins(). Waiting the
+        // full idlePollMs there cost one 16 KB read per 100 ms (~160 KB/s), a
+        // 2-4 s pause per flow-control cycle, and ~100 ms on every protocol
+        // round trip -- a TLS handshake through the tunnel measured 1-2 s
+        // instead of the ~50 ms the 14 ms edge RTT allows. With a session open
+        // the wait is shortened to activePollMs instead.
+        bool activeStream = false;
         for (auto& kv : streams) {
             auto& s = kv.second;
             if (!s.origin || s.isControl) continue;
+            activeStream = true;
+            // Bytes queued for the edge only count as backlog while the edge
+            // still grants credit. Without this check a closed flow-control
+            // window looked like "work waiting", so the loop called poll(0)
+            // forever: 100% CPU, a trace line per iteration, and the peer's
+            // WINDOW_UPDATE was the only thing that could ever clear it. That
+            // is the "repeated short stall" seen on long downloads.
+            const bool waitingForCredit =
+                s.toEdgeOff < s.toEdge.size() && !srv->send_credit_available(kv.first);
+            if (waitingForCredit) continue;
             if (s.toEdgeOff < s.toEdge.size() || s.toOriginOff < s.toOrigin.size() ||
                 s.origin->hasPendingOutput()) {
                 backlog = true;
@@ -800,6 +887,7 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
         int pollTimeoutMs;
         if (backlog) pollTimeoutMs = 0;
         else if (hasPendingOrigin) pollTimeoutMs = 1;
+        else if (activeStream) pollTimeoutMs = cfg.activePollMs;
         else pollTimeoutMs = cfg.idlePollMs;
         if (!srv->poll(pollTimeoutMs)) {
             // The edge went away (or sent GOAWAY). Leave the loop so the
@@ -820,7 +908,7 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
         if (h2_trace_enabled() && tick % 30 == 0) {
             for (auto& kv : streams) {
                 if (kv.second.isControl) continue;
-                log("[tunnel] stream " + std::to_string(kv.first) + " down=" +
+                LD("[tunnel] stream " + std::to_string(kv.first) + " down=" +
                     std::to_string(kv.second.downBytes) + " up=" +
                     std::to_string(kv.second.upBytes) + " queued=" +
                     std::to_string(kv.second.origin ? kv.second.origin->pendingOutputBytes() : 0) +
@@ -832,7 +920,7 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
                 down += kv.second.downBytes;
                 up += kv.second.upBytes;
             }
-            log("[tunnel] " + std::to_string(streams.size()) + " stream(s), down=" +
+            LD("[tunnel] " + std::to_string(streams.size()) + " stream(s), down=" +
                 std::to_string(down) + " up=" + std::to_string(up) +
                 ", served=" + std::to_string(status.requestsServed));
         }
@@ -843,7 +931,7 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
                                {{"content-type", "application/octet-stream"}}, false);
             auto boot = RpcStream::encode_bootstrap(1);
             srv->write_data(ctrlStream, boot.data(), boot.size(), false);
-            log("[tunnel] sent bootstrap");
+            LD("[tunnel] sent bootstrap");
 
             // Wait for the bootstrap Return.
             std::size_t consumed = 0;
@@ -901,7 +989,7 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
                     return params;
                 });
             srv->write_data(ctrlStream, call.data(), call.size(), false);
-            log("[tunnel] sent registerConnection");
+            LD("[tunnel] sent registerConnection");
 
             std::size_t before = consumed;
             bool registered = false;
@@ -933,8 +1021,9 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
                 if (registered) break;
             }
             status.registered = registered;
+            publish();
             if (registered) {
-                log("[tunnel] REGISTERED with edge");
+                LI("[tunnel] REGISTERED with edge");
             } else {
                 log("[tunnel] registration failed: " + status.error);
                 delete srv;

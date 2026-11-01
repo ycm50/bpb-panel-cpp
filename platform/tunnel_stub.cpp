@@ -33,8 +33,14 @@ bool start_from_store(Store& store, bool& started, std::string& error) {
 
 std::string status_json() {
     return "{\"running\":false,\"connected\":false,\"registered\":false,\"uuid\":\"\","
-           "\"location\":\"\",\"requests\":0,"
+           "\"location\":\"\",\"requests\":0,\"quick\":false,"
+           "\"hostname\":\"\",\"url\":\"\",\"hostnames\":[],\"mainDomain\":\"\","
            "\"error\":\"not available on this platform\"}";
+}
+
+void sync_ingress_domain(Store&) {
+    // No tunnel on this platform, so there is no ingress configuration to
+    // adopt and the published domain stays whatever the user configured.
 }
 
 void stop() {}

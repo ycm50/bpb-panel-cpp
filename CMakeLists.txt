@@ -31,9 +31,50 @@ find_package(ZLIB REQUIRED)
 set(CMAKE_CXX_FLAGS_RELEASE "-O2 -ffunction-sections -fdata-sections")
 set(CMAKE_C_FLAGS_RELEASE "-O2 -ffunction-sections -fdata-sections")
 
+# --- inbound protocols -------------------------------------------------------
+# Each inbound protocol lives in its own file under src/inbound/proto/ and is
+# compiled ONLY when selected here, so a binary built with
+# -DBPB_INBOUNDS=vless does not contain -- and does not even compile -- the
+# others. What the binary carries is exposed as BPB_HAVE_<PROTO>; the
+# dispatcher, the panel and the subscription generators consult
+# bpb::inbound::all() instead of hard-coding protocol names.
+#
+# Add a protocol: write src/inbound/proto/<name>_ws.cpp defining
+# <name>_inbound, then append the name to BPB_ALL_INBOUNDS below (the release
+# workflow reads that same line to build the matrix).
+set(BPB_ALL_INBOUNDS vless trojan shadowsocks vmess)
+set(BPB_INBOUNDS "vless" CACHE STRING
+    "Inbound protocols to compile: comma separated, or 'all' for every implemented one")
+
+if(BPB_INBOUNDS STREQUAL "all")
+  set(BPB_INBOUND_SELECTED ${BPB_ALL_INBOUNDS})
+else()
+  string(REPLACE "," ";" BPB_INBOUND_SELECTED "${BPB_INBOUNDS}")
+endif()
+if(NOT BPB_INBOUND_SELECTED)
+  message(FATAL_ERROR "BPB_INBOUNDS is empty: choose at least one of ${BPB_ALL_INBOUNDS}")
+endif()
+
+set(BPB_INBOUND_SOURCES "")
+foreach(proto IN LISTS BPB_INBOUND_SELECTED)
+  string(STRIP "${proto}" proto)
+  string(TOLOWER "${proto}" proto)
+  if(NOT proto IN_LIST BPB_ALL_INBOUNDS)
+    message(FATAL_ERROR "unknown inbound '${proto}'; implemented: ${BPB_ALL_INBOUNDS}")
+  endif()
+  list(APPEND BPB_INBOUND_SOURCES src/inbound/proto/${proto}_ws.cpp)
+  string(TOUPPER "${proto}" proto_upper)
+  add_compile_definitions(BPB_HAVE_${proto_upper}=1)
+endforeach()
+list(REMOVE_DUPLICATES BPB_INBOUND_SOURCES)
+message(STATUS "bpb inbounds: ${BPB_INBOUND_SELECTED}")
+
 # --- bpb ---------------------------------------------------------------------
 file(GLOB_RECURSE BPB_SOURCES CONFIGURE_DEPENDS src/*.cpp)
 list(APPEND BPB_SOURCES third_party/qrcodegen.cpp)
+# The per-protocol files are added explicitly above.
+list(FILTER BPB_SOURCES EXCLUDE REGEX "/src/inbound/proto/")
+list(APPEND BPB_SOURCES ${BPB_INBOUND_SOURCES})
 
 # The Cloudflare Tunnel client is a POSIX implementation (poll(2), <arpa/inet.h>,
 # <sys/socket.h>, stream sockets as ints). Shipping it on Windows would mean a
@@ -55,7 +96,9 @@ if(WIN32)
   target_link_options(bpb PRIVATE -static-libgcc -static-libstdc++ -Wl,--gc-sections)
 else()
   target_link_libraries(bpb PRIVATE pthread)
-  target_link_options(bpb PRIVATE -static-libgcc -static-libstdc++ -Wl,--gc-sections)
+  # -rdynamic keeps the symbol table so the crash handler's backtrace prints
+  # function names instead of bare addresses.
+  target_link_options(bpb PRIVATE -static-libgcc -static-libstdc++ -Wl,--gc-sections -rdynamic)
   if(BPB_STATIC)
     target_link_options(bpb PRIVATE -static)
   endif()
