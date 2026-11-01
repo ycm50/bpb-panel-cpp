@@ -145,6 +145,7 @@ bool Server::read_into(Conn& c) {
         net::IoResult result = net::IoResult::Error;
         int n = net::tls_read(c.ssl, c.fd, buf, static_cast<int>(sizeof(buf)), result);
         if (n > 0) {
+            now(c.last_active);
             c.in.append(buf, static_cast<std::size_t>(n));
             if (c.in.size() > kMaxHeader + kMaxBody) {
                 Response r = Response::text(413, "Payload Too Large");
@@ -155,6 +156,15 @@ bool Server::read_into(Conn& c) {
             continue;
         }
         if (result == net::IoResult::WouldBlock) return true;
+        if (result == net::IoResult::Closed) {
+            // End of the peer's write side. Do NOT drop the connection: a
+            // complete request may already be buffered (a GET with an
+            // immediately half-closed socket, which is exactly what the tunnel
+            // relay produces for bodyless requests). Mark it and let process()
+            // answer, then close after the response is written.
+            c.peer_closed = true;
+            return true;
+        }
         return false;
     }
 }
@@ -220,8 +230,17 @@ void Server::process(Conn& c) {
         auto conn_hdr = to_lower(req.header("connection"));
         if (req.version == "HTTP/1.0" || conn_hdr.find("close") != std::string::npos) keep_alive = false;
 
-        // WebSocket upgrade
+        // WebSocket upgrade. A plain client sends Upgrade: websocket; the
+        // Cloudflare edge instead marks the stream with
+        // cf-cloudflared-proxy-connection-upgrade: websocket and does NOT
+        // forward the standard header (cloudflared re-adds it internally).
+        // Accept both, otherwise a tunnel-fronted request is routed as ordinary
+        // HTTP and 404s.
         auto upgrade = to_lower(req.header("upgrade"));
+        if (upgrade.empty() &&
+            to_lower(req.header("cf-cloudflared-proxy-connection-upgrade")) == "websocket") {
+            upgrade = "websocket";
+        }
         if (upgrade == "websocket" && ws_handler_) {
             std::string key = req.header("sec-websocket-key");
             std::string accept_src = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -269,18 +288,32 @@ void Server::process(Conn& c) {
         out += res.body;
 
         c.out += out;
-        if (!keep_alive || res.close) c.close_after_write = true;
+        // A half-closed peer cannot send another request, so this response is
+        // the last one on the connection.
+        if (!keep_alive || res.close || c.peer_closed) c.close_after_write = true;
         flush(c);
-        if (c.detached || c.close_after_write) return;
-        if (c.out.empty() && c.in.empty()) return;
+        if (c.detached) return;
+        // Closing connection: there is nothing left to parse, but any tail still
+        // in c.out must be flushed by run()'s write arm before the socket is
+        // dropped. Returning here is safe *because* run() keeps such a
+        // connection registered for POLLOUT until c->out is empty.
+        if (c.close_after_write) return;
+        // Nothing more can arrive from a half-closed peer.
+        if (c.peer_closed) return;
         if (c.in.empty()) return;
     }
 }
 
 void Server::flush(Conn& c) {
+    // Cap one write at 16 KiB. Passing the whole 1 MiB body to SSL_write makes
+    // OpenSSL encode dozens of records before returning, and on a non-blocking
+    // socket a single WANT_WRITE then loses all that work. Chunking keeps each
+    // step atomic and lets the poll loop interleave with other connections.
+    constexpr std::size_t kWriteChunk = 16 * 1024;
     while (!c.out.empty()) {
         net::IoResult result = net::IoResult::Error;
-        int n = net::tls_write(c.ssl, c.fd, c.out.data(), static_cast<int>(c.out.size()), result);
+        const int want = static_cast<int>(std::min(c.out.size(), kWriteChunk));
+        int n = net::tls_write(c.ssl, c.fd, c.out.data(), want, result);
         if (n > 0) {
             c.out.erase(0, static_cast<std::size_t>(n));
             continue;
@@ -312,13 +345,27 @@ void Server::run() {
         for (std::size_t i = 0; i < conns_.size(); ++i) {
             auto& c = conns_[i];
             if (!c || c->detached || c->fd == net::kInvalid) continue;
+            // A half-closed peer can never send again. Keeping it in the poll
+            // set made poll() return POLLIN every iteration (nothing is read any
+            // more), which burned ~50% of a core and left the socket in
+            // CLOSE-WAIT forever. Its only remaining work is flushing the
+            // response, handled by the write arm below.
+            if (c->peer_closed && c->out.empty()) continue;
             short ev = net::kRead;
             if (!c->out.empty()) ev |= net::kWrite;
             if (c->ssl && net::tls_wants_write(c->ssl)) ev |= net::kWrite;
             pfds.push_back({c->fd, ev, 0});
             map.push_back(i);
         }
-        int rc = net::poll_fds(pfds.data(), pfds.size(), 1000);
+        // Short poll when any connection still has a request already buffered
+        // (a keep-alive client that pipelined) or a response tail to push, so
+        // the next round happens immediately instead of after the idle tick.
+        int pollWait = 1000;
+        for (auto& cc : conns_) {
+            if (!cc || cc->detached) continue;
+            if (!cc->in.empty() || !cc->out.empty()) { pollWait = 1; break; }
+        }
+        int rc = net::poll_fds(pfds.data(), pfds.size(), pollWait);
         if (rc < 0) {
             int err = net::last_error();
             if (err != 0 && !net::would_block(err)) continue;
@@ -348,10 +395,12 @@ void Server::run() {
             }
             if (pfds[k].revents & net::kWrite) flush(*c);
             if (pfds[k].revents & (net::kRead | net::kWrite)) {
-                if (!c->close_after_write) {
+                if (!c->close_after_write && !c->peer_closed) {
                     if (!read_into(*c)) { dead.push_back(idx); continue; }
                 }
                 process(*c);
+                // Close only after the tail is actually on the wire; otherwise
+                // the client waits for a response we still hold in c.out.
                 if (c->close_after_write && c->out.empty()) dead.push_back(idx);
             }
         }
@@ -361,6 +410,11 @@ void Server::run() {
         for (std::size_t i = 0; i < conns_.size(); ++i) {
             auto& c = conns_[i];
             if (!c || c->detached || c->fd == net::kInvalid) continue;
+            // Peer closed and the response is out: nothing left to do.
+            if (c->peer_closed && c->out.empty()) {
+                dead.push_back(i);
+                continue;
+            }
             if (c->out.empty() && !c->in.empty() && t - c->last_active > kIdleTimeoutMs) dead.push_back(i);
         }
         std::sort(dead.begin(), dead.end());

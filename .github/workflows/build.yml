@@ -1,41 +1,115 @@
 name: build
 
+# 本工作流只产出**可执行二进制**，不构建、不推送任何容器镜像。
+# alpine 容器仅作为一次性的编译环境（提供 musl 与静态库），跑完即弃。
+#
+# 触发方式：只有手动（workflow_dispatch）。
+#
+# 产物是**按协议分开的二进制**：每个入栈协议各自编一个（-DBPB_INBOUNDS=<协议>），
+# 不是把多个协议塞进同一个二进制。选 all 就是“全协议”——把每个协议的二进制
+# 全部构建并发布。协议清单从 CMakeLists.txt 的 BPB_ALL_INBOUNDS 里读，
+# 所以新增协议只改那一处，CI 自动跟上。
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
     inputs:
       tag:
-        description: "发布 tag（所有架构构建成功后才创建），例如 v1.0.0"
+        description: "发布 tag（必须等全部构建成功后才会创建或覆盖），例如 v1.0.0"
         required: true
         type: string
+      protocols:
+        description: "编译哪些入栈协议（all = 每个协议各出一个二进制）"
+        required: true
+        default: all
+        type: choice
+        # 与 CMakeLists.txt 的 BPB_ALL_INBOUNDS 保持一致；plan 会再校验一次，
+        # 选了清单外的协议直接报错。
+        options:
+          - all
+          - vless
+          - trojan
+          - shadowsocks
+          - vmess
 
+# 手动发布不允许被"再点一次 Run"掐断：同一个 ref 的第二次手动触发会让旧的
+# 运行直接失败（哪怕它已经编完一半），所以这里必须是 false。
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # 决定这次要编哪些协议。唯一的真相来源是 CMakeLists.txt：
+  #   set(BPB_ALL_INBOUNDS vless trojan)
+  # 新增协议时只改那一行，这里不用跟着改。
+  # ---------------------------------------------------------------------------
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    outputs:
+      protocols: ${{ steps.list.outputs.protocols }}
+      linux_matrix: ${{ steps.list.outputs.linux_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        run: |
+          set -euo pipefail
+          # tr -d '\r' first: a Windows checkout (core.autocrlf) would otherwise
+          # leave a CR at the end of the line and the anchored pattern never matches.
+          all="$(tr -d '\r' < CMakeLists.txt | sed -n 's/^set(BPB_ALL_INBOUNDS \(.*\))$/\1/p' | tail -1)"
+          [ -n "$all" ] || { echo '::error::BPB_ALL_INBOUNDS not found in CMakeLists.txt'; exit 1; }
+          case "${{ inputs.protocols }}" in
+            all) list="$all" ;;
+            *)
+              list="${{ inputs.protocols }}"
+              case " $all " in
+                *" $list "*) ;;
+                *) echo "::error::$list is not in BPB_ALL_INBOUNDS ($all)"; exit 1 ;;
+              esac
+              ;;
+          esac
+          json="$(printf '%s\n' $list | sed 's/.*/"&"/' | paste -sd, -)"
+          echo "protocols=[$json]" >> "$GITHUB_OUTPUT"
+
+          # 架构 -> docker platform 的映射只写一次，直接生成完整的 协议x架构
+          # 组合。故意不用 matrix.include 去“补” platform：include 的合并规则
+          # 依赖是否与已有取值冲突，很容易写出多出或缺失的组合。
+          combos=""
+          for proto in $list; do
+            for pair in amd64:linux/amd64 arm64:linux/arm64 armv7:linux/arm/v7 386:linux/386 riscv64:linux/riscv64; do
+              arch=${pair%%:*}
+              plat=${pair#*:}
+              [ -n "$combos" ] && combos="$combos,"
+              combos="$combos{\"protocol\":\"$proto\",\"arch\":\"$arch\",\"platform\":\"$plat\"}"
+            done
+          done
+          echo "linux_matrix=[$combos]" >> "$GITHUB_OUTPUT"
+          echo "building: $list"
+
+  # ---------------------------------------------------------------------------
+  # 各架构 × 各协议的静态 Linux 二进制。
+  #
+  # 编译环境是 Alpine（musl），不是 glibc：源代码里不能出现 musl 没有的
+  # 头/函数（例如 <execinfo.h> 与 backtrace()）。这类依赖必须用
+  # __has_include 之类的探测包起来，否则整个矩阵一起编译失败。
+  #
+  # 用 CMake 而不是裸 g++：CMake 负责配置 lwIP 的 include 路径与 C 源文件，
+  # 裸命令会漏掉 src/include 与 third_party/lwip（之前 CI 就是因此报
+  # "lwip/opt.h: No such file or directory"）。
+  # 用 -DBPB_STATIC=ON 而不是只加 -static：否则 CMake 仍解析到 libssl.so，
+  # 链接会报 "attempted static link of dynamic object"。
+  # ---------------------------------------------------------------------------
   linux:
-    name: linux-${{ matrix.arch }}
+    name: linux-${{ matrix.arch }}-${{ matrix.protocol }}
+    needs: plan
     runs-on: ubuntu-24.04
     strategy:
-      fail-fast: true
+      fail-fast: false
+      # 完整的 协议 x 架构 组合，由 plan 生成（见上面的注释）。
       matrix:
-        include:
-          - arch: amd64
-            platform: linux/amd64
-          - arch: arm64
-            platform: linux/arm64
-          - arch: armv7
-            platform: linux/arm/v7
-          - arch: "386"
-            platform: linux/386
-          - arch: riscv64
-            platform: linux/riscv64
+        include: ${{ fromJSON(needs.plan.outputs.linux_matrix) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -43,32 +117,72 @@ jobs:
         if: matrix.arch != 'amd64'
         uses: docker/setup-qemu-action@v3
 
-      # 只产出二进制：alpine 镜像仅作为一次性编译环境，不构建也不发布容器镜像。
-      - name: Build static binary
+      - name: "Build static binary (inbound: ${{ matrix.protocol }})"
         run: |
+          set -euo pipefail
           mkdir -p dist
           docker run --rm --platform ${{ matrix.platform }} \
             -v "$PWD:/src" -w /src alpine:3.22 sh -c '
               set -e
-              apk add --no-cache g++ musl-dev openssl-dev openssl-libs-static \
-                      zlib-dev zlib-static >/dev/null
-              g++ -O2 -std=c++20 -static -ffunction-sections -fdata-sections \
-                  -Isrc -Ithird_party \
-                  src/*.cpp src/*/*.cpp third_party/qrcodegen.cpp \
-                  -o dist/bpb-linux-${{ matrix.arch }} -lssl -lcrypto -lz -lpthread
-              strip dist/bpb-linux-${{ matrix.arch }}
+              apk add --no-cache g++ musl-dev cmake samurai \
+                      openssl-dev openssl-libs-static zlib-dev zlib-static >/dev/null
+              cmake -S . -B /tmp/b -G Ninja -DCMAKE_BUILD_TYPE=Release -DBPB_STATIC=ON \
+                    -DBPB_INBOUNDS=${{ matrix.protocol }}
+              cmake --build /tmp/b
+              strip /tmp/b/bpb
+              cp /tmp/b/bpb dist/bpb-linux-${{ matrix.arch }}-${{ matrix.protocol }}
             '
           ls -l dist
 
+      # 产物必须能真正跑起来、不依赖动态库，并且**只带被选中的那个协议**。
+      # 最后一条才是这次改造的重点：协议没编进去（或编多了）都要在这里炸掉。
+      - name: Verify it runs, is static, and carries only ${{ matrix.protocol }}
+        run: |
+          set -euo pipefail
+          f="bpb-linux-${{ matrix.arch }}-${{ matrix.protocol }}"
+          test -s "dist/$f" || { echo "::error::dist/$f is empty"; exit 1; }
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v "$PWD/dist:/dist:ro" -w /dist alpine:3.22 sh -c "
+              set -e
+              # This image is a bare alpine:3.22 with no apk add, so there is no
+              # libssl/libz to load: starting at all proves the binary is static.
+              ./$f --help > /dev/null
+              echo 'runs OK'
+              mkdir -p /tmp/d
+              ./$f --port 18080 --data /tmp/d --log info 2>/tmp/log.txt &
+              pid=\$!
+              for i in \$(seq 1 20); do
+                sleep 0.5
+                grep -q 'inbounds:' /tmp/log.txt && break
+              done
+              kill \$pid 2>/dev/null || true
+              # The log line ends with '..., inbounds: vless)', so the protocol
+              # list is what sits between 'inbounds: ' and the closing paren.
+              # An anchored grep for 'inbounds: vless$' can never match, which is
+              # what made every Linux build in this matrix fail.
+              inb=\$(sed -n 's/.*inbounds: \([^)]*\).*/\1/p' /tmp/log.txt)
+              [ "\$inb" = '${{ matrix.protocol }}' ] \
+                || { echo '::error::built-in inbounds are not exactly ${{ matrix.protocol }} (see log below)'; cat /tmp/log.txt; exit 1; }
+              echo 'inbound set OK'
+            "
+
       - uses: actions/upload-artifact@v4
         with:
-          name: bpb-linux-${{ matrix.arch }}
-          path: dist/bpb-linux-${{ matrix.arch }}
+          name: bpb-linux-${{ matrix.arch }}-${{ matrix.protocol }}
+          path: dist/bpb-linux-${{ matrix.arch }}-${{ matrix.protocol }}
           if-no-files-found: error
 
+  # ---------------------------------------------------------------------------
+  # Windows（MSYS2 UCRT64；CMake 会拒绝 MSVC），同样按协议分开。
+  # ---------------------------------------------------------------------------
   windows:
-    name: windows-x86_64
+    name: windows-x86_64-${{ matrix.protocol }}
+    needs: plan
     runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        protocol: ${{ fromJSON(needs.plan.outputs.protocols) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -87,26 +201,56 @@ jobs:
       - name: Configure and build
         shell: msys2 {0}
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DBPB_INBOUNDS=${{ matrix.protocol }}
           cmake --build build
 
       - name: Collect artifact
         shell: msys2 {0}
         run: |
           mkdir -p dist
-          cp build/bpb.exe dist/bpb-windows-x86_64.exe
+          cp build/bpb.exe "dist/bpb-windows-x86_64-${{ matrix.protocol }}.exe"
+
+      # 必须用 --help/--port 在 MSYS2 环境里跑：UCRT64 产物依赖 MSYS2 的
+      # runtime DLL，直接在 pwsh 里启动会因缺 DLL 立刻退出（表现为端口拒绝连接）。
+      - name: Smoke test
+        shell: msys2 {0}
+        run: |
+          set -e
+          mkdir -p smoke-data
+          ./dist/bpb-windows-x86_64-${{ matrix.protocol }}.exe --help > /dev/null
+          ./dist/bpb-windows-x86_64-${{ matrix.protocol }}.exe --port 18080 --data ./smoke-data --log info 2> smoke.log &
+          pid=$!
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            sleep 1
+            if curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/securepath/panel 2>/dev/null | grep -q 200; then
+              echo "panel OK"
+              break
+            fi
+          done
+          kill $pid 2>/dev/null || true
+          # Same strict check as Linux: the log line is "... inbounds: vless)",
+          # so compare the whole protocol list, not a substring.
+          inb=$(sed -n 's/.*inbounds: \([^)]*\).*/\1/p' smoke.log)
+          [ "$inb" = '${{ matrix.protocol }}' ] \
+            || { echo "::error::built-in inbounds are '$inb', expected '${{ matrix.protocol }}'"; cat smoke.log; exit 1; }
+          echo 'inbound set OK'
 
       - uses: actions/upload-artifact@v4
         with:
-          name: bpb-windows-x86_64
-          path: dist/bpb-windows-x86_64.exe
+          name: bpb-windows-x86_64-${{ matrix.protocol }}
+          path: dist/bpb-windows-x86_64-${{ matrix.protocol }}.exe
           if-no-files-found: error
 
+  # ---------------------------------------------------------------------------
+  # 发布：仅手动触发，且必须所有构建都成功。只附二进制，不产出镜像。
+  #
+  # tag 已存在时**覆盖**：先把 tag 强推到本次 commit，再用 overwrite_files 把
+  # release 里同名的二进制逐个替换掉（不新增一堆历史资产）。
+  # ---------------------------------------------------------------------------
   release:
-    name: release ${{ inputs.tag }}
-    # 仅手动触发，且必须所有构建（含全部架构）都成功。
-    if: github.event_name == 'workflow_dispatch' && success()
-    needs: [linux, windows]
+    name: release
+    needs: [plan, linux, windows]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -121,23 +265,31 @@ jobs:
 
       - name: Package
         run: |
+          set -euo pipefail
           ls -l dist
           cd dist
           sha256sum bpb-linux-* bpb-windows-* > SHA256SUMS
+          cat SHA256SUMS
 
-      - name: Create tag and GitHub release
+      - name: Point the tag at this commit (overwrites an existing one)
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -f "${{ inputs.tag }}" "$GITHUB_SHA"
+          git push --force origin "refs/tags/${{ inputs.tag }}"
+
+      - name: Create or update the GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag }}
           name: ${{ inputs.tag }}
           target_commitish: ${{ github.sha }}
+          # 已存在就覆盖同名资产，而不是留下上一轮的旧二进制。
+          overwrite_files: true
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            dist/bpb-linux-amd64
-            dist/bpb-linux-arm64
-            dist/bpb-linux-armv7
-            dist/bpb-linux-386
-            dist/bpb-linux-riscv64
-            dist/bpb-windows-x86_64.exe
+            dist/bpb-linux-*
+            dist/bpb-windows-*
             dist/SHA256SUMS
