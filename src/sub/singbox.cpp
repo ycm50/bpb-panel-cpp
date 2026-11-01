@@ -266,7 +266,7 @@ json build_ws_outbound(const json& s, const std::string& protocol, const std::st
         upstream_server = s["upstreamParams"].value("upstreamServer", std::string());
     }
     auto sni_host = select_sni_host(s, address, domain);
-    json transport = build_transport("ws", "none", generate_ws_path(protocol), sni_host.host, "", 2560);
+    json transport = build_transport("ws", "none", generate_ws_path(protocol, s.value("vlUUID", std::string())), sni_host.host, "", 2560);
     bool is_tls = is_https(s, port) || (!upstream_server.empty() && address == upstream_server);
     json tls = is_tls ? build_tls(s, "tls", is_fragment, sni_host.allow_insecure, sni_host.sni,
                                   flag(s, "enableECH") && !is_fragment, str(s, "echServerName"),
@@ -274,13 +274,14 @@ json build_ws_outbound(const json& s, const std::string& protocol, const std::st
                       : json();
 
     json fields = json::object();
-    if (protocol == "vless") {
-        fields["uuid"] = str(s, "vlUUID");
-        fields["packet_encoding"] = "";
-        fields["network"] = "tcp";
-    } else {
-        fields["password"] = str(s, "trPass");
-        fields["network"] = "tcp";
+    fields["uuid"] = str(s, "vlUUID");
+    fields["packet_encoding"] = "";
+    fields["network"] = "tcp";
+    if (protocol == "vmess") {
+        // sing-box: alter_id 0, security auto (AES-128-GCM); the ws transport
+        // already carries max_early_data / early_data_header_name.
+        fields["security"] = "auto";
+        fields["alter_id"] = 0;
     }
     return build_outbound_base(remark, protocol, address, port, flag(s, "enableTFO"), fields, tls,
                                transport, false);
@@ -723,7 +724,7 @@ bool build_sb_custom(const json& s, bool is_fragment, std::string& out_json, std
         bool is_custom = (!custom_domain.empty() && domain == custom_domain);
 
         for (auto& protocol : protocols) {
-            if (protocol != "vless" && protocol != "trojan") continue;
+            if (protocol != "vless" && protocol != "vmess") continue;
             int protocol_index = 1;
             for (int port : total_ports) {
                 for (auto& host : hosts) {

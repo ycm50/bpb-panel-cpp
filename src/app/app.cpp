@@ -1,17 +1,22 @@
 #include "app/app.h"
 #include "app/qrcode.h"
+#include "inbound/inbound.h"
 #include "assets_gen.h"
 #include "crypto/crypto.h"
 #include "net/http_client.h"
+#include "net/wg_outbound.h"
 #include "sub/clash.h"
 #include "sub/raw.h"
+#include "util/log.h"
 #include "sub/singbox.h"
 #include "sub/warp.h"
 #include "sub/wireguard.h"
 #include "sub/xray.h"
+#include "tunnel/integration.h"
 #include "util/util.h"
 
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 
@@ -54,53 +59,115 @@ static http::Response json_err(int status, const std::string& message) {
 
 App::App(Store& store, std::string asset_dir) : store_(store), asset_dir_(std::move(asset_dir)) {}
 
-bool App::load_assets(std::string& error) {
-    // Assets are embedded in the binary; --assets can override them for UI tweaks without a rebuild.
-    auto read_page = [&](const char* name, const std::string& path) -> std::string {
-        std::string text = asset_dir_.empty() ? std::string() : read_text(path);
-        if (!text.empty()) return text;
+bool App::write_file(const std::string& path, const std::string& data) {
+    std::error_code ec;
+    auto parent = std::filesystem::path(path).parent_path();
+    if (!parent.empty()) std::filesystem::create_directories(parent, ec);
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) return false;
+    f.write(data.data(), static_cast<std::streamsize>(data.size()));
+    return static_cast<bool>(f);
+}
+
+// Extracts the panel into <data>/assets on first run.
+//
+// The pages are compiled into the binary so a lone executable still works, but
+// keeping them *only* in there meant every CSS or icon tweak needed a rebuild
+// and a redeploy. Writing them out once gives the same single-file start while
+// making the deployed copy editable; existing files are never overwritten, so
+// local edits survive upgrades.
+bool App::extract_assets(const std::string& dir, std::string& error) {
+    static const char* kPages[] = {"panel", "login", "error"};
+    bool wroteAny = false;
+    for (const char* page : kPages) {
+        const std::string path = dir + "/" + page + "/index.html";
+        std::error_code ec;
+        if (std::filesystem::exists(path, ec)) continue;
         std::size_t len = 0;
-        const char* data = assets::page(name, len);
-        return data ? std::string(data, len) : std::string();
-    };
+        const char* data = assets::page(page, len);
+        if (!data || len == 0) continue;
+        if (!write_file(path, std::string(data, len))) {
+            // A read-only data directory must not be fatal: the embedded copy
+            // is still served, only local editing is unavailable.
+            bpb::log::warn("[assets] could not write %s, serving the embedded copy",
+                           path.c_str());
+            continue;
+        }
+        wroteAny = true;
+    }
+    if (wroteAny) bpb::log::info("[assets] panel extracted to %s", dir.c_str());
 
-    std::string panel = read_page("panel", asset_dir_ + "/panel/index.html");
-    std::string login = read_page("login", asset_dir_ + "/login/index.html");
-    std::string err = read_page("error", asset_dir_ + "/error/index.html");
+    const std::string iconPath = dir + "/favicon.ico";
+    std::error_code ec;
+    if (!std::filesystem::exists(iconPath, ec)) {
+        std::size_t len = 0;
+        const char* data = assets::icon(len);
+        if (data && len) write_file(iconPath, std::string(data, len));
+    }
+    (void)error;
+    return true;
+}
 
-    std::string icon = read_text(asset_dir_ + "/favicon.ico");
+// Native build has no Cloudflare account/analytics/telegram integration: hide
+// those controls with CSS only, so the browser-side script keeps running
+// against the elements it expects to exist.
+static const char* kNativeHideCss =
+    "<style>"
+    ".section:has(#total-usage){display:none!important;}"
+    ".dashboard-action:has(#updatePanel){display:none!important;}"
+    ".dashboard-action:has(#deletePanel){display:none!important;}"
+    "</style>";
+
+std::string App::page(const char* name, std::string& error) const {
+    const std::string dir = asset_dir_.empty() ? store_.dir() + "/assets" : asset_dir_;
+    std::string text = read_text(dir + "/" + name + "/index.html");
+    if (!text.empty()) return text;
+    // Embedded fallback keeps a lone binary working when the data directory is
+    // read-only or the file was deleted.
+    std::size_t len = 0;
+    const char* data = assets::page(name, len);
+    if (data && len) return std::string(data, len);
+    error = std::string("no ") + name + " page available";
+    return std::string();
+}
+
+std::string App::icon_b64() const {
+    const std::string dir = asset_dir_.empty() ? store_.dir() + "/assets" : asset_dir_;
+    std::string icon = read_text(dir + "/favicon.ico");
     if (icon.empty()) {
         std::size_t len = 0;
         const char* data = assets::icon(len);
         if (data) icon.assign(data, len);
     }
-    if (panel.empty() || login.empty()) {
-        error = "no panel assets available (embedded assets missing and --assets dir has none)";
+    return base64_encode(icon);
+}
+
+std::string App::render_page(const char* name, bool is_panel, std::string& error) const {
+    std::string html = page(name, error);
+    if (html.empty()) return html;
+    html = replace_all(std::move(html), "__VERSION__", version_);
+    html = replace_all(std::move(html), "__ICON__", icon_b64());
+    if (is_panel) html += kNativeHideCss;
+    return html;
+}
+
+bool App::load_assets(std::string& error) {
+    // Default location: <data>/assets, written out once on first run so the
+    // panel can be edited in place. --assets points somewhere else and skips
+    // the extraction.
+    if (asset_dir_.empty()) {
+        const std::string dir = store_.dir() + "/assets";
+        extract_assets(dir, error);
+    }
+    // Nothing is cached: every request re-reads the file (see page()). Startup
+    // only checks that at least the panel can be produced, so a broken install
+    // still fails loudly instead of serving 404s.
+    std::string check_error;
+    if (render_page("panel", true, check_error).empty() ||
+        render_page("login", false, check_error).empty()) {
+        error = check_error.empty() ? "no panel assets available" : check_error;
         return false;
     }
-
-    icon_b64_ = base64_encode(icon);
-
-    auto build = [&](std::string html) {
-        html = replace_all(std::move(html), "__VERSION__", version_);
-        html = replace_all(std::move(html), "__ICON__", icon_b64_);
-        return html;
-    };
-
-    panel_html_ = build(panel);
-
-    // Native build has no Cloudflare account/analytics/telegram integration: hide those controls
-    // with CSS only, so the browser-side script keeps running against existing elements.
-    static const char* kNativeHideCss =
-        "<style>"
-        ".section:has(#total-usage){display:none!important;}"
-        ".dashboard-action:has(#updatePanel){display:none!important;}"
-        ".dashboard-action:has(#deletePanel){display:none!important;}"
-
-        "</style>";
-    panel_html_ += kNativeHideCss;
-    login_html_ = build(login);
-    if (!err.empty()) error_html_ = build(err);
     return true;
 }
 
@@ -215,6 +282,16 @@ http::Response App::panel_settings() {
       {"name":"WG Tunnel","minVer":"5.1.0","source":"Github","b64Url":"aHR0cHM6Ly9naXRodWIuY29tL3dndHVubmVsL2FuZHJvaWQvcmVsZWFzZXMvbGF0ZXN0"}
     ])");
     body["isPassSet"] = store_.has_pwd();
+    // 这个二进制真正编进来的入栈协议。面板据此只显示这些；显示没编进来的协议
+    // 只会让用户勾出一个连不上的订阅。
+    body["inbounds"] = nlohmann::json::array();
+    for (const inbound::Inbound* in : inbound::all()) {
+        // A credential-derived path (VMess "<uuid>-vm") has no constant, so the
+        // panel is told the shape instead of a null pointer.
+        body["inbounds"].push_back({{"id", in->id},
+                                    {"label", in->label},
+                                    {"path", in->path ? in->path : "<uuid>-vm"}});
+    }
     return json_ok(body);
 }
 
@@ -228,14 +305,99 @@ http::Response App::update_settings(const http::Request& req) {
     }
     if (!data.is_object()) return json_err(400, "设置必须是 JSON 对象。");
 
+    // 协议裁剪：只接受这个二进制真正编进来的入栈协议。别的构建（或上游）的
+    // settings.json 可能带着没编进来的协议，存下去只会生成连不上的订阅链接。
+    if (data.contains("protocols")) {
+        std::string wanted;
+        if (data["protocols"].is_string()) {
+            wanted = data["protocols"].get<std::string>();
+        } else if (data["protocols"].is_array()) {
+            for (const auto& v : data["protocols"]) {
+                if (!v.is_string()) continue;
+                if (!wanted.empty()) wanted += ',';
+                wanted += v.get<std::string>();
+            }
+        }
+        std::string kept;
+        for (const std::string& proto : split(wanted, ',')) {
+            if (!inbound::has(proto)) continue;
+            if (!kept.empty()) kept += ',';
+            kept += proto;
+        }
+        if (kept.empty()) {
+            return json_err(400, "这个二进制没有编入所选的入栈协议，可用： " + inbound::id_list());
+        }
+        data["protocols"] = kept;
+    }
+
     auto& kv = store_.kv();
     for (auto it = data.begin(); it != data.end(); ++it) {
         if (kv.contains(it.key())) kv[it.key()] = it.value();
     }
 
+    // The panel submits the WireGuard outbound as two flat fields; fold them
+    // into the nested wgOutbound object.
+    if (!kv.contains("wgOutbound") || !kv["wgOutbound"].is_object()) {
+        kv["wgOutbound"] = nlohmann::json::object();
+    }
+    auto& wg = kv["wgOutbound"];
+    if (data.contains("wgOutboundEnabled")) {
+        std::string v = data["wgOutboundEnabled"].is_string()
+                            ? data["wgOutboundEnabled"].get<std::string>()
+                            : (data["wgOutboundEnabled"].is_boolean() &&
+                                       data["wgOutboundEnabled"].get<bool>()
+                                   ? "true"
+                                   : "false");
+        wg["enabled"] = (v == "true");
+    }
+    if (data.contains("wgOutboundEndpoint") && data["wgOutboundEndpoint"].is_string()) {
+        std::string v = data["wgOutboundEndpoint"].get<std::string>();
+        if (!v.empty()) wg["endpoint"] = v;
+    }
+
+    // Cloudflare Tunnel: flat panel fields folded into the nested cfTunnel object.
+    if (!kv.contains("cfTunnel") || !kv["cfTunnel"].is_object()) {
+        kv["cfTunnel"] = nlohmann::json::object();
+    }
+    auto& ct = kv["cfTunnel"];
+    if (data.contains("cfTunnelEnabled")) {
+        std::string v = data["cfTunnelEnabled"].is_string()
+                            ? data["cfTunnelEnabled"].get<std::string>()
+                            : (data["cfTunnelEnabled"].is_boolean() &&
+                                       data["cfTunnelEnabled"].get<bool>()
+                                   ? "true"
+                                   : "false");
+        ct["enabled"] = (v == "true");
+    }
+    if (data.contains("cfTunnelToken") && data["cfTunnelToken"].is_string()) {
+        std::string v = data["cfTunnelToken"].get<std::string>();
+        if (!v.empty()) ct["token"] = v;
+    }
+    if (data.contains("cfTunnelOrigin") && data["cfTunnelOrigin"].is_string()) {
+        std::string v = data["cfTunnelOrigin"].get<std::string>();
+        if (!v.empty()) {
+            auto colon = v.find(':');
+            if (colon == std::string::npos) {
+                ct["originHost"] = v;
+            } else {
+                ct["originHost"] = v.substr(0, colon);
+                try {
+                    ct["originPort"] = std::stoi(v.substr(colon + 1));
+                } catch (...) {
+                    // keep the previous port when the value is not numeric
+                }
+            }
+        }
+    }
+
+    // Apply the WireGuard switch immediately. Without this the panel only wrote
+    // the flag: saving "enabled" left ready=false until the process was
+    // restarted, so the UI reported 已启用/未就绪 with no way to tell why.
+    const bool wgTouched = data.contains("wgOutboundEnabled") ||
+                           data.contains("wgOutboundEndpoint");
+
     auto& cfg = store_.config();
     if (data.contains("vlUUID")) cfg.vlUUID = data["vlUUID"].get<std::string>();
-    if (data.contains("trPass")) cfg.trPass = data["trPass"].get<std::string>();
     if (data.contains("securePath")) cfg.securePath = data["securePath"].get<std::string>();
     if (data.contains("proxyIpMode")) cfg.proxyIpMode = data["proxyIpMode"].get<std::string>();
     if (data.contains("proxyIPs")) cfg.proxyIPs = data["proxyIPs"].get<std::vector<std::string>>();
@@ -245,7 +407,19 @@ http::Response App::update_settings(const http::Request& req) {
 
     std::string error;
     if (!store_.save(error)) return json_err(500, error);
-    return json_ok(nullptr);
+
+    nlohmann::json out = nlohmann::json::object();
+    if (wgTouched) {
+        // start_wg_outbound blocks up to 6s waiting for the handshake, so the
+        // switch is applied only after the settings are safely on disk: a
+        // timeout then still leaves a consistent config behind.
+        std::string wgError;
+        const bool ready = net::apply_wg_outbound(store_, wgError);
+        out["wgOutbound"] = {{"ready", ready},
+                             {"status", net::wg_outbound_status()},
+                             {"error", ready ? std::string() : wgError}};
+    }
+    return json_ok(out);
 }
 
 http::Response App::reset_settings() {
@@ -463,8 +637,10 @@ http::Response App::qrcode(const http::Request& req) {
 }
 
 http::Response App::render_error(int status, const std::string& message) {
-    if (error_html_.empty()) return http::Response::text(status, message);
-    std::string html = replace_all(error_html_, "__ERROR_MESSAGE__", message);
+    std::string page_error;
+    std::string html = render_page("error", false, page_error);
+    if (html.empty()) return http::Response::text(status, message);
+    html = replace_all(std::move(html), "__ERROR_MESSAGE__", message);
     auto res = http::Response::html(html);
     res.status = status;
     return res;
@@ -480,14 +656,16 @@ http::Response App::handle(const http::Request& req) {
 
     if (path == sp + "/login") {
         if (authenticated(req)) return http::Response::redirect("./panel");
-        return http::Response::html(login_html_);
+        std::string page_error;
+        return http::Response::html(render_page("login", false, page_error));
     }
     if (path == sp + "/login/authenticate") return login(req);
 
     bool needs_auth = store_.has_pwd();
     if (path == sp + "/panel") {
         if (needs_auth && !authenticated(req)) return http::Response::redirect("./login");
-        return http::Response::html(panel_html_);
+        std::string page_error;
+        return http::Response::html(render_page("panel", true, page_error));
     }
     if (path == sp + "/panel/settings") {
         if (needs_auth && !authenticated(req)) return json_err(401, "未授权或会话已过期。");
@@ -516,12 +694,102 @@ http::Response App::handle(const http::Request& req) {
         if (!store_.save(error)) return json_err(500, error);
         return json_ok(accounts);
     }
+    // ---- WARP outbound ------------------------------------------------------
+    // Backend differs per branch (main: supervised warp-rust, warp-built-in:
+    // in-tree WG + lwIP) but the panel surface is identical: status plus an
+    // explicit registration action. Registration defaults to a dry run so the
+    // round trip is testable without consuming Cloudflare's per-IP quota.
+    if (path == sp + "/panel/warp-status") {
+        if (needs_auth && !authenticated(req)) return json_err(401, "未授权或会话已过期。");
+        nlohmann::json out;
+        out["enabled"] = false;
+        if (store_.kv().contains("wgOutbound") && store_.kv()["wgOutbound"].is_object())
+            out["enabled"] = store_.kv()["wgOutbound"].value("enabled", false);
+        out["ready"] = net::wg_outbound_ready();
+        out["status"] = net::wg_outbound_status();
+        out["dryRun"] = store_.kv().value("warpRegisterDryRun", true);
+        out["accounts"] = store_.warps().size();
+        return json_ok(out);
+    }
+    if (path == sp + "/panel/warp-register") {
+        if (needs_auth && !authenticated(req)) return json_err(401, "未授权或会话已过期。");
+        if (req.method != "POST") return json_err(405, "请求方法不允许。");
+        const bool dry_run = store_.kv().value("warpRegisterDryRun", true);
+        nlohmann::json accounts;
+        std::string error;
+        if (!sub::fetch_warp_accounts(accounts, error, dry_run))
+            return json_err(500, "注册 WARP 账号失败：" + error);
+        // A dry run must not touch the live account pool: its synthetic account
+        // has no working keys, so persisting it would silently break the outbound
+        // (the next start would hand the stack an unusable account).
+        if (!dry_run) {
+            store_.warps() = accounts;
+            if (!store_.save(error)) return json_err(500, "保存设置失败：" + error);
+        }
+        nlohmann::json out;
+        out["dryRun"] = dry_run;
+        out["accounts"] = accounts;
+        out["saved"] = !dry_run;
+        out["note"] = dry_run ? "dry run：未访问 Cloudflare，未写入账号池"
+                              : "已真实注册并写入账号池";
+        return json_ok(out);
+    }
+    // ---- trimmed Cloudflare Tunnel, woken on demand -------------------------
+    if (path == sp + "/panel/tunnel-status") {
+        if (needs_auth && !authenticated(req)) return json_err(401, "未授权或会话已过期。");
+        // The edge's ingress configuration is the authority on the public
+        // hostname, so pick it up here (HTTP thread owns the store) and hand
+        // the resulting domain to the panel alongside the live state.
+        tunnel::sync_ingress_domain(store_);
+        nlohmann::json st = nlohmann::json::parse(tunnel::status_json(), nullptr, false);
+        if (st.is_discarded()) st = nlohmann::json::object();
+        st["mainDomain"] = store_.config().mainDomain;
+        return http::Response::json(200, st.dump());
+    }
+    if (path == sp + "/panel/tunnel-wake") {
+        if (needs_auth && !authenticated(req)) return json_err(401, "未授权或会话已过期。");
+        if (req.method != "POST") return json_err(405, "请求方法不允许。");
+        auto& kv = store_.kv();
+        if (!kv.contains("cfTunnel") || !kv["cfTunnel"].is_object())
+            kv["cfTunnel"] = nlohmann::json::object();
+        kv["cfTunnel"]["enabled"] = true;
+        std::string error;
+        if (!store_.save(error)) return json_err(500, "保存设置失败：" + error);
+        bool started = false;
+        if (!tunnel::start_from_store(store_, started, error)) return json_err(500, error);
+        nlohmann::json st = nlohmann::json::parse(tunnel::status_json(), nullptr, false);
+        if (st.is_discarded()) st = nlohmann::json::object();
+        st["mainDomain"] = store_.config().mainDomain;
+        return json_ok(st);
+    }
+    if (path == sp + "/panel/tunnel-sleep") {
+        if (needs_auth && !authenticated(req)) return json_err(401, "未授权或会话已过期。");
+        if (req.method != "POST") return json_err(405, "请求方法不允许。");
+        auto& kv = store_.kv();
+        if (!kv.contains("cfTunnel") || !kv["cfTunnel"].is_object())
+            kv["cfTunnel"] = nlohmann::json::object();
+        kv["cfTunnel"]["enabled"] = false;
+        std::string error;
+        if (!store_.save(error)) return json_err(500, "保存设置失败：" + error);
+        tunnel::stop();
+        // Report the live state, not a hard-coded flag: the ingress hostnames
+        // survive a sleep and the panel shows them under "隧道域名".
+        nlohmann::json st = nlohmann::json::parse(tunnel::status_json(), nullptr, false);
+        if (st.is_discarded()) st = nlohmann::json::object();
+        st["mainDomain"] = store_.config().mainDomain;
+        return json_ok(st);
+    }
     if (path == sp + "/panel/update-panel") return not_supported("面板自更新（仅 Cloudflare 版）");
     if (path == sp + "/panel/delete-panel") return not_supported("面板删除（仅 Cloudflare 版）");
     if (path == sp + "/telegram/setup") return telegram_setup(req);
     if (path == sp + "/telegram/remove") return telegram_remove(req);
     if (path == sp + "/telegram/webhook") return telegram_webhook(req);
     if (starts_with(path, sp + "/sub/")) {
+        // Subscriptions embed the domain clients dial. When the tunnel is up,
+        // the edge's ingress configuration is the truth about which hostname
+        // reaches this panel, so adopt it before building anything -- otherwise
+        // a recreated tunnel keeps handing out the stale (dead) domain.
+        tunnel::sync_ingress_domain(store_);
         std::string kind = path.substr((sp + "/sub/").size());
         auto params = req.params();
         std::string client = params.count("app") ? params["app"] : std::string();

@@ -246,7 +246,7 @@ json build_ws_outbound(const json& s, const std::string& tag, const std::string&
     bool enable_ech = flag(s, "enableECH") && !is_fragment;
     json stream = json::object();
     stream["network"] = "ws";
-    json transport = build_transport("ws", "", generate_ws_path(protocol) + "?ed=2560", sni_host.host,
+    json transport = build_transport("ws", "", generate_ws_path(protocol, s.value("vlUUID", std::string())) + "?ed=2560", sni_host.host,
                                      "", "", "");
     for (auto& [k, v] : transport.items()) stream[k] = v;
     stream["security"] = is_tls ? "tls" : "none";
@@ -258,20 +258,17 @@ json build_ws_outbound(const json& s, const std::string& tag, const std::string&
     json final_mask = build_final_mask(s, is_fragment, false, frag_length, frag_interval);
     if (!final_mask.is_null()) stream["finalmask"] = final_mask;
 
+    // VMess authenticates with the same UUID but its own user object: alterId 0
+    // and security "auto" (AES-128-GCM), which is what this inbound speaks.
+    const json user = (protocol == "vmess")
+                          ? json{{"id", str(s, "vlUUID")}, {"alterId", 0}, {"security", "auto"}}
+                          : json{{"id", str(s, "vlUUID")}, {"encryption", "none"}};
     json out = json::object();
     out["protocol"] = protocol;
-    if (protocol == "vless") {
-        out["settings"] = {{"vnext",
-                            json::array({{{"address", address},
-                                          {"port", port},
-                                          {"users", json::array({{{"id", str(s, "vlUUID")},
-                                                                  {"encryption", "none"}}})}}})}};
-    } else {
-        out["settings"] = {{"servers",
-                            json::array({{{"address", address},
-                                          {"port", port},
-                                          {"password", str(s, "trPass")}}})}};
-    }
+    out["settings"] = {{"vnext",
+                        json::array({{{"address", address},
+                                      {"port", port},
+                                      {"users", json::array({user})}}})}};
     out["streamSettings"] = stream;
     out["tag"] = tag;
     return out;
@@ -1009,7 +1006,7 @@ bool build_xray_custom(const json& s, bool is_fragment, std::string& out_json, s
         for (auto& h : hosts) total_hosts.push_back(h);
 
         for (auto& protocol : protocols) {
-            if (protocol != "vless" && protocol != "trojan") continue;
+            if (protocol != "vless" && protocol != "vmess") continue;
             int protocol_index = 1;
             for (int port : total_ports) {
                 for (auto& host : hosts) {

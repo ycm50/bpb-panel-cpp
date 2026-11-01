@@ -18,7 +18,9 @@ std::vector<std::string> get_protocols(const nlohmann::json& s);
 std::string generate_remark(const nlohmann::json& s, int index, int port, const std::string& address,
                             const std::string& protocol, const std::string& domain,
                             bool is_fragment, bool is_chain);
-std::string generate_ws_path(const std::string& protocol);
+// WebSocket path a client must use for this protocol. VMess encodes the
+// credential in the path, so the caller has to hand it over.
+std::string generate_ws_path(const std::string& protocol, const std::string& credential = "");
 
 std::string random_upper_case(const std::string& in);
 std::string get_random_string(int length_min, int length_max);
