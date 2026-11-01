@@ -61,6 +61,10 @@ private:
         std::string out;
         bool close_after_write = false;
         bool detached = false;
+        // The peer half-closed (or fully closed) its side. Any request already
+        // buffered must still be answered -- cloudflared and curl both send a
+        // complete GET and then shutdown(SHUT_WR) to signal "no body".
+        bool peer_closed = false;
         std::int64_t last_active = 0;
     };
 

@@ -9,7 +9,6 @@ struct Config {
     std::string accID = "native";
     std::string accEmail = "admin";
     std::string vlUUID;
-    std::string trPass;
     std::string securePath = "securepath";
     std::string mainDomain = "localhost";
     std::string fallback;
@@ -33,6 +32,10 @@ public:
     std::string& pwd() { return pwd_; }
     std::string& secret() { return secret_; }
     bool has_pwd() const { return !pwd_.empty(); }
+
+    // Data directory the store was loaded from; used to place auxiliary files
+    // such as the generated warp-rust config and the quick-tunnel credentials.
+    const std::string& dir() const { return dir_; }
 
     static nlohmann::json default_kv();
 

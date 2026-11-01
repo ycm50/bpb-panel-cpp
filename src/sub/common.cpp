@@ -1,5 +1,6 @@
 #include "sub/common.h"
 #include "crypto/crypto.h"
+#include "inbound/inbound.h"
 #include "net/http_client.h"
 #include "util/util.h"
 
@@ -60,9 +61,22 @@ std::string get_random_string(int length_min, int length_max) {
     return out;
 }
 
-std::string generate_ws_path(const std::string& protocol) {
-    std::string proto = (protocol == "vless") ? "vl" : "tr";
-    return "/" + proto + "/" + get_random_string(16, 32);
+std::string generate_ws_path(const std::string& protocol, const std::string& credential) {
+    // A fixed path: the credential is the UUID/password, so a random per-request
+    // suffix protected nothing and only made every restart invalidate the
+    // subscription links. The segment comes from the compiled-in table, so a
+    // protocol cannot advertise a path its own dispatcher does not serve.
+    if (const inbound::Inbound* in = inbound::by_id(protocol)) {
+        if (in->path) return std::string("/") + in->path;
+        // VMess: the client-side convention is "/<uuid>-vm" (see the deployment
+        // snippet the protocol was specified with).
+        std::string clean;
+        for (char c : credential) {
+            if (c != '-') clean += c;
+        }
+        return "/" + clean + "-vm";
+    }
+    return "/" + protocol;
 }
 
 bool is_domain(const std::string& address) {
@@ -133,7 +147,20 @@ bool is_https(const nlohmann::json& s, int port) {
 }
 
 std::vector<std::string> get_protocols(const nlohmann::json& s) {
-    return split(s.value("protocols", std::string("vless,trojan")), ',');
+    // Only protocols compiled into this binary can actually be served, so the
+    // configured list is intersected with the compile-time table. A settings file
+    // copied from another build (or from upstream) may name protocols this
+    // binary does not have; handing those to a client produces dead links.
+    std::vector<std::string> out;
+    for (const std::string& p : split(s.value("protocols", std::string("vless")), ',')) {
+        if (inbound::has(p)) out.push_back(p);
+    }
+    if (out.empty() && !inbound::all().empty()) {
+        // An empty set would render an empty subscription and a panel with no
+        // protocol to tick; fall back to the first compiled-in one.
+        out.push_back(inbound::all().front()->id);
+    }
+    return out;
 }
 
 struct CachedDns {
@@ -250,7 +277,7 @@ std::string generate_remark(const nlohmann::json& s, int index, int port, const 
     }
 
     std::string chain_sign = is_chain ? "\xF0\x9F\x94\x97 " : "";
-    std::string proto_sign = (protocol == "vless") ? "VLESS" : "Trojan";
+    std::string proto_sign = "VLESS";
     std::string fragment_sign = is_fragment ? "F " : "";
     std::string custom_domain_sign = (!custom_domain.empty() && domain == custom_domain) ? "D " : "";
     std::string custom_cdn_sign;
