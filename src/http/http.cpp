@@ -319,6 +319,11 @@ void Server::flush(Conn& c) {
             continue;
         }
         if (result == net::IoResult::WouldBlock) return;
+        // Hard error: the peer cannot receive. Drop the tail instead of keeping
+        // it, otherwise the connection stays registered for POLLOUT and every
+        // poll() round retries a write that will never succeed (100% of a core
+        // for a peer that is already gone).
+        c.out.clear();
         c.close_after_write = true;
         return;
     }
@@ -384,6 +389,20 @@ void Server::run() {
             if (!c) continue;
             if (pfds[k].revents & net::kError) {
                 dead.push_back(idx);
+                continue;
+            }
+            if (pfds[k].revents & (net::kHangup | net::kInvalidFd)) {
+                // Peer gone: answer whatever request is already buffered (a
+                // half-closed GET must still get its response), then drop the fd.
+                // Keeping it registered is the classic spin: poll() keeps
+                // reporting POLLHUP, no read or write arm matches, and the loop
+                // runs flat out.
+                c->peer_closed = true;
+                if (!c->close_after_write) {
+                    read_into(*c);
+                    process(*c);
+                }
+                if (c->out.empty()) dead.push_back(idx);
                 continue;
             }
             if (c->handshaking) {

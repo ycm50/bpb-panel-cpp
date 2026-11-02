@@ -18,8 +18,10 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mstcpip.h>   // tcp_keepalive / SIO_KEEPALIVE_VALS
 #else
 #include <netdb.h>
+#include <netinet/tcp.h>   // TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -53,6 +55,39 @@ constexpr std::size_t kHeaderMin = kHashLen + 2;
 // Any successful write resets the timer, so this is "no progress for 60s", not
 // "this frame took 60s" -- a slow-but-alive client keeps making progress.
 constexpr int kSendStallMs = 60000;
+
+// One poll() slice per direction. Idle cost is 10 wake-ups/second/session
+// instead of the 1000 the 1 ms sleep this replaces produced.
+constexpr int kWaitSliceMs = 100;
+
+// A websocket that upgrades and then never sends its Trojan header keeps a
+// thread and an fd for ever (a browser or a scanner poking /tr is enough). The
+// header is sent immediately by every real client, so this only ever catches
+// sockets that are already dead.
+constexpr std::int64_t kHandshakeTimeoutMs = 30000;
+
+// Dead eyes are invisible to a relay: the CF edge can vanish without a FIN, and
+// the session then waits for bytes that will never come. TCP keepalive makes the
+// kernel notice (~60 s idle + 4 probes) so the read fails and the session can be
+// torn down instead of lingering as a thread.
+void enable_keepalive(net::socket_t fd) {
+    if (fd == net::kInvalid) return;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE,
+               reinterpret_cast<const char*>(&one), sizeof(one));
+#ifdef _WIN32
+    tcp_keepalive ka{1, 60000, 15000};
+    DWORD bytes = 0;
+    WSAIoctl(fd, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &bytes, nullptr, nullptr);
+#else
+    int idle = 60;      // seconds before the first probe
+    int intvl = 15;     // seconds between probes
+    int cnt = 4;        // probes before the socket is declared dead
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
+}
 
 bool send_all(SSL* ssl, net::socket_t fd, const char* data, std::size_t len) {
     std::size_t off = 0;
@@ -114,10 +149,24 @@ int read_some(SSL* ssl, net::socket_t fd, char* buf, int cap, int timeout_ms) {
         if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) return 0;
         return -1;
     }
+    // The plain (non-TLS) socket is non-blocking too, so a bare recv() returns
+    // EAGAIN the instant the peer has nothing to say. Returning 0 immediately
+    // turned the caller's slice into a recv()/EAGAIN hot loop that pinned a core
+    // for every established-but-idle session; poll() makes timeout_ms real.
     int n = static_cast<int>(::recv(fd, buf, cap, 0));
     if (n > 0) return n;
     if (n == 0) return -1;
-    return net::would_block(net::last_error()) ? 0 : -1;
+    if (!net::would_block(net::last_error())) return -1;
+    if (timeout_ms <= 0) return 0;
+    net::PollFd pfd{fd, net::kRead, 0};
+    const int pr = net::poll_fds(&pfd, 1, timeout_ms);
+    if (pr == 0) return 0;                       // slice elapsed, session idle
+    if (pr < 0) return -1;
+    n = static_cast<int>(::recv(fd, buf, cap, 0));
+    if (n > 0) return n;
+    if (n == 0) return -1;
+    if (net::would_block(net::last_error())) return 0;
+    return -1;
 }
 // Outbound side: a plain socket, or the userspace WireGuard stack when it is up.
 struct Outbound {
@@ -219,6 +268,11 @@ struct WsIn {
     net::socket_t fd = net::kInvalid;
     std::string raw;      // bytes straight off the socket
     std::string pending;  // decoded application bytes not yet consumed
+    // Absolute deadline for the header handshake; the per-step limits in
+    // parse_header are a stall guard, this is the overall cap. max() until the
+    // handshake starts so that relay-only reads are never cut short.
+    std::chrono::steady_clock::time_point deadline{
+        std::chrono::steady_clock::time_point::max()};
 
     // false when the peer closed or the socket failed.
     bool pump(int timeout_ms) {
@@ -278,14 +332,17 @@ struct WsIn {
         }
     }
 };
-// Waits until `n` decoded bytes are buffered. Bounded by `limit_ms` so a peer
-// that opens the socket and says nothing cannot keep a thread forever.
+// Waits until `n` decoded bytes are buffered. Bounded by `limit_ms` (a single
+// stall) and by in.deadline (the whole handshake) so a peer that opens the socket
+// and dribbles one byte at a time cannot keep a thread and an fd forever.
 bool ensure(WsIn& in, std::size_t n, int limit_ms) {
     const auto start = std::chrono::steady_clock::now();
     while (in.pending.size() < n) {
-        if (!in.pump(200)) return false;
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - start).count();
+        if (!in.pump(kWaitSliceMs)) return false;
+        const auto now = std::chrono::steady_clock::now();
+        if (now > in.deadline) return false;   // handshake took too long
+        const auto ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
         if (ms > limit_ms) return false;
     }
     return true;
@@ -298,6 +355,7 @@ struct Header {
 };
 
 bool parse_header(WsIn& in, const std::string& expect, Header& out) {
+    in.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kHandshakeTimeoutMs);
     if (!ensure(in, kHeaderMin, 10000)) return false;
     if (in.pending.compare(0, kHashLen, expect) != 0) {
         log::debug("[trojan] password hash mismatch");
@@ -385,7 +443,9 @@ void relay(SSL* ssl, net::socket_t client, Outbound& ob, WsIn& in, const std::st
     std::atomic<bool> stop{false};
     std::thread upstream([&] {
         while (!stop.load()) {
-            if (!in.pump(200)) break;
+            // pump() blocks in poll() for one slice, so this thread sleeps
+            // instead of spinning on recv()/EAGAIN.
+            if (!in.pump(kWaitSliceMs)) break;
             if (!in.pending.empty()) {
                 const bool ok = ob.write(in.pending.data(), in.pending.size());
                 in.pending.clear();
@@ -396,7 +456,9 @@ void relay(SSL* ssl, net::socket_t client, Outbound& ob, WsIn& in, const std::st
     });
     char buf[kChunk];
     while (!stop.load()) {
-        const int n = ob.read(buf, static_cast<int>(sizeof(buf)), 200);
+        // read() polls for up to one slice: an idle session costs one wake-up
+        // per slice, not a hot loop.
+        const int n = ob.read(buf, static_cast<int>(sizeof(buf)), kWaitSliceMs);
         if (n < 0) break;
         if (n > 0 && !ws_send(ssl, client, buf, static_cast<std::size_t>(n))) break;
     }
@@ -424,6 +486,7 @@ void trojan_serve(net::socket_t client, SSL* ssl, std::string accept_key, std::s
     // one UUID per panel, used verbatim as the Trojan password.
     const std::string expect = sha224_hex(cfg.vl_uuid);
     std::thread([client, ssl, expect, cfg] {
+        enable_keepalive(client);
         WsIn in;
         in.ssl = ssl;
         in.fd = client;

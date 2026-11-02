@@ -30,6 +30,8 @@
 #include <openssl/ssl.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -39,8 +41,10 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mstcpip.h>   // tcp_keepalive / SIO_KEEPALIVE_VALS
 #else
 #include <netdb.h>
+#include <netinet/tcp.h>   // TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -48,7 +52,44 @@
 namespace bpb::proxy::wsx {
 
 constexpr std::size_t kChunk = 16384;
+// One poll() slice per direction. Idle cost is 10 wake-ups/second/session
+// instead of the 1000 the old 1 ms sleeps produced.
+constexpr int kWaitSliceMs = 100;
+// A websocket that upgrades and then never sends its protocol header keeps two
+// threads, one fd pair and a stack alive for ever (a browser or a scanner poking
+// the path is enough). The header is sent immediately by every real client, so
+// this only ever catches sockets that are already dead.
+constexpr std::int64_t kHandshakeTimeoutMs = 30000;
 using net::socket_t;
+
+inline std::int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// Dead eyes are invisible to a relay: the CF edge can vanish without a FIN, and
+// the session then waits for bytes that will never come. TCP keepalive makes the
+// kernel notice (~60 s idle + 4 probes) so the read fails and the session can be
+// torn down instead of lingering as a thread.
+inline void enable_keepalive(socket_t fd) {
+    if (fd == net::kInvalid) return;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE,
+               reinterpret_cast<const char*>(&one), sizeof(one));
+#ifdef _WIN32
+    tcp_keepalive ka{1, 60000, 15000};
+    DWORD bytes = 0;
+    WSAIoctl(fd, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &bytes, nullptr, nullptr);
+#else
+    int idle = 60;      // seconds before the first probe
+    int intvl = 15;     // seconds between probes
+    int cnt = 4;        // probes before the socket is declared dead
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
+}
 
 // send() that keeps going through short writes and WouldBlock. A websocket
 // frame must never be abandoned half-way: the peer would read a truncated frame
@@ -105,11 +146,17 @@ inline bool ws_send(SSL* ssl, socket_t fd, const char* data, std::size_t len, in
 // Result of a non-blocking frame read.
 enum class FrameState { Ok, Closed, Error, NeedMore };
 
-// Reads one websocket frame payload into out. Never blocks waiting for a frame:
-// returning NeedMore lets the caller keep servicing the other direction, which
-// is what keeps a large download from freezing (see vless_ws.cpp).
+// Reads one websocket frame payload into out. Blocks for at most wait_ms waiting
+// for the bytes of the next frame, then reports NeedMore: returning quickly lets
+// the caller keep servicing the other direction, which is what keeps a large
+// download from freezing (see vless_ws.cpp).
+//
+// wait_ms > 0 turns "nothing to read yet" into a bounded poll() sleep instead of
+// an instant NeedMore. Callers used to paper over that with a 1 ms sleep: 1000
+// wake-ups per second per direction per session, which is where the idle CPU burn
+// came from. Polling here costs two syscalls per slice.
 inline FrameState read_frame(SSL* ssl, socket_t fd, std::string& pending, std::string& payload,
-                             int& opcode) {
+                             int& opcode, int wait_ms = 0) {
     while (true) {
         if (pending.size() >= 2) {
             unsigned char b0 = static_cast<unsigned char>(pending[0]);
@@ -155,6 +202,17 @@ inline FrameState read_frame(SSL* ssl, socket_t fd, std::string& pending, std::s
         } else if (result == net::IoResult::WouldBlock) {
             // TLS can hold decrypted bytes that never raise a socket event.
             if (net::tls_pending(ssl) > 0) continue;
+            // Nothing buffered: sleep in poll() for one bounded slice instead of
+            // returning immediately to a caller that would spin, and instead of
+            // sleeping here (that would stop the opposite direction from being
+            // serviced within the slice).
+            if (wait_ms > 0) {
+                net::PollFd pfd{fd, net::kRead, 0};
+                const int pr = net::poll_fds(&pfd, 1, wait_ms);
+                if (pr > 0) continue;                 // readable now: retry the read
+                if (pr == 0) return FrameState::NeedMore;
+                return FrameState::Closed;
+            }
             return FrameState::NeedMore;
         } else {
             return FrameState::Closed;
@@ -186,11 +244,26 @@ struct Outbound {
 #endif
 
     // Reads up to len bytes. Returns >0, 0 on timeout, -1 on close.
+    //
+    // The socket is non-blocking, so a bare recv() returns EAGAIN the instant
+    // the origin has nothing to say. Returning 0 immediately made the caller's
+    // "slice" a lie: the download thread looped recv()/EAGAIN at full speed and
+    // pinned a core for every established-but-idle session. poll() here is what
+    // makes timeout_ms mean what the callers already assume.
     int read(char* buf, int len, int timeout_ms) {
 #ifdef BPB_WSX_WG_STACK
         if (wg) return wg->read(buf, len, timeout_ms);
 #endif
         int n = static_cast<int>(::recv(fd, buf, len, 0));
+        if (n > 0) return n;
+        if (n == 0) return -1;
+        if (!net::would_block(net::last_error())) return -1;
+        if (timeout_ms <= 0) return 0;
+        net::PollFd pfd{fd, net::kRead, 0};
+        const int pr = net::poll_fds(&pfd, 1, timeout_ms);
+        if (pr == 0) return 0;                       // slice elapsed, session idle
+        if (pr < 0) return -1;
+        n = static_cast<int>(::recv(fd, buf, len, 0));
         if (n > 0) return n;
         if (n == 0) return -1;
         if (net::would_block(net::last_error())) return 0;

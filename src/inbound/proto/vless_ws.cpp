@@ -6,6 +6,7 @@
 #include "net/wg_outbound.h"
 #include "net/wg_stack.h"
 #include "util/log.h"
+#include "util/thread.h"
 #include "util/util.h"
 
 #include <openssl/ssl.h>
@@ -13,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -22,6 +24,7 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mstcpip.h>   // tcp_keepalive / SIO_KEEPALIVE_VALS
 #else
 #include <netdb.h>
 #include <sys/socket.h>
@@ -33,6 +36,14 @@ namespace bpb::proxy {
 namespace {
 
 constexpr std::size_t kChunk = 16384;
+// One poll() slice per direction. Idle cost is 10 wake-ups/second/session
+// instead of the 1000 the previous 1 ms sleeps produced.
+constexpr int kWaitSliceMs = 100;
+// A websocket that upgrades and then never sends its VLESS header keeps two
+// threads, one fd pair and a stack alive for ever (a browser or a scanner
+// poking /vl is enough). The header is sent immediately by every real client,
+// so this only ever catches sockets that are already dead.
+constexpr std::int64_t kHandshakeTimeoutMs = 30000;
 using net::socket_t;
 
 int64_t now_ms() {
@@ -75,6 +86,29 @@ bool send_all(SSL* ssl, socket_t fd, const char* data, std::size_t len) {
     return true;
 }
 
+// Dead eyes are invisible to a relay: the CF edge can vanish without a FIN, and
+// the session then waits for bytes that will never come. TCP keepalive makes the
+// kernel notice (~60 s idle + 4 probes) so the read fails and the session can be
+// torn down instead of lingering as a thread.
+void enable_keepalive(socket_t fd) {
+    if (fd == net::kInvalid) return;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE,
+               reinterpret_cast<const char*>(&one), sizeof(one));
+#ifdef _WIN32
+    tcp_keepalive ka{1, 60000, 15000};
+    DWORD bytes = 0;
+    WSAIoctl(fd, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &bytes, nullptr, nullptr);
+#else
+    int idle = 60;      // seconds before the first probe
+    int intvl = 15;     // seconds between probes
+    int cnt = 4;        // probes before the socket is declared dead
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
+}
+
 bool frame_header(std::string& out, int opcode, std::size_t len) {
     out.push_back(static_cast<char>(0x80 | (opcode & 0x0F)));
     if (len < 126) {
@@ -108,9 +142,24 @@ struct Outbound {
     bool viaWarp() const { return wg != nullptr; }
 
     // Reads up to len bytes. Returns >0, 0 on timeout, -1 on close.
+    //
+    // The socket is non-blocking, so a bare recv() returns EAGAIN the instant
+    // the origin has nothing to say. Returning 0 immediately made the caller's
+    // "100 ms slice" a lie: the download thread looped recv()/EAGAIN at full
+    // speed and pinned a core for every established-but-idle session. poll()
+    // here is what makes timeout_ms mean what the callers already assume.
     int read(char* buf, int len, int timeout_ms) {
         if (wg) return wg->read(buf, len, timeout_ms);
         int n = static_cast<int>(::recv(fd, buf, len, 0));
+        if (n > 0) return n;
+        if (n == 0) return -1;
+        if (!net::would_block(net::last_error())) return -1;
+        if (timeout_ms <= 0) return 0;
+        net::PollFd pfd{fd, net::kRead, 0};
+        const int pr = net::poll_fds(&pfd, 1, timeout_ms);
+        if (pr == 0) return 0;                       // slice elapsed, session idle
+        if (pr < 0) return -1;
+        n = static_cast<int>(::recv(fd, buf, len, 0));
         if (n > 0) return n;
         if (n == 0) return -1;
         if (net::would_block(net::last_error())) return 0;
@@ -249,18 +298,32 @@ bool parse_vless(const std::string& buf, const std::string& uuid, Addr& addr, st
     need_more = false;
     if (buf.size() < 18) { need_more = true; return false; }
     int version = static_cast<unsigned char>(buf[0]);
-    std::string uuid_bytes = buf.substr(1, 16);
-    std::string expected;
-    if (uuid.find('-') != std::string::npos) {
-        std::string clean;
-        for (char c : uuid) {
-            if (c != '-') clean += c;
-        }
-        for (std::size_t i = 0; i + 1 < clean.size(); i += 2) {
-            expected += static_cast<char>(std::stoi(clean.substr(i, 2), nullptr, 16));
-        }
+    const std::string uuid_bytes = buf.substr(1, 16);
+    // The credential IS this 16-byte id: without the comparison the inbound
+    // accepts any uuid and turns into an open proxy. It used to be skipped
+    // whenever the configured uuid had no dashes -- which is exactly what the
+    // panel generates -- so it was skipped in practice.
+    std::string clean;
+    clean.reserve(32);
+    for (char c : uuid) {
+        if (c != '-' && c != ' ') clean.push_back(c);
     }
-    if (!expected.empty() && expected != uuid_bytes) return false;
+    if (clean.size() != 32) return false;   // malformed configured uuid: fail closed
+    std::string expected;
+    expected.reserve(16);
+    for (std::size_t i = 0; i + 1 < clean.size(); i += 2) {
+        const auto hex = [](char h) -> int {
+            if (h >= '0' && h <= '9') return h - '0';
+            if (h >= 'a' && h <= 'f') return h - 'a' + 10;
+            if (h >= 'A' && h <= 'F') return h - 'A' + 10;
+            return -1;
+        };
+        const int hi = hex(clean[i]);
+        const int lo = hex(clean[i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        expected.push_back(static_cast<char>((hi << 4) | lo));
+    }
+    if (expected != uuid_bytes) return false;
 
     std::size_t pos = 17;
     std::size_t addons_len = static_cast<unsigned char>(buf[pos++]);
@@ -283,8 +346,12 @@ bool parse_vless(const std::string& buf, const std::string& uuid, Addr& addr, st
 //   NeedMore -- no complete frame yet; the caller must poll and retry
 enum class FrameState { Ok, Closed, Error, NeedMore };
 
+// wait_ms > 0 turns "nothing to read yet" into a bounded poll() sleep instead of
+// an instant NeedMore. The caller used to paper over that with a 1 ms sleep:
+// 1000 wake-ups per second per direction per session, which is where the idle
+// CPU burn came from. Polling here costs two syscalls per slice.
 FrameState read_frame(SSL* ssl, socket_t fd, std::string& pending, std::string& payload,
-                       int& opcode) {
+                       int& opcode, int wait_ms = 0) {
     while (true) {
         if (pending.size() >= 2) {
             unsigned char b0 = static_cast<unsigned char>(pending[0]);
@@ -333,7 +400,16 @@ FrameState read_frame(SSL* ssl, socket_t fd, std::string& pending, std::string& 
             // Nothing buffered: return to the caller instead of sleeping here.
             // Blocking inside read_frame meant the reverse direction (origin ->
             // eyeball) got no service until a full websocket frame arrived,
-            // which is what froze large downloads mid-flight.
+            // which is what froze large downloads mid-flight. A bounded poll
+            // keeps that property (the caller still gets an answer within one
+            // slice) without the 1 ms spin loop it used to compensate with.
+            if (wait_ms > 0) {
+                net::PollFd pfd{fd, net::kRead, 0};
+                const int pr = net::poll_fds(&pfd, 1, wait_ms);
+                if (pr > 0) continue;                 // readable now: retry the read
+                if (pr == 0) return FrameState::NeedMore;
+                return FrameState::Closed;
+            }
             return FrameState::NeedMore;
         } else {
             return FrameState::Closed;
@@ -374,6 +450,7 @@ bool resolve_target(const std::string& host, int port, const SessionConfig& conf
 // continuous stream.
 void session_loop(SSL* client_ssl, socket_t client, const SessionConfig& config,
                   std::string early = std::string()) {
+    enable_keepalive(client);
     Outbound upstream;
     std::string response_header;
     unsigned long long to_upstream = 0;   // WS payload bytes handed to the target
@@ -439,18 +516,45 @@ void session_loop(SSL* client_ssl, socket_t client, const SessionConfig& config,
     std::atomic<bool> finished{false};
     std::atomic<bool> upstreamReady{false};
     std::mutex upstreamMutex;
+    // Gate for the download thread: it must not poll while the upload thread is
+    // still doing the VLESS handshake and the origin connect.
+    std::mutex gateMutex;
+    std::condition_variable gateCv;
+    auto gateOpen = [&] {
+        {
+            std::lock_guard<std::mutex> lk(gateMutex);
+        }
+        gateCv.notify_all();
+    };
     // Byte-level trace counter, only used when --log trace is on.
     int wg_trace_n = 0;
 
     // ---- client -> upstream ------------------------------------------------
     // Also owns the VLESS handshake: the target address only becomes known once
     // the first websocket frame (or early data) has been parsed.
-    std::thread toUpstream([&] {
+    // 128 KB stacks: the relay needs a couple of 16 KB buffers, not the 8 MB a
+    // std::thread reserves (see util/thread.h). Two threads per session is what
+    // made the old build sit at ~1 MB of RSS per open connection.
+    bpb::util::Thread toUpstream;
+    toUpstream.start([&] {
         std::string hasBuf = early;
         std::string framePending;
+        framePending.reserve(kChunk);
+        std::string payload;   // reused across frames: one 16 KB allocation per session
+        payload.reserve(kChunk);
+        // framePending only needs the partial-frame tail; reserving two chunks
+        // (32 KB) per session was pure waste -- 200 sessions meant 6 MB of empty
+        // reservation. It still grows geometrically for an unusually large frame.
+        const std::int64_t handshakeDeadline = now_ms() + kHandshakeTimeoutMs;
         try {
             while (!finished.load()) {
                 if (!upstreamReady.load()) {
+                    // Upgraded but silent: nothing will ever parse, so stop the
+                    // session before it parks two threads for the uptime.
+                    if (now_ms() > handshakeDeadline) {
+                        exitReason = "handshake timeout";
+                        break;
+                    }
                     if (!hasBuf.empty()) {
                         bool ok = false;
                         {
@@ -460,21 +564,19 @@ void session_loop(SSL* client_ssl, socket_t client, const SessionConfig& config,
                         if (ok) {
                             hasBuf.clear();
                             upstreamReady.store(true);
+                            gateOpen();   // release the download thread
                         } else if (!need_more || hasBuf.size() > 8192) {
                             exitReason = "handshake rejected";
                             break;
                         }
                     }
                 }
-                std::string payload;
                 int opcode = 0;
-                FrameState st = read_frame(client_ssl, client, framePending, payload, opcode);
-                if (st == FrameState::NeedMore) {
-                    // Nothing complete yet; a short sleep keeps this thread from
-                    // spinning while the other direction keeps flowing.
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    continue;
-                }
+                // read_frame polls for up to one slice, so this thread sleeps in
+                // poll(2) instead of waking up every millisecond.
+                FrameState st =
+                    read_frame(client_ssl, client, framePending, payload, opcode, kWaitSliceMs);
+                if (st == FrameState::NeedMore) continue;
                 if (st != FrameState::Ok) {
                     exitReason = (st == FrameState::Closed) ? "client closed" : "client frame error";
                     break;
@@ -519,20 +621,29 @@ void session_loop(SSL* client_ssl, socket_t client, const SessionConfig& config,
             exitReason = "exception in upload thread";
         }
         finished.store(true);
+        gateOpen();   // wake the download thread so it can observe the stop flag
     });
 
     // ---- upstream -> client ------------------------------------------------
-    std::thread toClient([&] {
+    bpb::util::Thread toClient;
+    toClient.start([&] {
         try {
             while (!finished.load()) {
                 if (!upstreamReady.load()) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    // Sleep on the gate the upload thread opens after the origin
+                    // connect. The 1 ms sleep it replaces woke up 1000 times a
+                    // second per session just to re-read an atomic.
+                    std::unique_lock<std::mutex> lk(gateMutex);
+                    gateCv.wait_for(lk, std::chrono::milliseconds(kWaitSliceMs),
+                                    [&] { return upstreamReady.load() || finished.load(); });
                     continue;
                 }
                 char buf[kChunk];
                 // No lock: this thread is the only reader. Holding it across a
-                // blocking read starved the upload direction.
-                int n = upstream.read(buf, sizeof(buf), 100);
+                // blocking read starved the upload direction. read() polls
+                // internally now, so an idle session costs one wake-up per slice
+                // instead of a recv()/EAGAIN hot loop.
+                int n = upstream.read(buf, sizeof(buf), kWaitSliceMs);
                 if (n < 0) { exitReason = "upstream closed"; break; }
                 if (n == 0) continue;
                 {
@@ -657,9 +768,15 @@ void vless_serve(net::socket_t client_fd, SSL* client_ssl, std::string accept_ke
         net::close(client_fd);
         return;
     }
-    std::thread([client_fd, client_ssl, config, early]() {
+    // A session thread needs tens of KB, not the platform default 8 MB, and it
+    // must never be joined: spawn it with an explicit small stack.
+    bpb::util::spawn_detached([client_fd, client_ssl, config, early]() {
         session_loop(client_ssl, client_fd, config, early);
-    }).detach();
+        // Hand this session's pages back to the kernel instead of parking them in
+        // a glibc arena: 200 short sessions otherwise leave an idle relay several
+        // MB above its cold-start RSS. Rate limited inside the helper.
+        bpb::util::release_free_memory();
+    });
 }
 
 } // namespace bpb::proxy

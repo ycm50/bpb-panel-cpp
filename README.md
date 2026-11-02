@@ -42,7 +42,8 @@ Cloudflare Tunnel 客户端。**服务端没有任何 JavaScript/TypeScript**，
 | `warp-built-in`（默认分支） | 进程内 `src/wg` + lwIP | 单二进制、零外部依赖、内存更省 |
 | `warp-rust` | 独立进程 `warp-rust`（Rust，自带用户态栈） | bpb 负责渲染配置、监督生命周期，经本地 SOCKS5 转发 |
 
-两个分支的**面板、订阅、隧道功能完全一致**，差异只在 WARP 数据面。
+两个分支的**面板、订阅、隧道、CLI 与密码功能完全一致**，差异只在 WARP 数据面。
+读路径空转修复、内存收敛（空载 ≈10MB / 200 并发 ≈15MB）、`--cur`/`--passwd`、内置图标字体这一轮改动**两个分支同步落地**。
 
 ## 功能
 
@@ -163,7 +164,64 @@ Cloudflare Tunnel 客户端。**服务端没有任何 JavaScript/TypeScript**，
 | `--tls-cert` / `--tls-key` | 启用 HTTPS / wss |
 | `--export-warp <file>` | 导出侧车用的 `wg0.conf` |
 | `--fetch <url>` | 出网诊断 |
+| `--cur` | 打印**当前正在运行**的 bpb 实例的隧道域名（Linux 自动发现全部实例：pid/端口/域名/连接状态/数据目录；Windows 构建无隧道，用 `--cur --data <dir> [--port <n>]` 读指定实例） |
+| `--passwd [user] <password> [--check]` | 设置 / 查看面板凭据：写 `<data>/passwd`（加盐 SHA-256）。不带参数只看状态并可跟 `--check` 向运行中的面板验证一次 |
 | `--log <level>` | 日志级别，默认 `error`（见下） |
+
+### 面板图标不依赖外网
+
+面板原先从 `fonts.googleapis.com` 拉 `Material Symbols Rounded`。在 Google 不可达的网络里字体会拿不到，
+浏览器就把连字名当普通文字渲染出来（界面上出现 `check_circle`、`settings_backup_restore`、`logout` 这种文字）。
+
+现在字体按面板实际用到的 27 个图标做了子集（`assets/fonts/material-symbols-rounded-subset.woff2`，4.4 KB），
+以 `data:font/woff2;base64` 内联进 `assets/panel/index.html` 与 `assets/login/index.html`，页面里不再有指向 Google 的 `<link>`，
+离线/受限网络下图标照常显示。改字体后需要重跑 `tmpscripts/patch_fonts.py` 与 `tmpscripts/gen_assets.py`（后者重生成 `src/assets_gen.cpp`，即装进二进制的内嵌副本）。
+
+### 查当前隧道域名：`bpb --cur`
+
+重启脚本里常要拿到“这台机器此刻对外的域名”，但域名只存在于运行中的进程状态里。
+`--cur` 会扫 `/proc` 找到所有正在跑的 bpb，读出各自的 `--port`/`--data`，然后：
+
+1. 先读数据目录里的 `tunnel-quick.json`（quick tunnel 域名）或 `config.json` 的 `mainDomain`；
+2. 再向该实例的 `/<securePath>/panel/tunnel-status` 问一次真实状态，以面板返回的域名为准。
+
+    $ bpb --cur
+    pid      port   tunnel domain                                  state
+    7754     8080   examinations-widely-occasion-eating.trycloudflare.com   connected   [panel] data=/root/.bpbdata
+    6954     18500  (no tunnel)                                    offline      data=/root/.bpbtest18500
+
+面板设了密码时，`--cur` 会用 `settings.json` 里的兼容明文口令登录一次 `/<securePath>/login/authenticate`，再带着 `jwtToken` 去问 `panel/tunnel-status`，所以状态列是**运行中进程的实时状态**（`connected`）而不是猜的；登录不了就退回数据目录里的文件，状态显示为 `locked (login required, from files)`。
+
+这比 `docker logs | grep trycloudflare` 稳：不依赖日志级别（默认 `error` 什么都不打），
+也不会把已经退出的旧实例的域名当成当前的。
+
+### 面板密码写在 `.bpbdata/passwd`
+
+老版本把面板密码明文放在 `<data>/settings.json` 的 `pwd` 字段里。问题不只是“明文”，而是
+它和一堆别的东西同住一个文件：`settings.json` 是**整份配置**，Telegram token、WARP 私钥、
+订阅 token、`securePath` 全在里面，还经常被 `cat` 出来贴进工单、被备份脚本整份拷走、被面板的
+`update-settings` 整份回写。密码混在这里，等于跟着一起到处跑。
+
+现在凭据单独一个文件 `<data>/passwd`（POSIX 上 `0600`，只有属主可读；Windows 靠目录 ACL）：
+
+    # user:$sha256$<salt>$<sha256(salt:password)>
+    admin$sha256$acfde46f13a6152bb9064acd430fc3fe$ae50bca2714514a0561e47f07345f331b3ce7cd29a808e2fe4c363bf273d358c
+
+加盐 SHA-256 + 常数时间比较，文件泄了也不能直接拿去登录；改密码一条命令，不用起服务、
+不用开面板：
+
+    bpb --passwd                     # 看状态：user + 盐长度，不打印任何秘密
+    bpb --passwd 'new-pass'          # 设置，用户名取 config.accEmail
+    bpb --passwd ops 'new-pass'      # 指定用户名
+    bpb --passwd 'new-pass' --check  # 本地校验 + 问一次运行中的面板（accepted / REJECTED）
+
+`--check` 判的**不是**状态码 200：`POST <securePath>/login` 本身也返回 200（登录页 HTML），
+所以只认「200 且 `Set-Cookie` 里有 `jwtToken=`」，口令错则由面板回 401。
+
+兼容性：`settings.json` 里已有的明文 `pwd` 仍然能登录，**首次成功登录后自动迁移**成
+`passwd`；迁移之后改 `settings.json` 的明文不再生效（`login()` 先看文件）。在面板里改密码
+（`update-settings`）会同步重写这个文件，两条路不会打架。忘了密码就 `bpb --passwd <new>`
+覆盖 —— 只有数据目录里确实没有 `passwd` 时才会退回 `settings.json` 的明文分支。
 
 ## 入栈协议与按协议构建
 

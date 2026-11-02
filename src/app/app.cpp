@@ -1,4 +1,5 @@
 #include "app/app.h"
+#include "app/passwd.h"
 #include "app/qrcode.h"
 #include "inbound/inbound.h"
 #include "assets_gen.h"
@@ -219,9 +220,25 @@ http::Response App::login(const http::Request& req) {
     std::string username = data.value("username", "");
     std::string password = data.value("password", "");
     username = to_lower(username);
-    if (username != to_lower(store_.config().accEmail) || password != store_.pwd()) {
-        return json_err(401, "用户名或密码错误。");
+
+    // The credential lives in <data>/passwd as a salted SHA-256 (see
+    // app/passwd.h). settings.json only remains as the legacy fallback: an
+    // install that predates the file still logs in, and the first successful
+    // login migrates it so nothing keeps a plaintext password around.
+    bool ok = false;
+    app::passwd::Entry entry;
+    if (app::passwd::load(store_.dir(), entry)) {
+        ok = app::passwd::verify(store_.dir(), username, password);
+    } else {
+        ok = (username == to_lower(store_.config().accEmail) && password == store_.pwd());
+        if (ok && !store_.pwd().empty()) {
+            std::string migrate_error;
+            app::passwd::save(store_.dir(), username, password, migrate_error);
+            if (!migrate_error.empty())
+                bpb::log::error("could not migrate the panel password: %s", migrate_error.c_str());
+        }
     }
+    if (!ok) return json_err(401, "用户名或密码错误。");
     std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
     nlohmann::json payload;
     payload["id"] = store_.config().accID;
@@ -444,6 +461,16 @@ http::Response App::reset_password(const http::Request& req) {
     store_.pwd() = data.value("password", "");
     std::string error;
     if (!store_.save(error)) return json_err(500, error);
+    // Keep the hashed credential in the data directory in step with the settings
+    // copy: the file is what App::login checks first, so a reset that only
+    // touched settings.json would be silently ignored.
+    if (!store_.pwd().empty()) {
+        std::string pwd_error;
+        const std::string user = username.empty() ? store_.config().accEmail : username;
+        if (!app::passwd::save(store_.dir(), user, store_.pwd(), pwd_error))
+            bpb::log::error("could not write %s: %s", app::passwd::path_for(store_.dir()).c_str(),
+                            pwd_error.c_str());
+    }
     return json_ok(nullptr);
 }
 

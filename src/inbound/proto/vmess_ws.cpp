@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -441,6 +442,9 @@ private:
 // protocol implementations: a single poll loop starves one direction as soon as
 // the other blocks for a moment, which is what produces the stalled downloads.
 void session_loop(SSL* client_ssl, socket_t client, const SessionConfig& config, std::string early) {
+    // The CF edge can drop a session without a FIN; keepalive lets the kernel
+    // notice (~60 s idle, 4 probes) instead of leaving a parked thread behind.
+    enable_keepalive(client);
     std::string cmd_key;
     if (!command_key(config.vl_uuid, cmd_key)) {
         bpb::log::error("[vmess] refusing: the configured UUID is not a valid uuid");
@@ -458,6 +462,18 @@ void session_loop(SSL* client_ssl, socket_t client, const SessionConfig& config,
     std::atomic<const char*> exit_reason{"session finished"};
     std::mutex write_mutex;   // serialises websocket writes from both threads
     std::mutex upstream_mutex;
+    // Gate for the download thread: it must not read while the upload thread is
+    // still doing the VMess handshake and the origin connect. The 1 ms sleep this
+    // replaces woke up 1000 times a second per session just to re-read an atomic.
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    // Wakes the download thread when upstream_ready / finished changes.
+    auto gate_open = [&] {
+        {
+            std::lock_guard<std::mutex> lk(gate_mutex);
+        }
+        gate_cv.notify_all();
+    };
     Outbound upstream;
     std::unique_ptr<Encoder> encoder;
     unsigned long long to_upstream = 0;
@@ -477,6 +493,9 @@ void session_loop(SSL* client_ssl, socket_t client, const SessionConfig& config,
         bool request_done = false;
         std::string stash = early;
         std::string pending;
+        // Upgraded but silent: no VMess header will ever parse, so stop the
+        // session before it parks two threads for the uptime of the process.
+        const std::int64_t handshake_deadline = now_ms() + kHandshakeTimeoutMs;
 
         // Returns 1 when the handshake completed, 0 when more bytes are needed and
         // -1 when the request has to be dropped.
@@ -528,6 +547,7 @@ void session_loop(SSL* client_ssl, socket_t client, const SessionConfig& config,
             encoder.reset(new Encoder(std::move(enc)));
             header_done = true;
             upstream_ready.store(true);
+            gate_open();   // release the download thread
             if (bpb::log::enabled(bpb::log::kDebug))
                 bpb::log::debug("[vmess] %s:%d security=%d option=0x%02x padding=%d",
                                 req.addr.host.c_str(), req.addr.port, req.security, req.option,
@@ -566,6 +586,10 @@ void session_loop(SSL* client_ssl, socket_t client, const SessionConfig& config,
 
         try {
             while (!finished.load()) {
+                if (!header_done && now_ms() > handshake_deadline) {
+                    exit_reason = "handshake timeout";
+                    break;
+                }
                 // The upgrade request itself can carry the first bytes: with
                 // early data enabled the client puts the whole VMess header in
                 // Sec-WebSocket-Protocol and then waits for the response, so the
@@ -583,11 +607,11 @@ void session_loop(SSL* client_ssl, socket_t client, const SessionConfig& config,
 
                 std::string payload;
                 int opcode = 0;
-                FrameState st = read_frame(client_ssl, client, pending, payload, opcode);
-                if (st == FrameState::NeedMore) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    continue;
-                }
+                // read_frame polls for up to one slice, so this thread sleeps in
+                // poll(2) instead of waking up every millisecond.
+                FrameState st =
+                    read_frame(client_ssl, client, pending, payload, opcode, kWaitSliceMs);
+                if (st == FrameState::NeedMore) continue;
                 if (st != FrameState::Ok) {
                     exit_reason = (st == FrameState::Closed) ? "client closed" : "client frame error";
                     break;
@@ -614,6 +638,7 @@ void session_loop(SSL* client_ssl, socket_t client, const SessionConfig& config,
             exit_reason = "exception in upload thread";
         }
         finished.store(true);
+        gate_open();   // wake the download thread so it can observe the stop flag
     });
 
     // ---- origin -> client --------------------------------------------------
@@ -621,11 +646,17 @@ void session_loop(SSL* client_ssl, socket_t client, const SessionConfig& config,
         try {
             while (!finished.load()) {
                 if (!upstream_ready.load()) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    // Sleep on the gate the upload thread opens after the origin
+                    // connect, instead of a 1 ms re-read of an atomic.
+                    std::unique_lock<std::mutex> lk(gate_mutex);
+                    gate_cv.wait_for(lk, std::chrono::milliseconds(kWaitSliceMs),
+                                     [&] { return upstream_ready.load() || finished.load(); });
                     continue;
                 }
                 char buf[kChunk];
-                int n = upstream.read(buf, sizeof(buf), 100);
+                // read() polls internally, so an idle session costs one wake-up
+                // per slice instead of a recv()/EAGAIN hot loop.
+                int n = upstream.read(buf, sizeof(buf), kWaitSliceMs);
                 if (n < 0) {
                     // Origin done: seal the response with the termination chunk so
                     // the client sees a clean end rather than a truncated body.

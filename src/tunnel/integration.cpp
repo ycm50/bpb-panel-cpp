@@ -46,9 +46,16 @@ std::uint64_t g_generation = 0;
 // with, and a *.trycloudflare.com hostname to reach it. One registration is
 // enough - the credentials are persisted and reused so waking the panel does not
 // create a new tunnel (and a new hostname) every time.
+// reuse_cached: keep the credentials from a previous run. Quick tunnels are
+// ad-hoc objects at the edge: when the connector goes away (reboot, service
+// restart, panel sleep) the edge stops routing that hostname, and reconnecting
+// with the same token re-establishes a tunnel nobody can reach -- the connector
+// reports "connected", the hostname answers 530, and config.json keeps a domain
+// that is already dead. So a fresh process registers a fresh tunnel; the cached
+// one is only a fallback when registration cannot reach the API.
 bool quick_tunnel_register(const std::string& dataDir, std::string& token,
-                           std::string& hostname, std::string& error) {
-    if (!dataDir.empty()) {
+                           std::string& hostname, std::string& error, bool reuse_cached) {
+    if (reuse_cached && !dataDir.empty()) {
         std::ifstream in(dataDir + "/tunnel-quick.json");
         if (in) {
             std::stringstream ss;
@@ -138,7 +145,21 @@ bool start_from_store(Store& store, bool& started, std::string& error) {
     std::string hostname;
     bool quick = false;
     if (token.empty()) {
-        if (!quick_tunnel_register(store.dir(), token, hostname, error)) return false;
+        // Force a new registration: reusing the credentials of a tunnel that died
+        // with the previous process yields a "connected" connector behind a dead
+        // hostname. If registration fails (no egress yet, API hiccup) fall back to
+        // whatever the last run persisted, so an offline box still has a domain.
+        std::string fresh_error;
+        if (!quick_tunnel_register(store.dir(), token, hostname, fresh_error, false)) {
+            bpb::log::error("[cf-tunnel] quick tunnel registration failed: %s",
+                            fresh_error.c_str());
+            if (!quick_tunnel_register(store.dir(), token, hostname, fresh_error, true)) {
+                error = fresh_error;
+                return false;
+            }
+            bpb::log::error("[cf-tunnel] reusing the cached quick tunnel (%s); the hostname may "
+                            "already be dead at the edge", hostname.c_str());
+        }
         quick = true;
         // The public hostname is reported by install.sh, not on every start:
         // see log.h -- bpb is silent by default unless asked.

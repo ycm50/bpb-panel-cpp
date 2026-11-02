@@ -273,6 +273,273 @@ serverName` 用该域名，`wsSettings.headers.Host` 同域名）；origin 用�
    WSL 无 v6 路由）。这不是代码问题：换成 IPv4 endpoint 也 `tx=0 rx=0`，
    属于当前环境限制，不纳入回归判定。
 
+## 7. 数据面空转 / 泄漏回归（回归重点）
+
+WS 会话建立后空闲会 100% 烧一个核；「升级成功但不发 VLESS 头」的会话还会永久占住两个
+线程和一个 fd。都在 `src/inbound/proto/vless_ws.cpp`：
+
+1. `Outbound::read()` 以前 `recv()` 拿到 `EAGAIN` 就当「没数据」立刻返回 0，调用方那句
+   "100 ms 切片"形同虚设，下载线程于是 `recv()/EAGAIN` 空转（实测一核 97.5%）；现在按
+   `timeout_ms` 真的 `poll()`；
+2. `read_frame()` 增加 `wait_ms`，去掉调用方补的 1 ms `sleep`（每会话每秒 1000 次唤醒）；
+3. 握手 30 秒超时（`kHandshakeTimeoutMs`）+ `SO_KEEPALIVE`，哑连接不再占线程。
+
+脚本 `tmpscripts/regress_ws.py`（纯 python3，无第三方库）+ 启动器
+`tmpscripts/run_regress_ws.ps1`（起 bpb、起 `python -m http.server` 源站、跑脚本、收尾杀进程）：
+
+    # build/bpb.exe，18400/18401，25 次 1 MiB，8 并发，空闲 8 s，35 s 线程回落
+    pwsh -File tmpscripts/run_regress_ws.ps1
+
+    # 基线对比（修复前的二进制：07、09 必须红）
+    pwsh -File tmpscripts/run_regress_ws.ps1 -Exe tmpscripts/bpb_old.exe \
+        -Port 18402 -HttpPort 18403 -Label old
+
+    # Linux 上手工跑（自备源站）
+    python3 -m http.server 18401 --bind 127.0.0.1 --directory tmpscripts/origin &
+    python3 tmpscripts/regress_ws.py --port 18400 --http-port 18401 \
+        --data .bpbdata --pid <bpb pid>
+
+**端口别用 18000/18099**：`set_reuseaddr()` 在 Windows 上允许重复 bind，端口被别的实例占着
+时测试会静默打到别人的服务上。启动器先用
+`(Get-CimInstance Win32_Process -Filter "ProcessId=<pid>").CommandLine` 核对自己传的
+`--port`/`--data`，再核对监听 socket 的 owner pid 就是该进程，不符直接 abort。
+
+**就绪检查必须发完整 HTTP 请求**（脚本里的 `wait_http()`）：只 `connect()` 再 `close()`
+在修复前会踩到 HTTP 层的 busy-loop（`POLLHUP` 没被当成断连，那个 fd 永远留在 poll 集合里，
+之后一直烧一核），而且它会把后面所有 CPU 采样污染成 ~97%。那个 busy-loop 本轮已经修掉
+（`POLLHUP/POLLNVAL` 按断连处理，单独验收见 §9c），但就绪检查依然应该发完整请求：
+它和真实客户端的形态一致，也才能在源站侧断言“确实取到东西”。
+
+预期（实测，25 次 / 8 并发）：
+
+    ID   TEST                                 RES   DETAIL
+    01   origin sanity                        PASS  1048576 bytes sha=d824bde2acff
+    02   sequential 25x 1MiB                  PASS  25/25 complete, 26214400 bytes, slowest 92 ms
+    03   concurrent 8x 1MiB                   PASS  8/8 streams complete
+    04a  half-close: session ends             PASS  closed after 0.00s, 2 wire bytes, 2 frames
+    04b  half-close: full response            XFAIL 0/1048576 bytes（WS 语义，见第 4 条）
+    05   unknown ws path 404                  PASS  /tr/x -> 404, /ss/x -> 404
+    06a  wrong uuid: no hang                  PASS  session ended after 0.00s (close frame)
+    06b  wrong uuid: no data                  PASS  0 payload bytes (close frame)（见第 6 条 / §9d）
+    07   idle cpu, 1 session                  PASS  0.00% of one core over 8.0s idle (limit 5.0%)
+    08   idle cpu, 20 silent ws               PASS  1.34% of one core over 8.1s, threads 5 -> 65
+    09   thread reclaim                       PASS  threads 5 -> 65 -> 2 after 35s (baseline 5 +2); 20/20 sockets closed by server
+    TOTAL rows=11 pass=10 fail=0 xfail=1 skip=0
+    RESULT PASS
+
+上面这张表是本轮在 `build/bpb.exe`（sha256 `CB582319A645402D…`，2026-11-02 21:10:17 构建，
+端口 18400/18401）上的实测。
+
+修复前的二进制（`tmpscripts/bpb_old.exe`，同样是 25/8 配置）实测：
+`07 FAIL 98.79%`、`09 FAIL threads 5 -> 65 -> 62 after 35s`（20 条 socket 一条都没被关），
+而 `02/03` 依然全绿 —— 这条回归只在 CPU / 线程维度上暴露。
+
+判定项：
+
+1. `01` 源站自检：直接 HTTP 取那 1 MiB，字节数与 sha256 必须和脚本内生成的期望一致，
+   否则后面的失败不能算在 bpb 头上。
+2. `02` 顺序 25 次 1 MiB（§2c 的等价验证）：必须 25/25 完整，单次约 20~110 ms、66~69 帧。
+   失败特征：卡在 3 KB 上下，脚本报 `stalled: no frame for 8.0s, got 31xx bytes`。
+3. `03` 8 条并发各 1 MiB：8/8，内容 sha256 与期望一致。
+4. `04a/04b` 半关闭：请求发出后立刻 `shutdown(SHUT_WR)`。会话必须**马上结束**
+   （实测 0.00~0.04 s，不占线程）；响应体收不到 —— 客户端 FIN 会拆掉 WS 的下行，xray 行为相同
+   （§6e），所以记 `XFAIL`，加 `--strict-halfclose` 才判失败。
+5. `05` 未知 WS 路径：`/tr/x`、`/ss/x` 在升级前就 `HTTP/1.1 404`（只编 vless 的二进制，
+   见 §0b；路径用 `--bad-paths` 可换）。
+6. `06a/06b` 错误 UUID：会话必须被关掉而不是挂着（实测 0.02 s 内收到 close 帧），
+   并且**一个负载字节都不许转发**（实测 0 payload bytes）。这一条以前记 `XFAIL`
+   —— `parse_vless()` 只在配置的 UUID 带 `-` 时才构造期望值，而面板默认 `config.json`
+   的 `vlUUID` 没有短横线，等于任何 UUID 都放行；现在无条件比较，见 §9d。
+7. `07` 一个已建立会话空闲 8 s：`(Get-Process -Id <pid>).CPU` 的差值 ≤ 5% 单核
+   （实测 0.00%；修复前 97.5%）。Windows 的 CPU 计时 15.6 ms 一跳，1 个 tick 属噪声，
+   别拿小数点后几位做判据。
+8. `08` 20 个「升级后不发头」的会话：CPU 同样 ≤ 5%（实测 0.19%~1.34%，机器忙时偏高，
+   判据仍是 5%），线程数先涨（5 → 65）。
+9. `09` 35 s 后（30 s 握手超时 + 5 s 余量）线程回落到基线 +2 以内，且这 20 条 socket 由
+   服务端主动关闭（实测 20/20）。
+
+## 9. CLI 自省与凭据加固回归（回归重点）
+
+本轮加了两个命令行能力：`--cur`（正在跑的实例用的是哪个隧道域名）和 `--passwd`（面板凭据
+从 `settings.json` 的明文挪进 `<data>/passwd` 的加盐哈希）；另外修了两个安全 / 资源问题：
+HTTP poll 循环遇到 `POLLHUP`/`POLLNVAL` 会烧满一核（只做 `connect()+close()` 的端口扫描就能
+触发），以及 VLESS 的 UUID 在配置不带短横线时根本不做比较（等于开放代理）。
+
+Windows 构建没有内置隧道、也读不到别的进程的命令行，所以 9a 的“自动发现实例”只在 Linux 上
+成立（Windows 只验 `--cur --data` 读文件这条路径）；9b~9d 两边都能验。
+
+### 9a. `bpb --cur`：当前运行实例的隧道域名
+
+Linux（生产机 151.241.88.97：下面两行的 pid / 端口 / 域名 / 状态都取自该机的 `/proc` 与
+`panel/tunnel-status` 实测值；`--cur` 本身要新构建的二进制才有）：
+
+    # 1) 一条命令列出所有活着的 bpb 实例
+    bpb --cur
+    pid      port   tunnel domain                                  state
+    7754     8080   examinations-widely-occasion-eating.trycloudflare.com   connected   [panel] data=/root/.bpbdata
+    6954     18500  (no tunnel)                                    offline      data=/root/.bpbtest18500
+
+    # 2) 三处来源必须一致（面板 > tunnel-quick.json > config.mainDomain）
+    systemctl show -p MainPID --value bpb
+    7754
+    cat /root/.bpbdata/tunnel-quick.json
+    {"hostname":"examinations-widely-occasion-eating.trycloudflare.com", ...}
+    python3 -c "import json;print(json.load(open('/root/.bpbdata/config.json'))['mainDomain'])"
+    examinations-widely-occasion-eating.trycloudflare.com
+
+    # 3) 重启后域名必然变化：--cur 与 config.json 必须同时更新
+    systemctl restart bpb && sleep 10 && bpb --cur
+    pid      port   tunnel domain                                  state
+    7421     8080   sierra-logo-permit-window.trycloudflare.com   connected   [panel] data=/root/.bpbdata
+    python3 -c "import json;print(json.load(open('/root/.bpbdata/config.json'))['mainDomain'])"
+    sierra-logo-permit-window.trycloudflare.com
+
+    # 4) 进程没了，实例也必须从列表里消失
+    systemctl stop bpb && bpb --cur; echo $?
+    no running bpb process found
+    1
+
+Windows（无隧道，只验读文件）：
+
+    build\bpb.exe --cur --data tmpscripts\data-passwd-demo --port 18420
+    pid      port   tunnel domain                                  state
+    0        18420  (no tunnel)                                    offline      data=...\data-passwd-demo
+
+    build\bpb.exe --cur --data tmpscripts\data-nowhere; echo $?
+    no bpb instance at ...\data-nowhere (config.json missing)      # 这行在 stderr
+    1
+
+    build\bpb.exe --cur
+    Windows builds carry no built-in tunnel; pass --cur --data <dir> to read a local instance.
+
+判定项：
+
+1. `pid` 必须是 `systemctl show -p MainPID --value bpb` 的那个 pid（而不是另起一个 bpb 再去问），
+   `port` 必须等于该实例的 `--port`，并且和 `ss -lntp` 里它监听的端口一致。
+2. 域名以**面板**为准：行尾标 `[panel]` 表示 `/<securePath>/panel/tunnel-status` 回了 200 且带
+   `hostname`；面板不可达时退回文件（`[quick tunnel]` / `[mainDomain]`），state 变成
+   `unreachable (from files)` —— 不许把文件里的旧域名假装成 connected。
+3. quick tunnel 每次启动都重新注册，旧域名在进程退出后就被边缘下线（复用 token 会得到
+   “connected 但域名 530”，见 §6b / §6c）。所以**重启后 `--cur` 与 `config.json` 的 `mainDomain`
+   必须在同一轮里都变成新域名**，只更新一处就是 bug：客户端会按订阅里的旧域名去连，拿到 530。
+   核对方法就是上面第 3 步那两条命令连着跑。
+4. `--cur` 只看活进程（扫 `/proc` 的 cmdline）：停掉之后该实例必须消失。
+   `docker logs | grep trycloudflare` 会把最后一次的旧域名给你，这正是不拿它当数据源的原因。
+5. `--cur --data <dir>` 指向没有 `config.json` 的目录时，stderr 一行 + 退出码 1；
+   不许打印一行空记录伪装成健康实例。
+
+### 9b. `bpb --passwd`：面板凭据写在 `<data>/passwd`
+
+四个形态（本机 Windows 实测输出，Linux 上一致）：
+
+    # 0) 还没设过：退出码 1
+    bpb --passwd --data ./.bpbdata; echo $?
+    no panel credential in ./.bpbdata/passwd
+    set one with: bpb --passwd <password>   (user = config.accEmail)
+    1
+
+    # 1) 状态形态：只报 user 和盐长度，不打印秘密
+    bpb --passwd --data ./.bpbdata
+    panel credential: ./.bpbdata/passwd
+      user: admin
+      hash: sha256, salt 32 hex chars
+
+    # 2) 设置（用户名取 config.accEmail）
+    bpb --passwd 'demo-pass-1' --data ./.bpbdata
+    password set for user 'admin' in ./.bpbdata/passwd
+    cat ./.bpbdata/passwd; stat -c '%a' ./.bpbdata/passwd
+    # bpb panel credential -- generated by 'bpb --passwd'
+    # user:$sha256$<salt>$<sha256(salt:password)>
+    admin$sha256$acfde46f13a6152bb9064acd430fc3fe$ae50bca2714514a0561e47f07345f331b3ce7cd29a808e2fe4c363bf273d358c
+    600
+
+    # 3) 指定用户名
+    bpb --passwd ops 's3cret' --data ./.bpbdata
+    password set for user 'ops' in ./.bpbdata/passwd
+
+    # 4) 本地校验 + 向运行中的面板验证 access
+    bpb --passwd 'demo-pass-1' --check --data ./.bpbdata --port 18420
+    credential on disk:      match
+    live access:             accepted (POST /securepath/login/authenticate -> HTTP 200 + jwtToken)
+
+    bpb --passwd 'nope' --check --data ./.bpbdata --port 18420; echo $?
+    credential on disk:      MISMATCH
+    live access:             REJECTED (HTTP 401)
+    1
+
+判定项：
+
+1. 文件格式固定 `user$sha256$salt$hash`：盐 ≥ 32 hex，`hash = sha256("<salt>:<password>")`；
+   POSIX 上落 `chmod 0600`（Windows 没有 chmod，靠目录 ACL）。
+2. 状态形态（不带参数）**不得**打印口令或哈希，只允许 user 与盐长度 —— 它要能贴进工单。
+3. `--check` 的 accepted 判据是 **HTTP 200 且 `Set-Cookie` 里有 `jwtToken=`**，不是只有 200：
+   `POST <securePath>/login` 本身也返回 200（那是登录页 HTML），只看状态码会把“地址或方法写错”
+   当成登录成功。本机实测三态：`/securepath/login` 200 无 cookie、
+   `/securepath/login/authenticate` 200 有 cookie、错口令 401 无 cookie。
+4. 口令错、用户名错都必须 401 → `--check` 打 `REJECTED` 且退出码 1；本地验不过打 `MISMATCH`
+   也算失败。用户名大小写不敏感。
+5. 登录优先级：`login()` 先查 `<data>/passwd`，**只有**该文件不存在时才回退 `settings.json` 的
+   明文口令，并在首次成功登录后把它迁移成 passwd 文件。迁移之后改 `settings.json` 的明文不再
+   影响登录；面板的 `update-settings` 改密码会同步重写这个文件，两条路不会打架。
+
+### 9c. 只做 `connect()+close()` 的端口扫描不得烧 CPU
+
+`tmpscripts/scan_cpu.py` 自己起 bpb、量 CPU、做 N 次裸 `connect()+close()`、再量一遍，最后
+确认它还在正常应答：
+
+    python tmpscripts\scan_cpu.py --exe build\bpb.exe --port 18410
+    scans performed:               200
+    0) baseline (readiness probe)        0.00%  threads=4
+    1) after 200 connect+close           0.00%  threads=4
+    still answering:               HTTP/1.1 302 OK
+    RESULT PASS (limit 2.0% of one core)
+
+    # 基线：修复前的二进制（同一条命令，换个端口）
+    python tmpscripts\scan_cpu.py --exe tmpscripts\bpb_old.exe --port 18411
+    0) baseline (readiness probe)       99.31%  threads=4
+    1) after 200 connect+close          99.25%  threads=4
+    still answering:               HTTP/1.1 302 OK
+    RESULT FAIL (limit 2.0% of one core)
+
+为什么：poll 循环以前只把“可读”当事件，`poll()` 返回 `POLLHUP`/`POLLNVAL` 时既不读也不关，
+那个 fd 永远留在集合里、每次 `poll()` 立刻返回 —— 一次“连上就断”的扫描就能让它烧满一核，
+而且再也降不下来（旧二进制的 baseline 就已经 ~99%，因为脚本的就绪探测本身也是一次
+connect+close）。现在 `POLLHUP|POLLNVAL|POLLERR` 一律按断连处理（关闭并从集合里摘掉），
+flush 硬错误时清空待发尾包，避免半关闭连接上无限重试。
+
+判定项：
+
+1. 200 次 connect+close 之后，5 s 窗口的 CPU **< 2% 单核**：实测 `0.00%`；修复前实测 `99.25%`
+   （同一个 busy-loop 在别的采样里也出现过 97% 量级，量级一致即可）。
+2. 线程数不涨（Windows `(Get-Process -Id <pid>).Threads.Count`，Linux `/proc/<pid>/status`
+   的 `Threads:`）：实测扫描前后都是 4。
+3. 扫描结束后服务器仍能正常应答：实测 `HTTP/1.1 302 OK`（`GET /` 重定向到 `<securePath>/panel`）。
+4. 这条和 §7 的 `07/09` 是同一类空转的两个入口 —— `07` 是“会话建立后空闲”，本条是“连上就断”，
+   两个都要压住。
+
+### 9d. 错误 uuid 必须被拒（0 字节 + 关闭）
+
+    # 只跑 01/05/06，并打开 --strict-uuid：能过就判失败
+    python tmpscripts\regress_ws.py --port 18400 --pid <bpb pid> \
+        --skip 02,03,04,07,08,09 --strict-uuid
+    ...
+    06a  wrong uuid: no hang                PASS  session ended after 0.00s (close frame)
+    06b  wrong uuid: no data                PASS  0 payload bytes (close frame)
+
+整轮就是 `pwsh -File tmpscripts\run_regress_ws.ps1 -StrictUuid`（`TOTAL rows=11 pass=10
+fail=0 xfail=1 skip=0`；剩下那个 `XFAIL` 是 `04b` 半关闭的响应体，与凭据无关）。
+
+判定项：
+
+1. 升级成功后发一帧带**错误** uuid 的 VLESS 头 + 一个 GET：会话必须马上以 close 帧结束
+   （`06a`，实测 0.00~0.02 s），不许挂着占线程。
+2. 不得转发任何负载字节（`06b` 必须 0 字节），源站侧也不许出现这次 GET。
+3. 修复前 `parse_vless()` 只在配置 uuid 带 `-` 时才构造期望值，而面板生成的 `vlUUID` 没有
+   短横线，于是比较被整段跳过、任何 uuid 都能过 —— 那就是个开放代理。现在不看去不去短横线
+   都比 32 个 hex，配置里的 uuid 本身不合法时 fail closed（直接拒）。
+4. `--strict-uuid` 原先只是把“能过就判失败”的老行为从 `XFAIL` 抬成硬判据；修好之后 `06b`
+   无条件 PASS，加不加这个开关结果一样（本轮两种跑法都验过）。
+
 ## 0. 日志开关
 
 默认 **error** 级：健康运行时 stderr 一个字节都不输出。
@@ -377,7 +644,7 @@ serverName` 用该域名，`wsSettings.headers.Host` 同域名）；origin 用�
 5. **卸载**：`sh install.sh --uninstall --data /root/.bpbtest`，
    预期 service 被停用删除、二进制被移除、**数据目录保留**。
 
-## 7. 多架构二进制
+## 7b. 多架构二进制
 
 CI 会为 amd64 / arm64 / armv7 / 386 / riscv64 各产出一个静态二进制。本地验证某一架构可执行：
 
