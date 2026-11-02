@@ -352,6 +352,15 @@ private:
     std::int64_t connSendWindow_ = 65535;
     std::map<std::uint32_t, std::int64_t> streamSendWindow_;
     std::int64_t peerInitialWindow_ = 65535;
+
+    // Receive-side credit we have consumed but not yet returned to the edge.
+    // SETTINGS_INITIAL_WINDOW_SIZE only opens the *stream* window: the
+    // connection window still starts at 65 KB and grows only through
+    // WINDOW_UPDATE. Returning credit one DATA frame at a time kept the
+    // connection window at one frame's worth, so a bulk download ran at
+    // 64 KB/RTT no matter how much CPU was free. Credit is now granted in bulk.
+    std::int64_t recvConnCredit_ = 0;
+    std::map<std::uint32_t, std::int64_t> recvStreamCredit_;
     std::map<std::uint32_t, std::chrono::steady_clock::time_point> creditWaitLast_;
     // Streams the edge has reset. Writing DATA on them is a protocol violation
     // and gets the connection killed, so remember them for the stream's life.
@@ -360,6 +369,21 @@ private:
     // The HEADERS block being assembled across CONTINUATION frames.
     std::uint32_t contStream_ = 0;
     std::vector<std::uint8_t> contBlock_;
+
+    // Outgoing bytes staged for one TLS record.
+    //
+    // Sending each frame used to cost two SSL_write calls -- a 9-byte header
+    // record and then the payload -- plus a heap allocation for the header
+    // vector. On a bulk download that is 2 TLS records per 16 KB frame, and the
+    // tunnel data path measured 30 CPU-seconds per GB against cloudflared's 4-5.
+    // Frames are now appended here and pushed out in one record once ~32 KB has
+    // accumulated (or immediately for control frames and END_STREAM).
+    std::vector<std::uint8_t> tx_;
+    bool flush_tx();
+
+    // Reused across frames: a fresh vector per DATA frame was one heap
+    // allocation per 16 KB, i.e. ~6400 per 100 MB download.
+    std::vector<std::uint8_t> rxPayload_;
 };
 
 bool H2ServerImpl::send_all(const void* data, std::size_t len) {
@@ -412,20 +436,40 @@ bool H2ServerImpl::recv_exact(void* buf, std::size_t len) {
     return true;
 }
 
+bool H2ServerImpl::flush_tx() {
+    if (tx_.empty()) return true;
+    const bool ok = send_all(tx_.data(), tx_.size());
+    tx_.clear();
+    return ok;
+}
+
 bool H2ServerImpl::send_frame(std::uint8_t type, std::uint8_t flags, std::uint32_t streamId,
                               const std::uint8_t* payload, std::size_t len) {
     static const char* names[] = {"DATA", "HEADERS", "PRIORITY", "RST", "SETTINGS",
                                   "PUSH", "PING", "GOAWAY", "WINDOW_UPDATE", "CONT"};
     h2_trace("[h2 tx] %s flags=0x%02x stream=%u len=%zu",
              type < 10 ? names[type] : "?", flags, streamId, len);
-    std::vector<std::uint8_t> hdr;
-    hdr.reserve(9);
-    put_u24(hdr, static_cast<std::uint32_t>(len));
-    hdr.push_back(type);
-    hdr.push_back(flags);
-    put_u32(hdr, streamId & 0x7FFFFFFF);
-    if (!send_all(hdr.data(), hdr.size())) return false;
-    if (len && !send_all(payload, len)) return false;
+    const std::size_t base = tx_.size();
+    tx_.resize(base + 9 + (payload ? len : 0));
+    std::uint8_t* dst = tx_.data() + base;
+    dst[0] = static_cast<std::uint8_t>((len >> 16) & 0xFF);
+    dst[1] = static_cast<std::uint8_t>((len >> 8) & 0xFF);
+    dst[2] = static_cast<std::uint8_t>(len & 0xFF);
+    dst[3] = type;
+    dst[4] = flags;
+    const std::uint32_t sid = streamId & 0x7FFFFFFF;
+    dst[5] = static_cast<std::uint8_t>((sid >> 24) & 0xFF);
+    dst[6] = static_cast<std::uint8_t>((sid >> 16) & 0xFF);
+    dst[7] = static_cast<std::uint8_t>((sid >> 8) & 0xFF);
+    dst[8] = static_cast<std::uint8_t>(sid & 0xFF);
+    if (payload && len) std::memcpy(dst + 9, payload, len);
+
+    // Control frames and the last frame of a stream must not wait for the next
+    // batch: the peer is waiting on them (SETTINGS/PING/WINDOW_UPDATE) or the
+    // stream should be able to finish promptly.
+    const bool control = (type != kFrameData) || (flags & kFlagEndStream);
+    constexpr std::size_t kBatch = 32 * 1024;
+    if (control || tx_.size() >= kBatch) return flush_tx();
     return true;
 }
 
@@ -532,6 +576,17 @@ bool H2ServerImpl::startHttp2(int timeout_ms, std::string& error) {
     if (!send_frame(kFrameSettings, 0, 0, settings.data(), settings.size())) {
         error = "send SETTINGS failed";
         return false;
+    }
+    // Open the connection-level window up front (the default 65 KB caps
+    // in-flight data at one RTT's worth). 4 MB is far more than this box ever
+    // needs and small enough that a slow origin cannot balloon memory.
+    {
+        std::vector<std::uint8_t> wu;
+        put_u32(wu, 4u * 1024 * 1024);
+        if (!send_frame(kFrameWindowUpdate, 0, 0, wu.data(), wu.size())) {
+            error = "send initial WINDOW_UPDATE failed";
+            return false;
+        }
     }
 
     // Consume the edge's SETTINGS; ACK it.
@@ -643,6 +698,7 @@ void H2ServerImpl::dispatch(std::uint8_t type, std::uint8_t flags, std::uint32_t
             }
             resetStreams_.insert(streamId);
             streamSendWindow_.erase(streamId);
+            recvStreamCredit_.erase(streamId);
             if (cb_.on_reset) cb_.on_reset(streamId);
             break;
         }
@@ -688,12 +744,27 @@ void H2ServerImpl::dispatch(std::uint8_t type, std::uint8_t flags, std::uint32_t
         case kFrameData:
             if (cb_.on_data) cb_.on_data(streamId, payload, len);
             if (flags & kFlagEndStream && cb_.on_end) cb_.on_end(streamId);
-            // Keep the edge's send window open.
+            // Return credit in bulk. One WINDOW_UPDATE per DATA frame meant two
+            // extra frames (and, before batching, two extra TLS records) per
+            // 16 KB, and it never let the connection window exceed a frame.
             if (len) {
+                constexpr std::int64_t kGrantAt = 1024 * 1024;   // 1 MB
+                recvConnCredit_ += static_cast<std::int64_t>(len);
+                std::int64_t& streamCredit = recvStreamCredit_[streamId];
+                streamCredit += static_cast<std::int64_t>(len);
                 std::vector<std::uint8_t> wu;
-                put_u32(wu, static_cast<std::uint32_t>(len));
-                send_frame(kFrameWindowUpdate, 0, 0, wu.data(), wu.size());
-                send_frame(kFrameWindowUpdate, 0, streamId, wu.data(), wu.size());
+                if (recvConnCredit_ >= kGrantAt) {
+                    wu.clear();
+                    put_u32(wu, static_cast<std::uint32_t>(recvConnCredit_));
+                    send_frame(kFrameWindowUpdate, 0, 0, wu.data(), wu.size());
+                    recvConnCredit_ = 0;
+                }
+                if (streamCredit >= kGrantAt) {
+                    wu.clear();
+                    put_u32(wu, static_cast<std::uint32_t>(streamCredit));
+                    send_frame(kFrameWindowUpdate, 0, streamId, wu.data(), wu.size());
+                    recvStreamCredit_[streamId] = 0;
+                }
             }
             break;
         case kFramePing:
@@ -765,6 +836,7 @@ bool H2ServerImpl::await_send_window(std::uint32_t streamId, int timeout_ms) {
         h2_trace("[h2] waiting: conn=%lld stream%u=%lld", (long long)connSendWindow_, streamId,
                  (long long)sw);
         if (std::chrono::steady_clock::now() >= deadline) return false;
+        if (!flush_tx()) return false;
         // Nothing can be sent until the peer grants credit; keep servicing the
         // connection so WINDOW_UPDATE (and RST_STREAM) actually reach us.
         std::uint8_t type = 0, flags = 0;
@@ -782,13 +854,19 @@ bool H2ServerImpl::await_send_window(std::uint32_t streamId, int timeout_ms) {
 // not be silently turned into success when the peer actually closed, which is
 // what kept a dead tunnel looking healthy and spinning at ~50% CPU.
 bool H2ServerImpl::poll(int timeout_ms) {
+    // Anything staged by the previous relay iteration goes out before we block
+    // waiting for the peer, otherwise a 5 KB tail could sit here for a whole
+    // poll timeout.
+    if (!flush_tx()) return false;
     std::uint8_t type = 0, flags = 0;
     std::uint32_t sid = 0;
-    std::vector<std::uint8_t> payload;
+    std::vector<std::uint8_t>& payload = rxPayload_;
+    payload.clear();
     const int got = read_frame(timeout_ms, type, flags, sid, payload);
     if (got < 0) return false;
-    if (got == 0) return true;
+    if (got == 0) return !fatal_;
     dispatch(type, flags, sid, payload.data(), payload.size());
+    if (!flush_tx()) return false;
     return !fatal_;
 }
 
@@ -851,7 +929,7 @@ bool H2ServerImpl::write_data(std::uint32_t streamId, const std::uint8_t* data, 
         sw -= static_cast<std::int64_t>(n);
         connSendWindow_ -= static_cast<std::int64_t>(n);
     }
-    return true;
+    return flush_tx();
 }
 
 std::size_t H2ServerImpl::write_data_some(std::uint32_t streamId, const std::uint8_t* data,

@@ -540,6 +540,56 @@ fail=0 xfail=1 skip=0`；剩下那个 `XFAIL` 是 `04b` 半关闭的响应体，
 4. `--strict-uuid` 原先只是把“能过就判失败”的老行为从 `XFAIL` 抬成硬判据；修好之后 `06b`
    无条件 PASS，加不加这个开关结果一样（本轮两种跑法都验过）。
 
+## 10. 隧道数据面流控与吞吐回归（回归重点）
+
+隧道（`src/tunnel/`）的数据面有两类退化，都不会报错、只会变慢，所以必须靠数字卡：
+
+- **二次方拷贝**：`client.cpp` 的抽水循环如果只在循环外判断高水位，`toEdge` 会涨到 MB 级，
+  之后每次前移都 memmove 整个尾巴。表现：吞吐跌到 16~21 MB/s，每 GB 烧 30 秒 CPU，
+  `perf record` 里 **libc 的 memcpy 循环占 70% 以上**。
+- **连接级窗口被卡在 65 KB**：只靠每个 DATA 帧还 1 次信用时，连接窗口永远只有一个帧，
+  吞吐 ≈ 64 KB/RTT，与 CPU 空闲无关。
+
+### 10a. 全链路吞吐 / CPU 基线（同机客户端）
+
+被测机：1 核 / 469 MB。客户端用 xray 跑在同一台机上（所以客户端也吃这颗核），
+源站用 `python3 -m http.server 18000` 提供 `/root/big100m.bin`。
+
+    # 1) 先量裸链路，确认不是链路本身只有这个速度
+    curl -s -o /dev/null -w '%{speed_download}\n' 'https://speed.cloudflare.com/__down?bytes=50000000'
+    # 期望：本机实测 48.6~48.8 MB/s，cachefly 100 MB 为 53.7 MB/s
+
+    # 2) 全链路单流 + 4 并发（客户端配置见 tmpscripts/chain*.json 的生成脚本）
+    #    单流 100 MB ×2 轮、4×100 MB ×1 轮，CPU 取 /proc/<bpb pid>/stat 的 utime+stime 差值
+
+判据（本机 1 核，链路 48.8 MB/s）：
+
+| 项 | 门槛 | 修复前 | 修复后实测 |
+|---|---:|---:|---:|
+| 单流吞吐 | ≥ 35 MB/s | 16~21 | **40~47** |
+| 4 并发聚合 | ≥ 25 MB/s | — | **31.8** |
+| 每 GB CPU | ≤ 7 s | 32.9~35.7 | **5.2~5.8** |
+| 单流 CPU 占比 | ≤ 40% 一核 | 65~95% | **24%** |
+
+### 10b. 定位手法（不装 profiler 也能查）
+
+    perf record -F 499 -g -o /tmp/perf.data -p <bpb pid> -- sleep 4
+    perf report -i /tmp/perf.data --stdio --sort dso,symbol | head -20
+    # 症状：libc.so 里一串 0x1640xx 的 vmovdqu64 循环 → memcpy/memmove 热点
+
+    perf stat -p <bpb pid> -e syscalls:sys_enter_sendto,syscalls:sys_enter_recvfrom -- sleep 3
+    # 每次系统调用搬运的字节 = 传输量 / 调用数；低于 8 KB 说明在搬碎块
+
+### 10c. 流控本身要看的两点
+
+1. 建连后必须发一次 `WINDOW_UPDATE(0, 4 MB)`（连接级窗口只能靠它放大）；
+2. 还信用必须按 ~1 MB 批量，**不能**每个 DATA 帧还一次 —— 后者既卡住窗口，又让每帧多两次
+   控制帧写入（批处理也因此失效）。
+
+回归时可开 `--log trace` 数 `[h2 tx] WINDOW_UPDATE` 的行数：
+100 MB 传输应只有 ~100 条（每 MB 一条），出现 6400 条说明退回了逐帧还信用。
+
+
 ## 0. 日志开关
 
 默认 **error** 级：健康运行时 stderr 一个字节都不输出。

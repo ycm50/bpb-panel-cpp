@@ -709,7 +709,7 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
                 if (s.toOriginOff >= s.toOrigin.size()) {
                     s.toOrigin.clear();
                     s.toOriginOff = 0;
-                } else {
+                } else if (s.toOriginOff > 256 * 1024 && s.toOriginOff * 2 >= s.toOrigin.size()) {
                     s.toOrigin.erase(s.toOrigin.begin(),
                                      s.toOrigin.begin() + static_cast<std::ptrdiff_t>(s.toOriginOff));
                     s.toOriginOff = 0;
@@ -775,7 +775,10 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
                 if (s.toEdgeOff >= s.toEdge.size()) {
                     s.toEdge.clear();
                     s.toEdgeOff = 0;
-                } else if (s.toEdgeOff > 256 * 1024) {
+                } else if (s.toEdgeOff > 256 * 1024 &&
+                           s.toEdgeOff * 2 >= s.toEdge.size()) {
+                    // Compact only when at least half the buffer is consumed:
+                    // otherwise each 16 KB write memmoves the whole tail.
                     s.toEdge.erase(s.toEdge.begin(),
                                    s.toEdge.begin() + static_cast<std::ptrdiff_t>(s.toEdgeOff));
                     s.toEdgeOff = 0;
@@ -790,9 +793,14 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
             const bool canRead =
                 headReady && (s.toEdge.size() - s.toEdgeOff) < kEdgeQueueHighWater;
 
-            std::uint8_t buf[16384];
+            std::uint8_t buf[65536];
             bool gotData = false;
-            for (; canRead;) {
+            // Re-check the high-water mark on every iteration. With a loopback
+            // origin readSome() keeps returning 16 KB until the socket drains,
+            // so testing the queue only once let toEdge grow to megabytes and
+            // every later front-erase memmoved the whole tail: 74% of the tunnel
+            // CPU was memcpy inside that quadratic loop (32 s/GB).
+            for (; headReady && (s.toEdge.size() - s.toEdgeOff) < kEdgeQueueHighWater;) {
                 int n = s.origin->readSome(buf, sizeof(buf), 0);
                 if (n > 0) {
                     // Headers were already sent when the origin answered, so we
