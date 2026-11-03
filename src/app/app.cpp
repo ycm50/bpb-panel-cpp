@@ -708,10 +708,10 @@ http::Response App::handle(const http::Request& req) {
         return json_ok(accounts);
     }
     // ---- WARP outbound ------------------------------------------------------
-    // Backend differs per branch (main: supervised warp-rust, warp-built-in:
-    // in-tree WG + lwIP) but the panel surface is identical: status plus an
-    // explicit registration action. Registration defaults to a dry run so the
-    // round trip is testable without consuming Cloudflare's per-IP quota.
+    // The WARP outbound is in-process (in-tree WireGuard + lwIP), so the panel
+    // surface is just status plus an explicit registration action. Registration
+    // defaults to a dry run so the round trip is testable without consuming
+    // Cloudflare's per-IP quota.
     if (path == sp + "/panel/warp-status") {
         if (needs_auth && !authenticated(req)) return json_err(401, "未授权或会话已过期。");
         nlohmann::json out;

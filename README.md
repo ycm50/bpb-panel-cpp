@@ -35,15 +35,12 @@ Cloudflare Tunnel 客户端。**服务端没有任何 JavaScript/TypeScript**，
 - [CI 与发布](#ci-与发布github-actions)
 - [许可证](#许可证)
 
-## 分支说明
+## 单一分支
 
-| 分支 | WARP 出栈 | 特点 |
-|---|---|---|
-| `warp-built-in`（默认分支） | 进程内 `src/wg` + lwIP | 单二进制、零外部依赖、内存更省 |
-| `warp-rust` | 独立进程 `warp-rust`（Rust，自带用户态栈） | bpb 负责渲染配置、监督生命周期，经本地 SOCKS5 转发 |
-
-两个分支的**面板、订阅、隧道、CLI 与密码功能完全一致**，差异只在 WARP 数据面。
-读路径空转修复、内存收敛（空载 ≈10MB / 200 并发 ≈15MB）、`--cur`/`--passwd`、内置图标字体这一轮改动**两个分支同步落地**。
+只有一个分支 `warp-built-in`。WARP 出栈在**进程内**用 `src/wg` + lwIP 实现，
+单二进制、零外部依赖、不需要 `NET_ADMIN`；曾经并行维护的「外部 `warp-rust` 进程 +
+本地 SOCKS5 转发」方案已移除，它的面板、订阅、隧道、CLI 与密码功能早已与内置实现完全一致，
+再维护两套 WARP 数据面只会让两边同时漂移。
 
 ## 功能
 
@@ -58,9 +55,8 @@ Cloudflare Tunnel 客户端。**服务端没有任何 JavaScript/TypeScript**，
 - **DoH 反向代理**、**PNG 二维码**、**设置导入导出**
 - **可选内置 TLS**（`--tls-cert` / `--tls-key`），https 与 wss 都支持；也可交给 Caddy 终止
 - **内置 Cloudflare Tunnel 客户端**：不需要 cloudflared，注册、转发、断线重连全在进程内
-- **WARP 出口**：两种实现，见 [WARP 出口](#warp-出口) ——
-  独立进程 `warp-rust`（`warp-rust` 分支）或**内置用户态 WireGuard**
-  （`warp-built-in` 分支也就是默认分支，Noise IK + lwIP，无需特权）
+- **WARP 出口**：**内置用户态 WireGuard**，见 [WARP 出口](#warp-出口) ——
+  Noise IK + lwIP 全在进程内，无需特权、无需外部程序
 - **面板内注册 WARP 账号**：默认 **dry run** —— 只构造并打印请求体、
   返回合成账号，**不访问 Cloudflare**、不写账号池
 - **隧道按需唤醒 / 休眠**：临时隧道不常驻，用的时候一句话拉起；
@@ -479,12 +475,8 @@ TLS 端口会带 `tls=tls` 加 `sni/alpn/fp`，明文端口 `tls` 留空。
 
 ## WARP 出口
 
-出口就是把 VLESS 会话的上游连接接进 WARP。两种后端，面板接口完全一致：
-
-| 后端 | 分支 | 形态 |
-|---|---|---|
-| 内置 `src/wg` + lwIP | `warp-built-in`（默认分支） | 进程内用户态 TCP/IP 栈直连 WireGuard，不需要外部程序也不需要 `NET_ADMIN` |
-| `warp-rust` | `warp-rust` | 外部独立进程；bpb 渲染 `warp-rust.toml`、监督生命周期，数据经本地 SOCKS5（`127.0.0.1:11080`）转发 |
+出口就是把 VLESS 会话的上游连接接进 WARP：进程内用户态 TCP/IP 栈直连 WireGuard，
+不需要外部程序也不需要 `NET_ADMIN`。
 
 另有 **侧车容器**（整机出网，需 `NET_ADMIN`）：
 
@@ -506,7 +498,7 @@ TLS 端口会带 `tls=tls` 加 `sni/alpn/fp`，明文端口 `tls` 留空。
 之所以默认 dry run：Cloudflare 对注册接口按来源 IP 限流，开发和演示不该消耗配额。
 另外 dry run **绝不写账号池** —— 合成账号没有可用密钥，写进去会让下次启动拿到一个死账号。
 
-### 内置用户态 WireGuard（`warp-built-in`）
+### 内置用户态 WireGuard
 
 | 目录 | 内容 |
 |---|---|
@@ -518,10 +510,10 @@ TLS 端口会带 `tls=tls` 加 `sni/alpn/fp`，明文端口 `tls` 留空。
 
 实测（1 核 / 512 MB）：
 
-| 后端 | 结果 |
+| 项目 | 结果 |
 |---|---|
-| 内置（`warp-built-in`） | 连续 10 次 HTTPS 经 VLESS → bpb → WARP 全部成功，出口均为 WARP 地址，平均 1.5 秒；100 KB 下载完整 |
-| `warp-rust` 后端（`warp-rust` 分支） | 常驻约 **7.4 MB**（bpb 2.4 MB + warp-rust 5.2 MB），同样 10 次连续成功 |
+| 连通性 | 连续 10 次 HTTPS 经 VLESS → bpb → WARP 全部成功，出口均为 WARP 地址，平均 1.5 秒；100 KB 下载完整 |
+| 常驻内存 | 单进程约 2.4 MB，无第二个进程
 
 ### 踩过的坑（都已修掉，列出来便于以后排查）
 

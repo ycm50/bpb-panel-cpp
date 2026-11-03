@@ -182,15 +182,14 @@ install -d "$PREFIX"
 install -m 0755 "$tmp/bpb" "$PREFIX/bpb"
 log "installed $PREFIX/bpb"
 
-# The warp-rust branch keeps its WARP outbound in a second binary that bpb looks
-# for next to itself; the warp-built-in branch has it in-process and the release
-# simply carries no such asset. Fetch it when present, warn when not -- a missing
-# sidecar only costs the WARP outbound, the panel and VLESS keep working.
-if [ -z "$LOCAL_BIN" ] && fetch "$base/warp-rust-linux-$arch" "$tmp/warp-rust" 2>/dev/null; then
-  install -m 0755 "$tmp/warp-rust" "$PREFIX/warp-rust"
-  log "installed $PREFIX/warp-rust (external WARP outbound)"
-else
-  log "release has no warp-rust sidecar: WARP runs in-process (warp-built-in)"
+# WARP terminates in this process (in-tree WireGuard + lwIP), so there is no
+# sidecar to fetch. An install left over from the retired external-sidecar
+# layout may still carry one: bpb only loads it when the binary is next to
+# itself, so a stale copy is dead weight that silently keeps a second WARP
+# implementation around. Remove it and say so rather than leaving it behind.
+if [ -f "$PREFIX/warp-rust" ]; then
+  rm -f "$PREFIX/warp-rust"
+  log "removed leftover $PREFIX/warp-rust (WARP is in-process now)"
 fi
 
 # --- data directory ---------------------------------------------------------

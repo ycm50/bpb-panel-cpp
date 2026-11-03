@@ -12,18 +12,13 @@
 #include "net/tls.h"
 #include "net/wg_outbound.h"
 
-// The two branches carry different WARP outbounds: warp-built-in runs lwIP in
-// process (net/wg_stack.h), warp-rust drives an external sidecar over a SOCKS
-// socket (net/warp_proc.h). Detect which one exists so this header is identical
-// on both branches and the protocol code never has to care.
+// The WARP outbound is lwIP running in process (net/wg_stack.h). The probe below
+// keeps the protocol code independent of that header: a build without it simply
+// compiles the relay without a WARP path instead of failing to compile.
 #if defined(__has_include)
 #if __has_include("net/wg_stack.h")
 #include "net/wg_stack.h"
 #define BPB_WSX_WG_STACK 1
-#endif
-#if __has_include("net/warp_proc.h")
-#include "net/warp_proc.h"
-#define BPB_WSX_WARP_PROC 1
 #endif
 #endif
 
@@ -337,15 +332,6 @@ inline Outbound connect_outbound(const std::string& host, int port, int timeout_
         auto conn = net::WgStack::instance().connect(host, port, timeout_ms, err);
         if (conn && conn->valid()) {
             ob.wg = std::move(conn);
-            return ob;
-        }
-    }
-#elif defined(BPB_WSX_WARP_PROC)
-    // The sidecar resolves the name inside the tunnel, so no DNS query leaks.
-    if (net::wg_outbound_ready()) {
-        socket_t s = net::warp_socks_connect(host, port, timeout_ms);
-        if (s != net::kInvalid) {
-            ob.fd = s;
             return ob;
         }
     }

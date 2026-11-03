@@ -46,7 +46,7 @@ public:
     }
 
     // Data directory the store was loaded from; used to place auxiliary files
-    // such as the generated warp-rust config.
+    // such as the exported wg0.conf.
     const std::string& dir() const { return dir_; }
 
     static nlohmann::json default_kv();

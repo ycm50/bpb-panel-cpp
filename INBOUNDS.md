@@ -608,7 +608,7 @@ goal 里第二套部署写法是 sing-box（`users:[{uuid, alterId:0}]` +
 | 下载 5MB / 20MB | 5000000 / 20000000 字节，精确 |
 | 上传 1MB / 5MB（本地 sink 计数） | 1048576 / 5242880，精确 |
 | 关掉 early data 的变体 | 全过 |
-| warp-built-in 与 warp-rust 两个二进制 | 都过 |
+| `warp-built-in` 二进制 | 过 |
 
 **顺带发现一个重要差异**：sing-box 的 vmess 只置
 `RequestOptionChunkStream|ChunkMasking`（option=`0x05`，**没有全局填充**），
@@ -648,11 +648,6 @@ WS 的 Host 头决定 Cloudflare 隧道/Worker 的路由，写死 bing 会让真
 `PUT /panel/update-settings {"protocols":"vless"}` 返回 **400**
 「这个二进制没有编入所选的入栈协议，可用： vmess」；提交 `vmess` 返回 200。
 即「面板只能勾选真正编进来的协议」在新增协议上同样成立。
-
-**3) 补充说明**：warp-rust 分支的 WARP 出口是外部 sidecar（`net::warp_socks_connect`
-返回普通 socket），本机没有 Rust 构建环境，所以那条分支只在编译层面验证（两分支
-共用同一份 `ws_transport.h`，靠 `#if __has_include` 选实现），运行期由
-trojan/ss/vless 已在生产的同一套代码路径覆盖。
 
 **4) 走真实 Cloudflare 边缘（生产拓扑）**：本机开了 quick tunnel
 （`proxySettings.cfTunnel.enabled=true` + 空 token → `api.trycloudflare.com/tunnel`），

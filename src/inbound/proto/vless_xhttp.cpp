@@ -9,17 +9,12 @@
 #include "util/thread.h"
 #include "util/util.h"
 
-// The two branches carry different WARP outbounds: warp-built-in runs lwIP in
-// process (net/wg_stack.h), warp-rust drives an external sidecar over a SOCKS
-// socket (net/warp_proc.h). The header probe keeps this file identical on both.
+// The WARP outbound is lwIP running in process (net/wg_stack.h). The header
+// probe keeps this file compiling whether or not that backend is present.
 #if defined(__has_include)
 #if __has_include("net/wg_stack.h")
 #include "net/wg_stack.h"
 #define BPB_XH_WG_STACK 1
-#endif
-#if __has_include("net/warp_proc.h")
-#include "net/warp_proc.h"
-#define BPB_XH_WARP_PROC 1
 #endif
 #endif
 
@@ -208,14 +203,6 @@ Outbound connect_outbound(const std::string& host, int port, int timeout_ms) {
         auto conn = net::WgStack::instance().connect(host, port, timeout_ms, err);
         if (conn && conn->valid()) {
             ob.wg = std::move(conn);
-            return ob;
-        }
-    }
-#elif defined(BPB_XH_WARP_PROC)
-    if (net::wg_outbound_ready()) {
-        socket_t s = net::warp_socks_connect(host, port, timeout_ms);
-        if (s != net::kInvalid) {
-            ob.fd = s;
             return ob;
         }
     }
