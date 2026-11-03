@@ -262,7 +262,8 @@ json build_outbound(const std::string& name, const std::string& type, const std:
 }
 
 json build_ws_outbound(const json& s, const std::string& protocol, const std::string& remark,
-                       const std::string& address, int port, const std::string& domain) {
+                       const std::string& address, int port, const std::string& domain,
+                       const std::string& transport_kind = "ws") {
     std::string upstream_server;
     if (s.contains("upstreamParams") && s["upstreamParams"].is_object()) {
         upstream_server = s["upstreamParams"].value("upstreamServer", std::string());
@@ -270,11 +271,19 @@ json build_ws_outbound(const json& s, const std::string& protocol, const std::st
     bool is_tls = is_https(s, port) || (!upstream_server.empty() && address == upstream_server);
 
     auto sni_host = select_sni_host(s, address, domain);
+    // gRPC is HTTP/2 only; websocket has to stay on h1.1 because that is the
+    // protocol this server upgrades on.
+    const bool is_grpc = (transport_kind == "grpc");
     json tls = is_tls ? build_tls(s, protocol, "tls", sni_host.allow_insecure, sni_host.sni,
-                                  flag(s, "enableECH"), str(s, "echServerName"), "http/1.1",
+                                  flag(s, "enableECH"), str(s, "echServerName"),
+                                  is_grpc ? "h2" : "http/1.1",
                                   str(s, "fingerprint", "chrome"))
                       : json::object();
-    json transport = build_transport("ws", "", generate_ws_path(protocol, s.value("vlUUID", std::string())), sni_host.host, "", 2560);
+    json transport = is_grpc
+                         ? build_transport("grpc", "", "", "", "vlg", 0)
+                         : build_transport("ws", "",
+                                           generate_ws_path(protocol, s.value("vlUUID", std::string())),
+                                           sni_host.host, "", 2560);
 
     json fields = json::object();
     fields["uuid"] = str(s, "vlUUID");
@@ -621,6 +630,7 @@ bool build_clash_custom(const json& s, std::string& out_json, std::string& error
     if (!custom_domain.empty()) domains.push_back(custom_domain);
 
     auto protocols = get_protocols(s);
+    const std::vector<std::string> transports = get_transports(s);
     std::vector<int> ports;
     if (s.contains("ports") && s["ports"].is_array()) {
         for (auto& p : s["ports"]) {
@@ -668,26 +678,36 @@ bool build_clash_custom(const json& s, std::string& out_json, std::string& error
                     bool host_is_upstream = (!upstream_server.empty() && host == upstream_server);
                     if (port_is_upstream != host_is_upstream) continue;
 
-                    std::string tag =
-                        generate_remark(s, protocol_index, port, host, protocol, domain, false, false);
-                    json outbound = build_ws_outbound(s, protocol, tag, host, port, domain);
-                    if (outbound.is_null()) continue;
+                    // One outbound per enabled transport; Clash.Meta has no XHTTP
+                    // at all, so only gRPC is added here (get_transports already
+                    // drops the ones this binary cannot serve).
+                    for (const std::string& tr : transports) {
+                        if (tr == "xhttp") continue;
+                        std::string tag = generate_remark(s, protocol_index, port, host, protocol,
+                                                          domain, false, false) +
+                                          transport_suffix(tr);
+                        json outbound = build_ws_outbound(s, protocol, tag, host, port, domain, tr);
+                        if (outbound.is_null()) continue;
 
-                    outbounds.push_back(outbound);
-                    for (auto& g : tag_group) {
-                        if (g.first == (is_custom ? best_ping_d : best_ping)) g.second.push_back(tag);
-                    }
-
-                    if (is_chain) {
-                        std::string chain_tag = generate_remark(s, protocol_index, port, host, protocol,
-                                                                domain, false, true);
-                        json chain = chain_outbound;
-                        chain["name"] = chain_tag;
-                        chain["dialer-proxy"] = tag;
-                        outbounds.push_back(chain);
+                        outbounds.push_back(outbound);
                         for (auto& g : tag_group) {
-                            if (g.first == (is_custom ? best_ping_d_chain : best_ping_chain))
-                                g.second.push_back(chain_tag);
+                            if (g.first == (is_custom ? best_ping_d : best_ping))
+                                g.second.push_back(tag);
+                        }
+
+                        if (is_chain) {
+                            std::string chain_tag =
+                                generate_remark(s, protocol_index, port, host, protocol, domain,
+                                                false, true) +
+                                transport_suffix(tr);
+                            json chain = chain_outbound;
+                            chain["name"] = chain_tag;
+                            chain["dialer-proxy"] = tag;
+                            outbounds.push_back(chain);
+                            for (auto& g : tag_group) {
+                                if (g.first == (is_custom ? best_ping_d_chain : best_ping_chain))
+                                    g.second.push_back(chain_tag);
+                            }
                         }
                     }
                     ++protocol_index;

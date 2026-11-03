@@ -22,6 +22,17 @@ std::string generate_remark(const nlohmann::json& s, int index, int port, const 
 // credential in the path, so the caller has to hand it over.
 std::string generate_ws_path(const std::string& protocol, const std::string& credential = "");
 
+// Transports a subscription must emit. WebSocket always comes first: it is the
+// default and the only transport every client understands. XHTTP and gRPC are
+// appended when the panel switches (enableXHTTP / enableGRPC) are on, so turning
+// them on *adds* entries instead of replacing the websocket ones — a client that
+// cannot do either still has something to import.
+std::vector<std::string> get_transports(const nlohmann::json& s);
+
+// Suffix that keeps names/remarks unique when one server is emitted once per
+// transport: "" for websocket, " XHTTP", " gRPC".
+std::string transport_suffix(const std::string& transport);
+
 std::string random_upper_case(const std::string& in);
 std::string get_random_string(int length_min, int length_max);
 

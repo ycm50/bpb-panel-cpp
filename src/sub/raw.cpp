@@ -24,29 +24,50 @@ static std::string encode_fragment(const std::string& in) {
 static std::string build_config_url(const std::string& protocol, const std::string& address,
                                     int port, const std::string& host, const std::string& sni,
                                     const std::string& remark, bool is_tls, const std::string& client,
-                                    const std::string& uuid, const std::string& fingerprint) {
+                                    const std::string& uuid, const std::string& fingerprint,
+                                    const std::string& transport = "ws") {
     std::string user = uuid;
     std::string path = generate_ws_path(protocol, uuid);
+    // gRPC is the only one of the three that rides on HTTP/2; XHTTP and
+    // websocket stay on HTTP/1.1, which is what this server answers.
+    const bool is_grpc = (transport == "grpc");
 
     std::string url = protocol + "://" + user + "@" + address + ":" + std::to_string(port) + "?";
     std::vector<std::string> params;
     if (protocol == "vless") params.push_back("encryption=none");
-    params.push_back("host=" + url_encode(host));
-    params.push_back("type=ws");
-    params.push_back("security=" + std::string(is_tls ? "tls" : "none"));
-
-    if (client == "sing-box") {
-        params.push_back("eh=Sec-WebSocket-Protocol");
-        params.push_back("ed=2560");
-        params.push_back("path=" + url_encode(path));
+    if (is_grpc) {
+        // The service name is the first path segment of the gRPC call; the
+        // inbound mounts it as /vlg/Tun (see src/inbound/proto/vless_grpc.cpp).
+        params.push_back("type=grpc");
+        params.push_back("security=" + std::string(is_tls ? "tls" : "none"));
+        params.push_back("serviceName=vlg");
+        params.push_back("mode=multi");
+    } else if (transport == "xhttp") {
+        // XHTTP (SplitHTTP): a chunked GET downlink plus numbered POSTs uplink.
+        params.push_back("type=xhttp");
+        params.push_back("security=" + std::string(is_tls ? "tls" : "none"));
+        params.push_back("host=" + url_encode(host));
+        params.push_back("path=" + url_encode("/vlx"));
+        params.push_back("mode=packet-up");
     } else {
-        params.push_back("path=" + url_encode(path + "?ed=2560"));
+        params.push_back("host=" + url_encode(host));
+        params.push_back("type=ws");
+        params.push_back("security=" + std::string(is_tls ? "tls" : "none"));
+
+        if (client == "sing-box") {
+            params.push_back("eh=Sec-WebSocket-Protocol");
+            params.push_back("ed=2560");
+            params.push_back("path=" + url_encode(path));
+        } else {
+            params.push_back("path=" + url_encode(path + "?ed=2560"));
+        }
     }
 
     if (is_tls) {
+        if (is_grpc) params.push_back("authority=" + url_encode(host));
         params.push_back("sni=" + url_encode(sni));
         params.push_back("fp=" + url_encode(fingerprint));
-        params.push_back("alpn=" + url_encode("http/1.1"));
+        params.push_back("alpn=" + url_encode(is_grpc ? "h2" : "http/1.1"));
     }
 
     url += join(params, "&");
@@ -110,6 +131,7 @@ SubResult build_raw_configs(const nlohmann::json& s, const std::string& client) 
     if (!custom_domain.empty()) domains.push_back(custom_domain);
 
     auto protocols = get_protocols(s);
+    const std::vector<std::string> transports = get_transports(s);
     std::string vl_confs;
     int proxy_index = 1;
 
@@ -154,9 +176,12 @@ SubResult build_raw_configs(const nlohmann::json& s, const std::string& client) 
                         continue;
                     }
                     if (proto != "vless") continue;
-                    std::string url = build_config_url(proto, addr, port, sni_host.host, sni_host.sni,
-                                                       remark, is_tls, client, vl_uuid, fingerprint);
-                    vl_confs += url + "\n";
+                    for (const std::string& tr : transports) {
+                        std::string url = build_config_url(proto, addr, port, sni_host.host,
+                                                           sni_host.sni, remark + transport_suffix(tr),
+                                                           is_tls, client, vl_uuid, fingerprint, tr);
+                        vl_confs += url + "\n";
+                    }
                 }
                 ++proxy_index;
             }

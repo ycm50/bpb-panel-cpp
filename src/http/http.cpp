@@ -223,6 +223,28 @@ static bool parse_request(std::string& in, Request& req) {
 }
 
 void Server::process(Conn& c) {
+    // HTTP/2 clients never send a request head: they open with
+    // "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n". Hand the connection to the h2
+    // owner (the gRPC transport) as soon as the preface is complete, and wait for
+    // the rest of it when only a prefix has arrived.
+    if (pre_takeover_) {
+        static const std::string kPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        const std::size_t n = c.in.size() < kPreface.size() ? c.in.size() : kPreface.size();
+        if (n && c.in.compare(0, n, kPreface.substr(0, n)) == 0) {
+            if (c.in.size() < kPreface.size()) return;
+            const net::socket_t tfd = c.fd;
+            SSL* tssl = c.ssl;
+            c.fd = net::kInvalid;
+            c.ssl = nullptr;
+            if (pre_takeover_(tfd, tssl, c.in)) {
+                c.detached = true;
+                c.in.clear();
+                return;
+            }
+            c.fd = tfd;
+            c.ssl = tssl;
+        }
+    }
     while (true) {
         Request req;
         if (!parse_request(c.in, req)) return;
@@ -240,6 +262,21 @@ void Server::process(Conn& c) {
         if (upgrade.empty() &&
             to_lower(req.header("cf-cloudflared-proxy-connection-upgrade")) == "websocket") {
             upgrade = "websocket";
+        }
+        // Transports that own the connection after the request head (XHTTP's
+        // downlink GET keeps streaming, gRPC keeps an HTTP/2 connection alive)
+        // get their chance before the panel sees the request.
+        if (takeover_) {
+            const net::socket_t tfd = c.fd;
+            SSL* tssl = c.ssl;
+            c.fd = net::kInvalid;
+            c.ssl = nullptr;
+            if (takeover_(tfd, tssl, req)) {
+                c.detached = true;
+                return;
+            }
+            c.fd = tfd;
+            c.ssl = tssl;
         }
         if (upgrade == "websocket" && ws_handler_) {
             std::string key = req.header("sec-websocket-key");

@@ -31,6 +31,20 @@ extern const Inbound shadowsocks_inbound;
 #ifdef BPB_HAVE_VMESS
 extern const Inbound vmess_inbound;
 #endif
+#ifdef BPB_HAVE_VLESS_GRPC
+// VLESS over gRPC. Like XHTTP it is not a websocket protocol: the connection is
+// claimed by the HTTP server's pre-takeover hook (an HTTP/2 client never sends an
+// HTTP/1 request head), and the entry here is what makes the panel, the startup
+// log and the path table agree with what this binary can serve.
+extern const Inbound vless_grpc_inbound;
+#endif
+#ifdef BPB_HAVE_VLESS_XHTTP
+// VLESS over the XHTTP (SplitHTTP) transport. Not a websocket protocol: it is
+// served by the HTTP server's takeover hook, not by the upgrade dispatcher, but
+// it is listed here so the panel, the startup log and the path table agree with
+// what this binary can actually serve.
+extern const Inbound vless_xhttp_inbound;
+#endif
 
 const std::vector<const Inbound*>& all() {
     static const std::vector<const Inbound*> table = {
@@ -45,6 +59,12 @@ const std::vector<const Inbound*>& all() {
 #endif
 #ifdef BPB_HAVE_VMESS
         &vmess_inbound,
+#endif
+#ifdef BPB_HAVE_VLESS_XHTTP
+        &vless_xhttp_inbound,
+#endif
+#ifdef BPB_HAVE_VLESS_GRPC
+        &vless_grpc_inbound,
 #endif
     };
     return table;

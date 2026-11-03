@@ -27,7 +27,7 @@
 
 ## 2. 冒烟测试（面板接口 + 订阅）
 
-    docker run -d --name bpb-test -p 18099:8080 -v bpbdata:/data bpb-native:1.0.0
+    docker run -d --name bpb-test -p 18099:8080 -v bpbdata:/data bpb-native:1.0.2
     python3 tests/smoke.py http://127.0.0.1:18099/securepath
 
 预期：13/13 全过（登录、面板设置、8 种订阅、share-settings、DoH、二维码）。
@@ -99,7 +99,7 @@ VLESS over WebSocket 必须能转原生 TCP。最小验证：
 
 ### 5a. 侧车容器（整机出网）
 
-    docker run --rm -v "$PWD/data:/data" -v "$PWD/warp:/out" bpb-native:1.0.0 \
+    docker run --rm -v "$PWD/data:/data" -v "$PWD/warp:/out" bpb-native:1.0.2 \
       --export-warp /out/wg0.conf --data /data
     docker compose -f docker-compose.warp.yml up -d --build
     docker exec bpb-warp wg show
@@ -707,21 +707,112 @@ CI 会为 amd64 / arm64 / armv7 / 386 / riscv64 各产出一个静态二进制�
 协议清单是**编译期**决定的，没编进去的协议不能被编译、不能被分发、不能出现在面板和订阅里。
 
 1. **只编一个协议**：
-   `cmake -S . -B /tmp/one -DBPB_INBOUNDS=vless` → 配置期必须打印
-   `-- bpb inbounds: vless`；`/tmp/one/bpb --log info` 的启动行必须以
-   `inbounds: vless` 结尾（多一个协议都不对）。
+   `cmake -S . -B /tmp/one -DBPB_INBOUNDS=trojan` → 配置期必须打印
+   `-- bpb inbounds: trojan`；`/tmp/one/bpb --log info` 的启动行必须以
+   `inbounds: trojan` 结尾（多一个协议都不对）。
+
+   **例外是 vless**：XHTTP 是“传输绑定”而不是独立协议，CMake 把它和 VLESS 一起编，
+   所以 `-DBPB_INBOUNDS=vless` 的启动行是 `inbounds: vless,vless-xhttp`。
+   同理 `-DBPB_INBOUNDS=vless-xhttp` 单独选也要能链接（早期版本会 `undefined reference`）。
+   **正确做法是以 CMake 写出的 `expected-inbounds.txt` 为准**，不要自己推这条规则：
+   配置期会把运行时列表写进该文件，CI 的校验步骤直接读它比对启动行。
 2. **未选中的协议不参与编译**：构建日志里不应出现
    `trojan_ws.cpp` / `shadowsocks_ws.cpp` 这两个翻译单元。
-3. **全协议**：`-DBPB_INBOUNDS=all` → `inbounds: vless,trojan,shadowsocks,vmess`。
+3. **全协议**：`-DBPB_INBOUNDS=all` → `inbounds: vless,trojan,shadowsocks,vmess,vless-xhttp,vless-grpc`。
+   WebSocket 协议排在前四个，两个新传输（XHTTP、gRPC）排在后面；它们不走 WebSocket 升级，
+   分别由 HTTP 服务端的 takeover / pre-takeover 钩子接管（见第 11 节）。
 4. **非法协议名**：`-DBPB_INBOUNDS=nope` 必须配置期直接 FATAL_ERROR 并列出可用协议。
 5. **路径分发**：编入 vless 的二进制访问 `/tr`、`/ss` 都是 404；
-   编入 all 时 `/vl` `/tr` `/ss` 都能升级成 WebSocket。
+   编入 all 时 `/vl` `/tr` `/ss` 都能升级成 WebSocket，`/vlx`（XHTTP）与
+   `/vlg/Tun`（gRPC）分别被对应传输接管。默认 `BPB_INBOUNDS=vless` 含 XHTTP 但**不含 gRPC**，
+   发布构建要用 `all` 或显式 `vless,vless-grpc`。
 6. **面板裁剪**：`GET /<sp>/panel/settings` 的 `body.inbounds` 与实际编入一致；
    `PUT /<sp>/panel/update-settings` 提交 `{"protocols":"<没编进去的协议>"}` 返回 400，
    提交混合列表时没编进去的项被静默剔除。
 7. **订阅裁剪**：`sub::get_protocols()` 与协议表求交集；把一个没编进去的协议写进
    settings.json，生成出来的订阅里不应出现它。
 
+## 11. 传输开关与订阅一致性（回归重点）
+
+面板「通用」区两个开关 `enableXHTTP` / `enableGRPC` 同时决定两件事：订阅里是否多出
+该传输的线路，以及服务端是否还接受该入口。两者必须同步，否则会出现「订阅里删掉了、端口还开着」的隐藏入口。
+
+本地自检（会自己起一个临时实例，不碰正式数据目录）：
+
+    cmake -S . -B build-all -G Ninja -DCMAKE_BUILD_TYPE=Release -DBPB_INBOUNDS=all
+    cmake --build build-all
+    python tmpscripts/transport_selftest.py   # 31 项，订阅侧
+    python tmpscripts/gate_selftest.py        # 4 项，服务端拦截
+
+预期：两个脚本都以 `ALL PASS` 结束。覆盖点：
+
+1. **默认两个都关**：`panel/settings` 的 `proxySettings` 里 `enableXHTTP=false`、
+   `enableGRPC=false`，且不再有旧的 `transport` 键；raw 订阅只有 `type=ws`。
+2. **打开后是追加不是替换**：WebSocket 线路一条不少，XHTTP / gRPC 各补一份，备注后缀 ` XHTTP` / ` gRPC`；
+   主机数为 N 时三种传输的条数必须相等（Best Ping 的负载均衡条目只算一条，不随传输数翻倍）。
+3. **内容正确**：xray 配置 `network=xhttp` + `xhttpSettings.path=/vlx`；
+   `network=grpc` + `grpcSettings.serviceName=vlg`；share link 里 grpc 的 `alpn` 必须是 `h2`。
+4. **客户端能力取舍**：Clash / sing-box 订阅里有 gRPC、**没有** XHTTP（这两个内核不支持 XHTTP）。
+5. **关掉即回收**：再写回 `false` 后，订阅里两种传输的条目全部消失，条数回到开关前的基线。
+6. **服务端也关**（`gate_selftest.py`）：开关关闭时发 h2 前言收到的是 HTTP/1.1 应答（说明 h2 接管没有发生），
+   `GET /<sp>/vlx/<sid>` 落回面板；打开后前者回 SETTINGS 帧、后者回 `text/event-stream`。
+7. **没编进就不生成**：只编 vless 的二进制（`BPB_INBOUNDS=vless`，其内部已含 vless-xhttp 但不含 vless-grpc）
+   把 `enableGRPC` 打开，订阅里也不应出现 gRPC 线路 —— 生成侧按 `inbound::has()` 过滤。
+
+真机互通（VPS，1 核 / 469 MB，官方 xray 26.3.27 客户端）实测，供对照：
+
+| 传输 | 结果 | 吞吐 | 每 GiB CPU |
+|---|---|---|---|
+| XHTTP | 25/25 × 1 MiB 逐字节一致 | 下行 84.7 MiB/s，上行 15.1 MiB/s | 3.8–5.0（下）/ 2.9–3.8（上）cpu·s |
+| gRPC | 25/25 × 1 MiB 在 0.96 s 内完成 | 137.2 MiB/s | 1.33 cpu·s |
+
+空载与并发：XHTTP 200 并发会话峰值 RSS 110 MB（约 550 KB/会话，每会话 3 条 128 KB 栈线程），
+客户端停止后 30 s 回到 14 MB、125 s 回到 6.5 MB；gRPC 200 条流跑在 1 条 TCP 上 RSS 10.3 MB。
+两者空载 CPU 都是 0.0–0.1%，没有空转。
+## 12. 两个传输开关对内存与并发的影响（回归重点）
+
+问题：打开 `enableXHTTP` / `enableGRPC` 会不会拉高内存、多占线程？结论分两层。
+
+**第一层：只打开开关、不走该传输时，开销为零。** 同一二进制、同一数据目录，只改 settings.json 的两个布尔值后重启：
+
+| 状态 | idle RSS | 线程 |
+|---|---|---|
+| 两个都关 | 5816 kB | 5 |
+| 只开 XHTTP | 5884 kB | 8 |
+| 只开 gRPC | 5692 kB | 5 |
+
+差值在 ±70 kB / ±3 线程以内，属于进程噪声：开关只决定 HTTP 服务端的两个钩子是否接管连接，不预分配任何缓冲。
+本地 Windows 版同样结论（10.3 MB / 10.1 MB / 10.1 MB，线程都是 4）。
+
+**第二层：真正跑该传输时，XHTTP 的成本明显高于 gRPC。** 30 并发下载，每个传输用各自真实的 xray 客户端，
+每轮都是全新进程（上一轮残留会污染下一轮的基线，务必重启）：
+
+| 传输 | 连接数 | idle RSS | 峰值 RSS | 每会话 | 峰值线程 | 客户端停止后 |
+|---|---|---|---|---|---|---|
+| WebSocket（基线） | 30 | 5816 kB | 8280 kB | **82 kB** | 92 | 60 s 内回到 9.9 MB / 2 线程 |
+| XHTTP | 60 | 5884 kB | 36428 kB | **1018 kB** | 153 | 20 s 回到 8.5 MB / 3 线程 |
+| gRPC | 1 | 5692 kB | 5792 kB | **3 kB** | 93 | 60 s 内回到 7.2 MB / 3 线程 |
+
+读法：
+
+1. **XHTTP 每会话约 1 MB**，是 WebSocket 的 12 倍。原因是它每个会话要同时持有下行 GET 流、按 seq 重排的
+   乱序缓存（上限 256 块 / 4 MB）、上行队列（4 MB 上限）和至少 2~3 条 128 KB 栈的线程。
+   30 并发时线程 153、连接 60（一会话一对 GET+POST 连接）。
+2. **gRPC 几乎是免费的**：一条 TCP 承载全部 stream，RSS 峰值只比空载高 100 kB，
+   因为每个会话只是同一连接上的一个 stream，没有独立连接和独立队列。
+3. **都没有泄漏**：客户端停掉后连接立刻归零，XHTTP 20 s 内、gRPC 60 s 内内存回到接近空载；
+   继续观察到 t+240 s 稳定在 8.5 MB，不再增长。
+4. **空载不空转**：三种状态 17 s 采样期 CPU 0.02–0.56 s，主要是测量本身的开销。
+
+复现：
+
+    # 服务器与客户端配置里的 UUID 必须一致（新数据目录会随机生成 UUID）
+    python3 tmpscripts/m_transport3.py 30
+    # 每轮重启进程、探测一次 200 后再加压，探测失败就跳过而不是记 0
+
+**踩过的坑**：三轮共用同一个长期进程，第二轮会把第一轮没还回去的内存当成自己的基线
+（曾测出 gRPC “空载 56 MB”）；不校验探测结果就加压，得到的是 30 个连不上服务端的空转客户端
+（conn=0、cpu=0）。这两条都会让结论完全反向，所以脚本里现在强制重启 + 强制 probe。
 ## 0c. 每协议一个独立二进制（发布前自查）
 
 用官方 Xray 客户端（outbound 分别配 vless / trojan / shadowsocks / vmess，
@@ -734,10 +825,10 @@ streamSettings.network=ws、security=none、路径对 /vl /tr /ss /<uuid>-vm）�
 alterId 0 + security auto。sing-box 客户端同样要过（alter_id 0，transport ws，
 可选 max_early_data 2048 + early_data_header_name）。
 
-**矩阵自查（本地可完整复现 CI 的断言）**：对 vless / trojan / shadowsocks / vmess 各做一次
--DBPB_INBOUNDS=<proto> 的独立构建，配置期必须打印 -- bpb inbounds: <proto>，二进制必须
-static，启动行必须恰好是 inbounds: <proto>。脚本：tmpscripts/matrix.sh，期望末行
-MATRIX-RESULT fail=0。实测四个都是 OK（9.1MB 左右，static=1）。
+**矩阵自查（本地可完整复现 CI 的断言）**：对每个协议各做一次 -DBPB_INBOUNDS=<proto> 的独立构建，
+配置期打印的列表必须与 build/expected-inbounds.txt 一致，二进制必须 static，启动行必须等于该文件。
+注意 vless 的期望值是 inbounds: vless,vless-xhttp（XHTTP 跟着 VLESS 一起编），其余协议是单个名字。
+脚本：tmpscripts/matrix.sh，期望末行 MATRIX-RESULT fail=0。
 
 **必须连 musl 一起验**：CI 的静态产物在 alpine:3.22（musl）里编，只在本机 glibc 上
 过编译是不够的。本地等价做法是用 alpine-minirootfs 建 chroot（不需要 docker）：

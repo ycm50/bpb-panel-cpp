@@ -37,8 +37,21 @@ bool flag(const json& s, const char* key) {
     return s.contains(key) && s[key].is_boolean() && s[key].get<bool>();
 }
 
+// Numbers arrive as numbers from the panel's own JSON, but a settings.json that
+// went through a form submission can carry them as strings ("count": "5").
+// nlohmann::json::value<int>() throws type_error.302 on those, which used to
+// take a whole subscription down with it, so both spellings are accepted here.
 int num(const json& s, const char* key, int fallback = 0) {
-    if (s.contains(key) && s[key].is_number()) return s[key].get<int>();
+    if (!s.contains(key)) return fallback;
+    const json& v = s[key];
+    if (v.is_number_integer()) return v.get<int>();
+    if (v.is_number()) return static_cast<int>(v.get<double>());
+    if (v.is_string()) {
+        const std::string text = v.get<std::string>();
+        if (text.empty()) return fallback;
+        return std::atoi(text.c_str());
+    }
+    if (v.is_boolean()) return v.get<bool>() ? 1 : 0;
     return fallback;
 }
 
@@ -201,7 +214,12 @@ json build_udp_noises(const json& s) {
             }
             entry["delay"] = noise.value("delay", std::string());
         }
-        int count = noise.value("count", 1);
+        // Through num(): the panel submits numbers but a settings.json that went
+        // through a form round-trip carries them as strings ("count": "5"), and
+        // value<int>() throws on those -- that took the fragment and warp-pro
+        // xray subscriptions down with a 500.
+        int count = num(noise, "count", 1);
+        if (count < 0) count = 0;
         for (int i = 0; i < count; ++i) list.push_back(entry);
     }
     return list;
@@ -235,7 +253,8 @@ json build_final_mask(const json& s, bool is_fragment, bool is_udp_noise, const 
 json build_ws_outbound(const json& s, const std::string& tag, const std::string& protocol,
                        const std::string& address, int port, const std::string& domain,
                        bool is_fragment, const std::string& frag_length = "",
-                       const std::string& frag_interval = "") {
+                       const std::string& frag_interval = "",
+                       const std::string& transport_kind = "ws") {
     std::string upstream_server;
     if (s.contains("upstreamParams") && s["upstreamParams"].is_object()) {
         upstream_server = s["upstreamParams"].value("upstreamServer", std::string());
@@ -244,15 +263,35 @@ json build_ws_outbound(const json& s, const std::string& tag, const std::string&
     auto sni_host = select_sni_host(s, address, domain);
 
     bool enable_ech = flag(s, "enableECH") && !is_fragment;
+    // Transport selection. WebSocket is the default and the only one the panel
+    // has always emitted; XHTTP and gRPC exist because a client blocked on
+    // websocket upgrades sometimes gets through as plain POST/GET or gRPC.
+    // The paths must match what the inbounds mount (see src/inbound/registry.cpp):
+    // XHTTP on "/vlx/<session>", gRPC on "/vlg/Tun".
+    const std::string kind = transport_kind;
     json stream = json::object();
-    stream["network"] = "ws";
-    json transport = build_transport("ws", "", generate_ws_path(protocol, s.value("vlUUID", std::string())) + "?ed=2560", sni_host.host,
-                                     "", "", "");
-    for (auto& [k, v] : transport.items()) stream[k] = v;
+    if (kind == "xhttp" || kind == "splithttp") {
+        stream["network"] = "xhttp";
+        json transport = build_transport("xhttp", "", "/vlx", sni_host.host, "", "packet-up", "");
+        for (auto& [k, v] : transport.items()) stream[k] = v;
+    } else if (kind == "grpc") {
+        stream["network"] = "grpc";
+        json transport = build_transport("grpc", "", "", "", "vlg", "multi", "");
+        for (auto& [k, v] : transport.items()) stream[k] = v;
+    } else {
+        stream["network"] = "ws";
+        json transport = build_transport("ws", "", generate_ws_path(protocol, s.value("vlUUID", std::string())) + "?ed=2560", sni_host.host,
+                                         "", "", "");
+        for (auto& [k, v] : transport.items()) stream[k] = v;
+    }
     stream["security"] = is_tls ? "tls" : "none";
     if (is_tls) {
+        // gRPC rides on HTTP/2 (ALPN h2). Everything else must ask for h1.1: a
+        // client that negotiates h2 for XHTTP would need our server to speak
+        // HTTP/2 for that transport too.
         stream["tlsSettings"] = build_tls_settings(s, sni_host.sni, str(s, "fingerprint", "chrome"),
-                                                   "http/1.1", enable_ech, str(s, "echServerName"));
+                                                   kind == "grpc" ? "h2" : "http/1.1", enable_ech,
+                                                   str(s, "echServerName"));
     }
     stream["sockopt"] = build_sockopt(true, flag(s, "enableTFO"), "UseIP", "");
     json final_mask = build_final_mask(s, is_fragment, false, frag_length, frag_interval);
@@ -966,6 +1005,8 @@ bool build_xray_custom(const json& s, bool is_fragment, std::string& out_json, s
     if (!custom_domain.empty()) domains.push_back(custom_domain);
 
     auto protocols = get_protocols(s);
+    // Websocket plus whichever extra transports the panel switches turned on.
+    const std::vector<std::string> transports = get_transports(s);
 
     std::vector<int> ports;
     if (s.contains("ports") && s["ports"].is_array()) {
@@ -1014,27 +1055,38 @@ bool build_xray_custom(const json& s, bool is_fragment, std::string& out_json, s
                     bool host_is_upstream = (!upstream_server.empty() && host == upstream_server);
                     if (port_is_upstream != host_is_upstream) continue;
 
-                    json outbound = build_ws_outbound(s, "proxy", protocol, host, port, domain, is_fragment);
-                    json proxy = modify_outbound(outbound, "proxy-" + std::to_string(index));
-                    proxies.push_back(proxy);
+                    // One entry per enabled transport. Websocket always comes
+                    // first and keeps the plain remark; the extra ones get a
+                    // suffix so a client's outbound names stay unique.
+                    for (const std::string& tr : transports) {
+                        json outbound = build_ws_outbound(s, "proxy", protocol, host, port, domain,
+                                                          is_fragment, "", "", tr);
+                        json proxy = modify_outbound(outbound, "proxy-" + std::to_string(index));
+                        proxies.push_back(proxy);
 
-                    std::string remark =
-                        generate_remark(s, protocol_index, port, host, protocol, domain, is_fragment, false);
-                    configs.push_back(build_config(s, remark, json::array({outbound}), false, false, false,
-                                                   false, false, {host}));
+                        std::string remark = generate_remark(s, protocol_index, port, host, protocol,
+                                                             domain, is_fragment, false) +
+                                             transport_suffix(tr);
+                        configs.push_back(build_config(s, remark, json::array({outbound}), false,
+                                                       false, false, false, false, {host}));
 
-                    if (!chain_outbound.is_null()) {
-                        std::string chain_remark =
-                            generate_remark(s, protocol_index, port, host, protocol, domain, is_fragment, true);
-                        configs.push_back(build_config(s, chain_remark,
-                                                       json::array({chain_outbound, outbound}), false, true,
-                                                       false, false, false, {host}));
-                        chains.push_back(modify_outbound(chain_outbound, "chain-" + std::to_string(index),
-                                                         "proxy-" + std::to_string(index)));
+                        if (!chain_outbound.is_null()) {
+                            std::string chain_remark =
+                                generate_remark(s, protocol_index, port, host, protocol, domain,
+                                                is_fragment, true) +
+                                transport_suffix(tr);
+                            configs.push_back(build_config(s, chain_remark,
+                                                           json::array({chain_outbound, outbound}),
+                                                           false, true, false, false, false, {host}));
+                            chains.push_back(modify_outbound(chain_outbound,
+                                                             "chain-" + std::to_string(index),
+                                                             "proxy-" + std::to_string(index)));
+                        }
+
+                        ++index;
                     }
 
                     ++protocol_index;
-                    ++index;
                 }
             }
         }

@@ -3,6 +3,8 @@
 #include "app/passwd.h"
 #include "http/http.h"
 #include "inbound/inbound.h"
+#include "inbound/proto/grpc.h"
+#include "inbound/proto/xhttp.h"
 #include "net/http_client.h"
 #include "net/net.h"
 #include "net/wg_outbound.h"
@@ -230,6 +232,32 @@ int main(int argc, char** argv) {
         inbound->serve(fd, ssl, accept_key, req.path, req.header("sec-websocket-protocol"),
                        session_config);
     });
+
+    // XHTTP: the client splits one stream over a long-lived GET (downlink) and a
+    // series of POST chunks (uplink), so those requests own the connection and
+    // must not be answered by the panel.
+#ifdef BPB_HAVE_VLESS_XHTTP
+    // The panel switch is the authority here: a subscription only advertises
+    // XHTTP when enableXHTTP is on, so a client that fetched its config earlier
+    // must not keep a hidden entry point alive after the switch was turned off.
+    server.set_takeover([session_config, &store](bpb::net::socket_t fd, SSL* ssl,
+                                                 const bpb::http::Request& req) {
+        if (!store.enable_xhttp()) return false;
+        return bpb::proxy::xhttp::takeover(fd, ssl, req, session_config, "/vlx");
+    });
+#endif
+
+    // gRPC transport: an HTTP/2 client opens with the connection preface instead
+    // of a request head, so it has to be recognised before the HTTP/1.1 parser
+    // ever runs. Anything that is not HTTP/2 is left to the server untouched.
+#ifdef BPB_HAVE_VLESS_GRPC
+    bpb::proxy::grpc::set_config(session_config);
+    server.set_pre_takeover([session_config, &store](bpb::net::socket_t fd, SSL* ssl,
+                                                     const std::string& buffered) {
+        if (!store.enable_grpc()) return false;
+        return bpb::proxy::grpc::pre_takeover(fd, ssl, buffered, session_config);
+    });
+#endif
 
     if (!tls_cert.empty() && !tls_key.empty()) {
         if (!server.enable_tls(tls_cert, tls_key, error)) {

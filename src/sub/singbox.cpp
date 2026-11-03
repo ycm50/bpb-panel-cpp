@@ -172,7 +172,11 @@ json build_tls(const json& s, const std::string& security, bool is_fragment, boo
     if (!alpn.empty()) {
         std::vector<std::string> alpns;
         for (auto& a : split(alpn, ',')) {
-            if (a != "h2") alpns.push_back(a);
+            // "h2" is dropped for websocket (sing-box then negotiates whatever
+            // the CDN offers), but gRPC *is* HTTP/2 — asking for anything else
+            // makes the client speak h1.1 and the server refuse the stream.
+            if (a == "h2" && alpn != "h2") continue;
+            alpns.push_back(a);
         }
         tls["alpn"] = alpns;
     }
@@ -260,17 +264,23 @@ json build_outbound_base(const std::string& tag, const std::string& type, const 
 
 json build_ws_outbound(const json& s, const std::string& protocol, const std::string& remark,
                        const std::string& address, int port, const std::string& domain,
-                       bool is_fragment) {
+                       bool is_fragment, const std::string& transport_kind = "ws") {
     std::string upstream_server;
     if (s.contains("upstreamParams") && s["upstreamParams"].is_object()) {
         upstream_server = s["upstreamParams"].value("upstreamServer", std::string());
     }
     auto sni_host = select_sni_host(s, address, domain);
-    json transport = build_transport("ws", "none", generate_ws_path(protocol, s.value("vlUUID", std::string())), sni_host.host, "", 2560);
+    const bool is_grpc = (transport_kind == "grpc");
+    json transport =
+        is_grpc
+            ? build_transport("grpc", "", "", "", "vlg", 0)
+            : build_transport("ws", "none",
+                              generate_ws_path(protocol, s.value("vlUUID", std::string())),
+                              sni_host.host, "", 2560);
     bool is_tls = is_https(s, port) || (!upstream_server.empty() && address == upstream_server);
     json tls = is_tls ? build_tls(s, "tls", is_fragment, sni_host.allow_insecure, sni_host.sni,
                                   flag(s, "enableECH") && !is_fragment, str(s, "echServerName"),
-                                  "http/1.1", str(s, "fingerprint", "chrome"))
+                                  is_grpc ? "h2" : "http/1.1", str(s, "fingerprint", "chrome"))
                       : json();
 
     json fields = json::object();
@@ -683,6 +693,7 @@ bool build_sb_custom(const json& s, bool is_fragment, std::string& out_json, std
     if (!custom_domain.empty()) domains.push_back(custom_domain);
 
     auto protocols = get_protocols(s);
+    const std::vector<std::string> transports = get_transports(s);
     std::vector<int> ports;
     if (s.contains("ports") && s["ports"].is_array()) {
         for (auto& p : s["ports"]) {
@@ -732,24 +743,34 @@ bool build_sb_custom(const json& s, bool is_fragment, std::string& out_json, std
                     bool host_is_upstream = (!upstream_server.empty() && host == upstream_server);
                     if (port_is_upstream != host_is_upstream) continue;
 
-                    std::string tag = generate_remark(s, protocol_index, port, host, protocol, domain,
-                                                      is_fragment, false);
-                    outbounds.push_back(build_ws_outbound(s, protocol, tag, host, port, domain, is_fragment));
+                    // One outbound per enabled transport; sing-box has no XHTTP,
+                    // so only gRPC is added on top of the websocket entries.
+                    for (const std::string& tr : transports) {
+                        if (tr == "xhttp") continue;
+                        std::string tag = generate_remark(s, protocol_index, port, host, protocol,
+                                                          domain, is_fragment, false) +
+                                          transport_suffix(tr);
+                        outbounds.push_back(
+                            build_ws_outbound(s, protocol, tag, host, port, domain, is_fragment, tr));
 
-                    for (auto& g : tag_group) {
-                        if (g.first == (is_custom ? best_ping_d : best_ping)) g.second.push_back(tag);
-                    }
-
-                    if (is_chain) {
-                        std::string chain_tag = generate_remark(s, protocol_index, port, host, protocol,
-                                                                domain, is_fragment, true);
-                        json chain = chain_outbound;
-                        chain["tag"] = chain_tag;
-                        chain["detour"] = tag;
-                        outbounds.push_back(chain);
                         for (auto& g : tag_group) {
-                            if (g.first == (is_custom ? best_ping_d_chain : best_ping_chain))
-                                g.second.push_back(chain_tag);
+                            if (g.first == (is_custom ? best_ping_d : best_ping))
+                                g.second.push_back(tag);
+                        }
+
+                        if (is_chain) {
+                            std::string chain_tag =
+                                generate_remark(s, protocol_index, port, host, protocol, domain,
+                                                is_fragment, true) +
+                                transport_suffix(tr);
+                            json chain = chain_outbound;
+                            chain["tag"] = chain_tag;
+                            chain["detour"] = tag;
+                            outbounds.push_back(chain);
+                            for (auto& g : tag_group) {
+                                if (g.first == (is_custom ? best_ping_d_chain : best_ping_chain))
+                                    g.second.push_back(chain_tag);
+                            }
                         }
                     }
                     ++protocol_index;

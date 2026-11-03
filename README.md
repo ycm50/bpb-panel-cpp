@@ -111,8 +111,8 @@ Cloudflare Tunnel 客户端。**服务端没有任何 JavaScript/TypeScript**，
 
 ### Docker
 
-    docker build -t bpb-native:1.0.0 .
-    docker run -d --name bpb -p 8080:8080 -v bpb-data:/data bpb-native:1.0.0
+    docker build -t bpb-native:1.0.2 .
+    docker run -d --name bpb -p 8080:8080 -v bpb-data:/data bpb-native:1.0.2
 
 打开 <http://localhost:8080/securepath/panel>。
 
@@ -228,10 +228,14 @@ Cloudflare Tunnel 客户端。**服务端没有任何 JavaScript/TypeScript**，
 各入栈协议是**独立源文件**，用 CMake 选项选择编哪些，没选中的**不参与编译**
 （不是运行时关掉，是根本不进二进制）：
 
-    -DBPB_INBOUNDS=vless                只编 VLESS
+    -DBPB_INBOUNDS=vless                只编 VLESS（连带编入 XHTTP，见下）
     -DBPB_INBOUNDS=vless,trojan         指定组合
-    -DBPB_INBOUNDS=all                  全部
-    # 配置期会打印： -- bpb inbounds: vless;trojan;shadowsocks;vmess
+    -DBPB_INBOUNDS=all                  全部：六个二进制协议全部编入
+    # 配置期会打印运行时列表，并写进 build/expected-inbounds.txt：
+    #   -- bpb inbounds: vless,trojan,shadowsocks,vmess,vless-xhttp,vless-grpc
+
+XHTTP 是**传输绑定**而不是独立协议：它的源码跟着 VLESS 一起编，所以 `-DBPB_INBOUNDS=vless`
+的启动行是 `inbounds: vless,vless-xhttp`。gRPC 则是独立选项。
 
 | 协议 | 路径 | 说明 |
 |---|---|---|
@@ -249,7 +253,7 @@ Cloudflare Tunnel 客户端。**服务端没有任何 JavaScript/TypeScript**，
 
 启动日志（需要 `--log info`）会写实际编入的协议：
 
-    bpb native listening on http://0.0.0.0:8080 (secure path: /securepath/, inbounds: vless,trojan,shadowsocks,vmess)
+    bpb native listening on http://0.0.0.0:8080 (secure path: /securepath/, inbounds: vless,trojan,shadowsocks,vmess,vless-xhttp,vless-grpc)
 
 面板资源已编译进二进制，**单独一个可执行文件就能跑**。
 
@@ -428,6 +432,51 @@ TLS 端口会带 `tls=tls` 加 `sni/alpn/fp`，明文端口 `tls` 留空。
 - 会话结束时发送 RFC 6455 close 帧（1000 normal），否则客户端报
   `close 1006 (abnormal closure)`
 
+## 传输方式：WebSocket / XHTTP / gRPC
+
+同一个 VLESS 会话可以跑在三种传输上。面板「通用」区有两个开关 **XHTTP** 和 **gRPC**，默认都关；
+打开一个就**多生成一份**该传输的配置，WebSocket 那份始终保留 —— 关掉开关不会让客户端没得用，
+打开开关也不会顶掉最通用的那一条。订阅里每个主机因此有 `1 + 开着的传输数` 条线路，
+备注后缀 ` XHTTP` / ` gRPC` 用来区分。
+
+| 传输 | 开关 | 客户端 streamSettings | 服务端入口 | 适用 |
+|---|---|---|---|---|
+| WebSocket（始终有） | — | `network:ws` + `wsSettings.path` | `/vl` 升级 | 最通用 |
+| XHTTP（SplitHTTP） | `enableXHTTP` | `network:xhttp` + `xhttpSettings{path:/vlx, mode:packet-up}` | `GET /vlx/<sid>`（下行）+ `POST /vlx/<sid>/<seq>`（上行） | 长连接被干扰、只放行普通 POST/GET 的网络 |
+| gRPC | `enableGRPC` | `network:grpc` + `grpcSettings{serviceName:vlg}` | `/vlg/Tun`（HTTP/2 bidi stream） | 只放行 HTTP/2 的网络 |
+
+这两个新传输都不是 WebSocket 协议：连接由 HTTP 服务端的钩子接管，而不是走升级流程 ——
+`set_takeover` 拿走 XHTTP 的下行 GET，`set_pre_takeover` 在 HTTP/1.1 解析之前认出 `PRI * HTTP/2.0` 前言。
+
+**开关同时管服务端**：关掉 `enableXHTTP` / `enableGRPC` 后，对应入口直接返回 `false`（XHTTP 的请求
+落回面板 404，h2 前言不再被接管），旧订阅里残留的地址不会变成一个隐藏入口。订阅生成侧还会再按
+`bpb::inbound::all()` 过滤一次：二进制里没编进 `vless-xhttp` / `vless-grpc` 时，开关打开也不会生成。
+
+各客户端支持度不同，生成器按能力取舍：
+
+- **Xray / v2rayN / sing-box raw**：三种都给（share link 为 `type=xhttp&path=/vlx&mode=packet-up`、
+  `type=grpc&serviceName=vlg&alpn=h2`）；
+- **Clash.Meta / sing-box**：只给 WebSocket + gRPC，**没有 XHTTP**（两者都没有这个传输，写进去只会导入失败）。
+
+## 传输实现要点（踩坑记录）
+
+- **gRPC 的消息体不是裸字节**：每条 message = `1B 压缩标志 + 4B 大端长度 + protobuf Hunk{0A varint(data)}`，
+  剥离后才是 VLESS 字节流；发送方向同样要包成 Hunk。message 边界与协议边界无关，必须当字节流重拼。
+- **gRPC 结束必须发 trailing HEADERS + `grpc-status: 0` + END_STREAM**，否则客户端报
+  server closed the stream without sending trailers，即使数据已经传完。
+- **一条 TCP 要承载多条 stream**（一个 stream 一个会话）。`MAX_CONCURRENT_STREAMS` 给小了会让客户端
+  排队而不是报错，表现为莫名卡死；本项目设 256。
+- **HPACK**：服务端宣告 `SETTINGS_HEADER_TABLE_SIZE=0` 可以合法关掉动态表，但 Huffman 解码躲不掉；
+  位流不足时不能当成输入结束（首个实现就因此在字节边界截断 `:path`，客户端一路 404）。
+- **XHTTP 的 seq 会乱序**（HTTP/2 下每 chunk 一个 goroutine）：按 seq 重排、重复 seq 丢弃、同一会话只允许一个下行 reader；
+  POST 可能先于 GET 到达，必须先缓冲。
+- **会话生命周期与 TCP 连接解耦**：客户端会复用连接（默认 3 条、每条几百次请求），一条连接断开不等于会话结束。
+- **PING 必须原样回 8 字节 payload**：不回，客户端 BDP 不增长，吞吐锁死在 64 KB/RTT。
+- **XHTTP 的每会话成本比 WebSocket 高一个数量级**（实测 1018 kB vs 82 kB）：它要同时持有下行 GET、
+  乱序缓存和上行队列。gRPC 则相反，一条 TCP 承载全部 stream，30 并发只多 100 kB。
+  开关本身不花内存，真正花钱的是流量真的走上去之后。
+
+
 ## WARP 出口
 
 出口就是把 VLESS 会话的上游连接接进 WARP。两种后端，面板接口完全一致：
@@ -439,7 +488,7 @@ TLS 端口会带 `tls=tls` 加 `sni/alpn/fp`，明文端口 `tls` 留空。
 
 另有 **侧车容器**（整机出网，需 `NET_ADMIN`）：
 
-    docker run --rm -v "$PWD/data:/data" -v "$PWD/warp:/out" bpb-native:1.0.0 \
+    docker run --rm -v "$PWD/data:/data" -v "$PWD/warp:/out" bpb-native:1.0.2 \
       --export-warp /out/wg0.conf --data /data
     docker compose -f docker-compose.warp.yml up -d --build
 

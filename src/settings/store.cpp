@@ -18,6 +18,8 @@ static const char* kDefaultKvJson = R"({
   "logLevel": "warning",
   "customDomain": "",
   "protocols": "vless",
+  "enableXHTTP": false,
+  "enableGRPC": false,
   "remoteDNS": "https://8.8.8.8/dns-query",
   "remoteDnsHost": { "isDomain": false, "host": "8.8.8.8", "ipv4": [], "ipv6": [] },
   "upstreamProxy": "",
@@ -101,7 +103,7 @@ static const char* kDefaultKvJson = R"({
   "customBlockRules": [],
   "customBypassSanctionRules": [],
   "remoteSettings": "",
-  "panelVersion": "1.0.0"
+  "panelVersion": "1.0.2"
 })";
 
 nlohmann::json Store::default_kv() {
@@ -212,10 +214,15 @@ bool Store::load(const std::string& dir, std::string& error) {
     }
 
     if (secret_.empty()) secret_ = crypto::random_hex(32);
+
+    // Publish the transport switches for the connection handlers, which run on
+    // other threads and must not read kv_ while the panel writes it.
+    set_transport_switches(kv_.value("enableXHTTP", false), kv_.value("enableGRPC", false));
     return true;
 }
 
 bool Store::save(std::string& error) {
+    set_transport_switches(kv_.value("enableXHTTP", false), kv_.value("enableGRPC", false));
     nlohmann::json j;
     j["proxySettings"] = kv_;
     j["telegramBot"] = telegram_;

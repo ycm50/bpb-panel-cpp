@@ -163,6 +163,26 @@ std::vector<std::string> get_protocols(const nlohmann::json& s) {
     return out;
 }
 
+std::vector<std::string> get_transports(const nlohmann::json& s) {
+    // WebSocket is unconditional: it is what this project has always emitted and
+    // what the panel's "default" answer means. The other two are opt-in switches
+    // because a client that does not understand them silently fails to connect,
+    // and because the inbounds may not even be compiled into this binary.
+    std::vector<std::string> out{"ws"};
+    auto enabled = [&](const char* key) {
+        return s.contains(key) && s[key].is_boolean() && s[key].get<bool>();
+    };
+    if (enabled("enableXHTTP") && inbound::has("vless-xhttp")) out.push_back("xhttp");
+    if (enabled("enableGRPC") && inbound::has("vless-grpc")) out.push_back("grpc");
+    return out;
+}
+
+std::string transport_suffix(const std::string& transport) {
+    if (transport == "xhttp") return " XHTTP";
+    if (transport == "grpc") return " gRPC";
+    return "";
+}
+
 struct CachedDns {
     DnsResult result;
     std::int64_t expires_at = 0;
@@ -174,6 +194,15 @@ static std::map<std::string, CachedDns>& dns_cache() {
 }
 
 bool resolve_dns(const std::string& domain, bool only_ipv4, DnsResult& out, std::string& error) {
+    // A literal address or a loopback name has nothing to resolve. Sending it to
+    // DoH used to fail the whole subscription on a box with no outbound DNS (a
+    // fresh panel defaults mainDomain to "localhost"), which made every
+    // subscription return 500 even though the answer was already known.
+    if (domain.empty() || is_ipv4(domain) || is_ipv6(domain) || domain == "localhost" ||
+        ends_with(domain, ".localhost")) {
+        out = DnsResult{};
+        return true;
+    }
     std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
     std::string cache_key = domain + (only_ipv4 ? "|4" : "|46");
     auto& cache = dns_cache();

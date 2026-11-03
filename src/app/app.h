@@ -50,7 +50,7 @@ private:
 
     Store& store_;
     std::string asset_dir_;
-    std::string version_ = "1.0.0";
+    std::string version_ = "1.0.2";
 };
 
 } // namespace bpb

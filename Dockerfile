@@ -1,9 +1,9 @@
 # Build (deployment image):
-#   docker build -t bpb-native:1.0.0 .
+#   docker build -t bpb-native:1.0.2 .
 #   # optional local speed-up: reuse a pre-built toolchain image
-#   docker build --build-arg BASE=bpb-buildenv:base -t bpb-native:1.0.0 .
+#   docker build --build-arg BASE=bpb-buildenv:base -t bpb-native:1.0.2 .
 # Run:
-#   docker run -d -p 8080:8080 -v bpb-data:/data bpb-native:1.0.0
+#   docker run -d -p 8080:8080 -v bpb-data:/data bpb-native:1.0.2
 ARG BASE=alpine:3.22
 FROM ${BASE} AS build
 

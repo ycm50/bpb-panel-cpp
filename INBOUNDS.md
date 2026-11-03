@@ -153,14 +153,15 @@ README 的性能实测一致。
 
 CMake 选项（未选中的协议**不参与编译**）：
 
-    -DBPB_INBOUNDS=vless            只编 VLESS
+    -DBPB_INBOUNDS=vless            只编 VLESS（连带 XHTTP 传输）
     -DBPB_INBOUNDS=vless,trojan     指定组合
     -DBPB_INBOUNDS=all              全部（= BPB_ALL_INBOUNDS）
-    # 配置期会打印： -- bpb inbounds: vless;trojan;shadowsocks
+    # 配置期会打印运行时列表，并写进 build/expected-inbounds.txt：
+    #   -- bpb inbounds: vless,trojan,shadowsocks,vmess,vless-xhttp,vless-grpc
 
 启动日志会写实际编入的协议（`--log info` 才有）：
 
-    bpb native listening on http://0.0.0.0:8080 (secure path: /securepath/, inbounds: vless,trojan,shadowsocks)
+    bpb native listening on http://0.0.0.0:8080 (secure path: /securepath/, inbounds: vless,trojan,shadowsocks,vmess,vless-xhttp,vless-grpc)
 
 面板与订阅跟着编译期清单走：
 

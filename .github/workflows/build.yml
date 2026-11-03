@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "发布 tag（必须等全部构建成功后才会创建或覆盖），例如 v1.0.0"
+        description: "发布 tag（必须等全部构建成功后才会创建或覆盖），例如 v1.0.2"
         required: true
         type: string
       protocols:
@@ -23,12 +23,19 @@ on:
         type: choice
         # 与 CMakeLists.txt 的 BPB_ALL_INBOUNDS 保持一致；plan 会再校验一次，
         # 选了清单外的协议直接报错。
+        #
+        # 注意 vless-xhttp / vless-grpc 是“传输绑定”，不是独立的 websocket 协议：
+        # 选 vless 会连带编入 vless-xhttp（所以那个二进制的启动行是
+        # "inbounds: vless,vless-xhttp"），CI 的校验以 CMake 生成的
+        # expected-inbounds.txt 为准，不再假设“选什么就只编什么”。
         options:
           - all
           - vless
           - trojan
           - shadowsocks
           - vmess
+          - vless-xhttp
+          - vless-grpc
 
 # 手动发布不允许被"再点一次 Run"掐断：同一个 ref 的第二次手动触发会让旧的
 # 运行直接失败（哪怕它已经编完一半），所以这里必须是 false。
@@ -131,6 +138,9 @@ jobs:
               cmake --build /tmp/b
               strip /tmp/b/bpb
               cp /tmp/b/bpb dist/bpb-linux-${{ matrix.arch }}-${{ matrix.protocol }}
+              # The verify step compares the startup line against this file: the
+              # runtime inbound list is not always the selection (see CMakeLists).
+              cp /tmp/b/expected-inbounds.txt dist/expected-inbounds.txt
             '
           ls -l dist
 
@@ -160,9 +170,16 @@ jobs:
               # list is what sits between 'inbounds: ' and the closing paren.
               # An anchored grep for 'inbounds: vless$' can never match, which is
               # what made every Linux build in this matrix fail.
-              inb=\$(sed -n 's/.*inbounds: \([^)]*\).*/\1/p' /tmp/log.txt)
-              [ "\$inb" = '${{ matrix.protocol }}' ] \
-                || { echo '::error::built-in inbounds are not exactly ${{ matrix.protocol }} (see log below)'; cat /tmp/log.txt; exit 1; }
+              #
+              # The expected list is NOT the selection: CMake compiles the XHTTP
+              # transport together with VLESS, so -DBPB_INBOUNDS=vless serves
+              # 'vless,vless-xhttp'. CMake writes the exact startup list to
+              # expected-inbounds.txt, mounted next to the binary, so this check
+              # compares against the truth instead of re-deriving the rule.
+              inb=\$(sed -n 's/.*inbounds: \([^)]*\\).*/\1/p' /tmp/log.txt)
+              want=\$(cat /dist/expected-inbounds.txt)
+              [ "\$inb" = "\$want" ] \
+                || { echo "::error::built-in inbounds are '\$inb' in a '\$want' build (see log below)"; cat /tmp/log.txt; exit 1; }
               echo 'inbound set OK'
             "
 
@@ -229,11 +246,15 @@ jobs:
             fi
           done
           kill $pid 2>/dev/null || true
-          # Same strict check as Linux: the log line is "... inbounds: vless)",
-          # so compare the whole protocol list, not a substring.
-          inb=$(sed -n 's/.*inbounds: \([^)]*\).*/\1/p' smoke.log)
-          [ "$inb" = '${{ matrix.protocol }}' ] \
-            || { echo "::error::built-in inbounds are '$inb', expected '${{ matrix.protocol }}'"; cat smoke.log; exit 1; }
+          # Same check as Linux: the log line is "... inbounds: vless)", so
+          # compare the whole protocol list, not a substring. The expectation
+          # comes from CMake (expected-inbounds.txt) because the runtime list is
+          # not always the selection: -DBPB_INBOUNDS=vless also serves the XHTTP
+          # transport, so it reports "vless,vless-xhttp".
+          inb=\$(sed -n 's/.*inbounds: \([^)]*\\).*/\1/p' smoke.log)
+          want=\$(tr -d '\r' < build/expected-inbounds.txt)
+          [ "\$inb" = "\$want" ] \
+            || { echo "::error::built-in inbounds are '\$inb', expected '\$want'"; cat smoke.log; exit 1; }
           echo 'inbound set OK'
 
       - uses: actions/upload-artifact@v4
