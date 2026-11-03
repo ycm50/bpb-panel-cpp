@@ -272,6 +272,11 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
         // hostnames used to come back empty.
         bool endSeen = false;
         bool responded = false;    // origin head already relayed
+        // The origin answered without a content-length: the body length is
+        // unknown up front and the reply is a live stream (SSE, and the XHTTP
+        // downlink). The request side finishing must not half-close the origin
+        // for these -- see the endFromEdge guard in the pump.
+        bool streamedResponse = false;
         bool failed = false;       // origin unreachable
         bool headSeen = false;
         std::uint64_t upBytes = 0;   // origin -> edge
@@ -458,7 +463,16 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
                 std::string ln = name;
                 for (auto& c : ln) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
                 if (ln == "content-length") { contentLength = value; haveLength = true; }
-                if (ln == "transfer-encoding" || ln == "proxy-connection") continue;
+                // Connection-specific fields (RFC 7230 s6.1) must not be relayed:
+                // the edge reconstructs HTTP/1 headers from these, and an HTTP/2
+                // stream that carries transfer-encoding is a protocol error --
+                // the edge answered RST_STREAM(CANCEL) and the eyeball saw no
+                // response at all. Framing is implied by a missing content-length
+                // (see streamedResponse), exactly like xray's own hub, whose GET
+                // reply sets only Content-Type/Cache-Control/X-Accel-Buffering.
+                if (ln == "transfer-encoding" || ln == "proxy-connection" ||
+                    ln == "connection" || ln == "keep-alive")
+                    continue;
                 userHeaders.emplace_back(name, value);
             }
         }
@@ -485,6 +499,7 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
         std::string statusOut = (statusCode == 101) ? "200" : std::to_string(statusCode);
 
         std::vector<std::pair<std::string, std::string>> h2hdrs;
+        s.streamedResponse = !haveLength;
         if (haveLength) h2hdrs.emplace_back("content-length", contentLength);
         for (auto& kv : userHeaders) {
             std::string ln = kv.first;
@@ -735,6 +750,14 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
                 s.edgeDone = false;
                 s.originDone = true;
             }
+            // A response that carries no length is a live stream (SSE/XHTTP
+            // downlink): the request side finishing says nothing about the
+            // reply. Half-closing the origin here made the origin's chunked
+            // writer see EOF and retire the stream immediately, so the edge
+            // relayed our HEADERS to nobody and the client timed out with no
+            // bytes at all. cloudflared never half-closes such a connection
+            // either -- it just keeps relaying until the origin finishes.
+            if (s.streamedResponse && s.endFromEdge) s.endFromEdge = false;
             if (s.endFromEdge && s.origin->requestSent() && !s.origin->hasPendingOutput()) {
                 // Everything the edge sent has reached the origin; now it may
                 // see end-of-request while we keep reading its reply. Wait for

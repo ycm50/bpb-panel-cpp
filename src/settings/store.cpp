@@ -22,7 +22,6 @@ static const char* kDefaultKvJson = R"({
   "enableGRPC": false,
   "remoteDNS": "https://8.8.8.8/dns-query",
   "remoteDnsHost": { "isDomain": false, "host": "8.8.8.8", "ipv4": [], "ipv6": [] },
-  "upstreamProxy": "",
   "upstreamParams": { "upstreamServer": "", "upstreamPort": 0 },
   "chainProxy": "",
   "chainProxyParams": {},
@@ -36,7 +35,6 @@ static const char* kDefaultKvJson = R"({
   "customCdnAddrs": [],
   "customCdnHost": "",
   "customCdnSni": "",
-  "fragmentMode": "custom",
   "fragmentPackets": "tlshello",
   "fragmentLengthMin": 100,
   "fragmentLengthMax": 200,
@@ -53,10 +51,12 @@ static const char* kDefaultKvJson = R"({
   "warpRegisterDryRun": true,
   "wgOutbound": {
     "enabled": false,
-    "endpoint": "162.159.192.1:2408",
-    "mtu": 1200,
-    "keepalive": 25,
-    "useWarpAccount": true
+    "binary": "",
+    "bindHost": "127.0.0.1",
+    "socksPort": 11080,
+    "dataDir": "",
+    "mtu": 1280,
+    "maxConnections": 0
   },
   "cfTunnel": {
     "enabled": false,
@@ -196,7 +196,6 @@ bool Store::load(const std::string& dir, std::string& error) {
                     if (kv_.contains(it.key())) kv_[it.key()] = it.value();
                 }
             }
-            if (j.contains("telegramBot") && j["telegramBot"].is_object()) telegram_ = j["telegramBot"];
             if (j.contains("warpAccounts") && j["warpAccounts"].is_array()) warps_ = j["warpAccounts"];
             if (j.contains("pwd") && j["pwd"].is_string()) pwd_ = j["pwd"].get<std::string>();
             if (j.contains("secretKey") && j["secretKey"].is_string()) secret_ = j["secretKey"].get<std::string>();
@@ -225,7 +224,6 @@ bool Store::save(std::string& error) {
     set_transport_switches(kv_.value("enableXHTTP", false), kv_.value("enableGRPC", false));
     nlohmann::json j;
     j["proxySettings"] = kv_;
-    j["telegramBot"] = telegram_;
     j["warpAccounts"] = warps_;
     j["pwd"] = pwd_;
     j["secretKey"] = secret_;
@@ -262,7 +260,9 @@ nlohmann::json Store::merged() const {
     if (out.contains("wgOutbound") && out["wgOutbound"].is_object()) {
         const auto& wg = out["wgOutbound"];
         out["wgOutboundEnabled"] = wg.value("enabled", false) ? "true" : "false";
-        out["wgOutboundEndpoint"] = wg.value("endpoint", std::string{});
+        const std::string bh = wg.value("bindHost", std::string{"127.0.0.1"});
+        const int sp = wg.value("socksPort", 11080);
+        out["wgOutboundSocks"] = bh + ":" + std::to_string(sp);
     }
     if (out.contains("cfTunnel") && out["cfTunnel"].is_object()) {
         const auto& ct = out["cfTunnel"];

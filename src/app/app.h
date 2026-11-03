@@ -25,6 +25,8 @@ private:
 
     http::Response panel_settings();
     http::Response update_settings(const http::Request& req);
+    http::Response import_raw_files(const http::Request& req);
+    http::Response list_raw_files();
     http::Response reset_settings();
     http::Response reset_password(const http::Request& req);
     http::Response login(const http::Request& req);
@@ -34,11 +36,6 @@ private:
     http::Response doh(const http::Request& req);
     http::Response qrcode(const http::Request& req);
     http::Response my_ip(const http::Request& req);
-    http::Response telegram_setup(const http::Request& req);
-    http::Response telegram_remove(const http::Request& req);
-    http::Response telegram_webhook(const http::Request& req);
-    std::string telegram_api(const std::string& token, const std::string& method,
-                             const std::string& body, std::string& error);
 
     // Reads a page from disk on every request: the panel is served straight
     // from <data>/assets, so an edit shows up on the next refresh without a

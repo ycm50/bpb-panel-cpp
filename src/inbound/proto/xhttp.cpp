@@ -258,12 +258,17 @@ bool peek_head(const std::string& pend, MiniRequest& out, std::size_t& head_len,
 }
 
 const char kOkReply[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nCache-Control: no-store\r\n\r\nok";
+// The downlink head must not announce "Connection: close". Cloudflare's edge
+// treats a close-delimited stream as something it can only forward once the
+// body is complete, so the head is withheld until the last chunk -- the client
+// sees a request that never answers and reports the node as unreachable. Xray's
+// own hub sends exactly this set of headers and no Connection header at all.
+// "Transfer-Encoding: chunked" has to stay: the stream is open-ended.
 const char kDownlinkHead[] = "HTTP/1.1 200 OK\r\n"
                              "Content-Type: text/event-stream\r\n"
                              "Cache-Control: no-store\r\n"
                              "X-Accel-Buffering: no\r\n"
                              "Transfer-Encoding: chunked\r\n"
-                             "Connection: close\r\n"
                              "\r\n";
 
 void reply_and_close(SSL* ssl, net::socket_t fd, const char* status) {

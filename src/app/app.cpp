@@ -109,7 +109,7 @@ bool App::extract_assets(const std::string& dir, std::string& error) {
     return true;
 }
 
-// Native build has no Cloudflare account/analytics/telegram integration: hide
+// Native build has no Cloudflare account/analytics integration: hide
 // those controls with CSS only, so the browser-side script keeps running
 // against the elements it expects to exist.
 static const char* kNativeHideCss =
@@ -259,7 +259,6 @@ http::Response App::logout() {
 http::Response App::panel_settings() {
     nlohmann::json body;
     body["proxySettings"] = store_.merged();
-    body["telegramSettings"] = store_.telegram();
     body["subscriptions"] = nlohmann::json::parse(R"({
       "normal": {"label":"Normal","categories":[
         {"core":"xray","clients":["v2rayNG","MahsaNG","Streisand"]},
@@ -312,6 +311,91 @@ http::Response App::panel_settings() {
     return json_ok(body);
 }
 
+// The panel's "外部原始配置" section writes the data-directory files verbatim
+// instead of pretending to merge them into the generated subscriptions: there is
+// no consumer for free-form extra configs, and a half-parsed merge only produced
+// entries that never reached a client. An explicit whitelist keeps this from
+// becoming an arbitrary write primitive -- the names below are exactly what
+// lives in <data>.
+namespace {
+
+struct RawFileSpec {
+    const char* name;
+    bool restart_required;
+};
+
+// settings.json is deliberately absent: it is the panel's own state and is
+// rewritten on every save, so writing it here would silently lose the values
+// the form just posted. These four are the files a user may legitimately want
+// to replace by hand.
+const RawFileSpec kRawFiles[] = {
+    {"config.json", true},
+    {"passwd", true},
+    {"tunnel-quick.json", true},
+};
+
+const RawFileSpec* raw_file_spec(const std::string& name) {
+    for (const auto& s : kRawFiles) {
+        if (name == s.name) return &s;
+    }
+    return nullptr;
+}
+
+} // namespace
+
+http::Response App::list_raw_files() {
+    nlohmann::json files = nlohmann::json::array();
+    const std::string dir = store_.dir();
+    for (const auto& spec : kRawFiles) {
+        nlohmann::json entry = {{"name", spec.name}, {"present", false}, {"size", 0}};
+        std::error_code ec;
+        const std::string path = dir + "/" + spec.name;
+        if (std::filesystem::exists(path, ec) && !ec) {
+            entry["present"] = true;
+            entry["size"] = static_cast<std::uint64_t>(std::filesystem::file_size(path, ec));
+        }
+        files.push_back(entry);
+    }
+    nlohmann::json body;
+    body["files"] = files;
+    body["dir"] = dir;
+    return json_ok(body);
+}
+
+http::Response App::import_raw_files(const http::Request& req) {
+    if (req.method != "PUT") return json_err(405, "请求方法不允许。");
+    nlohmann::json data;
+    try {
+        data = nlohmann::json::parse(req.body);
+    } catch (...) {
+        return json_err(400, "请求体不是合法 JSON。");
+    }
+    if (!data.contains("files") || !data["files"].is_object())
+        return json_err(400, "缺少 files 字段。");
+
+    nlohmann::json written = nlohmann::json::array();
+    for (auto it = data["files"].begin(); it != data["files"].end(); ++it) {
+        const std::string name = it.key();
+        const RawFileSpec* spec = raw_file_spec(name);
+        if (!spec) return json_err(400, "不允许写入的文件：" + name);
+        if (!it.value().is_string()) return json_err(400, name + " 的内容必须是字符串。");
+        const std::string content = it.value().get<std::string>();
+        // A JSON file that does not parse is almost certainly a mistake, and
+        // writing it would leave the process unable to start. Validate before
+        // touching the real file.
+        if (name.size() > 5 && name.compare(name.size() - 5, 5, ".json") == 0) {
+            const nlohmann::json probe = nlohmann::json::parse(content, nullptr, false);
+            if (probe.is_discarded()) return json_err(400, name + " 不是合法 JSON，已放弃写入。");
+        }
+        if (!write_file(store_.dir() + "/" + name, content))
+            return json_err(500, "写入 " + name + " 失败。");
+        written.push_back(name);
+    }
+    nlohmann::json body;
+    body["written"] = written;
+    body["note"] = "文件已覆盖，重启进程后生效。";
+    return json_ok(body);
+}
 http::Response App::update_settings(const http::Request& req) {
     if (req.method != "PUT") return json_err(405, "请求方法不允许。");
     nlohmann::json data;
@@ -385,6 +469,17 @@ http::Response App::update_settings(const http::Request& req) {
                                    ? "true"
                                    : "false");
         ct["enabled"] = (v == "true");
+    }
+    // The tunnel and the two extra transports are mutually exclusive, and this is
+    // the authoritative place to enforce it: the edge rewrites every request into
+    // a plain HTTP/1.1 round trip, so a gRPC h2c preface never arrives and an XHTTP
+    // downlink is reset (RST_STREAM CANCEL) before its first byte. Only the
+    // WebSocket upgrade is passed through. The panel disables the pair when the
+    // tunnel is on, but a stale tab or a direct API call could still post them
+    // together, so the tunnel wins here and the switches are stored off.
+    if (ct["enabled"].is_boolean() && ct["enabled"].get<bool>()) {
+        kv["enableXHTTP"] = false;
+        kv["enableGRPC"] = false;
     }
     if (data.contains("cfTunnelToken") && data["cfTunnelToken"].is_string()) {
         std::string v = data["cfTunnelToken"].get<std::string>();
@@ -474,20 +569,6 @@ http::Response App::reset_password(const http::Request& req) {
     return json_ok(nullptr);
 }
 
-std::string App::telegram_api(const std::string& token, const std::string& method,
-                              const std::string& body, std::string& error) {
-    std::string url = "https://api.telegram.org/bot" + token + "/" + method;
-    net::httpc::Response res;
-    if (body.empty()) {
-        if (!net::httpc::get(url, res, error, 10000, {})) return "";
-    } else {
-        if (!net::httpc::post(url, body, res, error, 10000,
-                              {{"Content-Type", "application/json"}}))
-            return "";
-    }
-    return res.body;
-}
-
 http::Response App::my_ip(const http::Request& req) {
     std::string ip = trim(req.body);
     if (ip.empty()) return json_err(400, "缺少 IP 地址。");
@@ -502,106 +583,6 @@ http::Response App::my_ip(const http::Request& req) {
     } catch (...) {
         return json_err(502, "ip-api.com 返回内容无法解析");
     }
-}
-
-http::Response App::telegram_setup(const http::Request& req) {
-    if (req.method != "PUT") return json_err(405, "请求方法不允许。");
-    if (!authenticated(req)) return json_err(401, "未授权或会话已过期。");
-    nlohmann::json data;
-    try {
-        data = nlohmann::json::parse(req.body);
-    } catch (...) {
-        return json_err(400, "请求体不是合法 JSON。");
-    }
-    std::string token = trim(data.value("telegramBotToken", std::string()));
-    std::string user_id = trim(data.value("telegramUserId", std::string()));
-    if (token.empty() || user_id.empty()) return json_err(400, "缺少 Bot 信息。");
-
-    std::string host = req.header("host");
-    std::string base = store_.config().mainDomain.empty() || store_.config().mainDomain == "localhost"
-                           ? host
-                           : store_.config().mainDomain;
-    if (base.empty()) base = "localhost";
-    std::string webhook = "https://" + host + "/" + store_.config().securePath + "/telegram/webhook";
-
-    std::string error;
-    std::string body = telegram_api(token, "setWebhook?url=" + url_encode(webhook), "", error);
-    if (body.empty()) return json_err(500, "Telegram setWebhook 失败： " + error);
-
-    nlohmann::json commands = {
-        {"commands", nlohmann::json::array({{{"command", "start"}, {"description", "ð¤ Show welcome menu"}},
-                                            {{"command", "config"}, {"description", "ð Get configs"}},
-                                            {{"command", "clients"}, {"description", "ð± Get supported clients"}},
-                                            {{"command", "usage"}, {"description", "ð Monitor usage"}}})}};
-    telegram_api(token, "setMyCommands", commands.dump(), error);
-
-    store_.telegram()["telegramBotToken"] = token;
-    store_.telegram()["telegramUserId"] = user_id;
-    if (!store_.save(error)) return json_err(500, error);
-    return json_ok(store_.telegram());
-}
-
-http::Response App::telegram_remove(const http::Request& req) {
-    if (req.method != "POST") return json_err(405, "请求方法不允许。");
-    if (!authenticated(req)) return json_err(401, "未授权或会话已过期。");
-    std::string token = store_.telegram().value("telegramBotToken", std::string());
-    std::string error;
-    if (!token.empty()) {
-        telegram_api(token, "deleteWebhook", R"({"drop_pending_updates":true})", error);
-    }
-    store_.telegram()["telegramBotToken"] = "";
-    store_.telegram()["telegramUserId"] = "";
-    if (!store_.save(error)) return json_err(500, error);
-    return json_ok(store_.telegram());
-}
-
-http::Response App::telegram_webhook(const http::Request& req) {
-    if (req.method != "POST") return json_err(405, "请求方法不允许。");
-    nlohmann::json update;
-    try {
-        update = nlohmann::json::parse(req.body);
-    } catch (...) {
-        return json_err(400, "请求体不是合法 JSON。");
-    }
-    if (!update.contains("message") || !update["message"].is_object()) return json_ok(nullptr);
-    auto& msg = update["message"];
-    std::int64_t from_id = 0;
-    if (msg.contains("from") && msg["from"].is_object()) from_id = msg["from"].value("id", (std::int64_t)0);
-    std::int64_t chat_id = msg.contains("chat") && msg["chat"].is_object()
-                               ? msg["chat"].value("id", (std::int64_t)0)
-                               : 0;
-    std::string text = msg.value("text", std::string());
-    std::string expected = store_.telegram().value("telegramUserId", std::string());
-    std::string token = store_.telegram().value("telegramBotToken", std::string());
-    if (token.empty() || chat_id == 0) return json_ok(nullptr);
-    if (!expected.empty() && std::to_string(from_id) != expected) return json_ok(nullptr);
-
-    std::string reply;
-    std::string host = req.header("host");
-    std::string origin = "https://" + host + "/" + store_.config().securePath + "/sub";
-    if (text == "/start") {
-        reply = "\xF0\x9F\xA4\x96 BPB native bot\n/start - this menu\n/config - subscription links\n/clients - supported clients\n/usage - usage statistics";
-    } else if (text == "/config") {
-        std::vector<std::string> lines;
-        for (auto& [kind, client] : std::vector<std::pair<std::string, std::string>>{
-                 {"normal", "xray"}, {"normal", "sing-box"}, {"normal", "clash"}, {"raw", "xray"},
-                 {"warp", "wireguard"}}) {
-            lines.push_back(kind + " (" + client + "): " + origin + "/" + kind + "?app=" + client);
-        }
-        reply = join_lines(lines);
-    } else if (text == "/clients") {
-        reply = "v2rayNG, v2rayN, MahsaNG, Streisand, sing-box, husi, NekoBox, Hiddink, Clash Meta, "
-                "Clash Verge, FlClash, Stash, Wireguard, Amnezia";
-    } else if (text == "/usage") {
-        reply = "Usage statistics are not available in the native build.";
-    } else {
-        reply = "Unknown command. Try /start";
-    }
-
-    nlohmann::json payload = {{"chat_id", chat_id}, {"text", reply}};
-    std::string error;
-    telegram_api(token, "sendMessage", payload.dump(), error);
-    return json_ok(nullptr);
 }
 
 http::Response App::doh(const http::Request& req) {
@@ -701,6 +682,11 @@ http::Response App::handle(const http::Request& req) {
     if (path == sp + "/panel/update-settings") {
         if (needs_auth && !authenticated(req)) return json_err(401, "未授权或会话已过期。");
         return update_settings(req);
+    }
+    if (path == sp + "/panel/raw-files") {
+        if (needs_auth && !authenticated(req)) return json_err(401, "未授权或会话已过期。");
+        if (req.method == "PUT") return import_raw_files(req);
+        return list_raw_files();
     }
     if (path == sp + "/panel/reset-settings") {
         if (needs_auth && !authenticated(req)) return json_err(401, "未授权或会话已过期。");
@@ -808,9 +794,6 @@ http::Response App::handle(const http::Request& req) {
     }
     if (path == sp + "/panel/update-panel") return not_supported("面板自更新（仅 Cloudflare 版）");
     if (path == sp + "/panel/delete-panel") return not_supported("面板删除（仅 Cloudflare 版）");
-    if (path == sp + "/telegram/setup") return telegram_setup(req);
-    if (path == sp + "/telegram/remove") return telegram_remove(req);
-    if (path == sp + "/telegram/webhook") return telegram_webhook(req);
     if (starts_with(path, sp + "/sub/")) {
         // Subscriptions embed the domain clients dial. When the tunnel is up,
         // the edge's ingress configuration is the truth about which hostname

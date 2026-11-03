@@ -28,7 +28,7 @@ public:
     Config& config() { return cfg_; }
 
     nlohmann::json& kv() { return kv_; }
-    nlohmann::json& telegram() { return telegram_; }
+    const nlohmann::json& kv() const { return kv_; }
     nlohmann::json& warps() { return warps_; }
     std::string& pwd() { return pwd_; }
     std::string& secret() { return secret_; }
@@ -46,7 +46,7 @@ public:
     }
 
     // Data directory the store was loaded from; used to place auxiliary files
-    // such as the generated warp-rust config and the quick-tunnel credentials.
+    // such as the generated warp-rust config.
     const std::string& dir() const { return dir_; }
 
     static nlohmann::json default_kv();
@@ -58,7 +58,6 @@ private:
     std::string dir_;
     Config cfg_;
     nlohmann::json kv_;
-    nlohmann::json telegram_ = {{"telegramBotToken", ""}, {"telegramUserId", ""}};
     nlohmann::json warps_ = nlohmann::json::array();
     std::string pwd_;
     std::string secret_;
