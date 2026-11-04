@@ -43,6 +43,17 @@ void sync_ingress_domain(Store&) {
     // adopt and the published domain stays whatever the user configured.
 }
 
+void release_adopted_domain(Store&) {
+    // Counterpart of sync_ingress_domain(): nothing was ever adopted here, so
+    // there is nothing to roll back. The operator's mainDomain is left alone.
+}
+
 void stop() {}
+
+void apply_store_state(Store&) {
+    // Called right after the panel saves its settings. There is no connector
+    // on this platform to start or stop; start_from_store() already reports
+    // the "enabled but unsupported" case when the process boots.
+}
 
 } // namespace bpb::tunnel

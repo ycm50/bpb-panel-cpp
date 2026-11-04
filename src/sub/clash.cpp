@@ -172,7 +172,11 @@ json build_tls(const json& s, const std::string& protocol, const std::string& se
     out["tls"] = true;
     out[protocol == "trojan" ? "sni" : "servername"] = sni;
     if (!fp.empty()) out["client-fingerprint"] = (fp == "randomized") ? "random" : fp;
-    out["skip-cert-verify"] = allow_insecure;
+    // Self-signed listener: Clash Meta has no certificate pinning for VLESS, so
+    // the honest option is to skip verification for a certificate the operator
+    // generated themselves. Xray clients get the stronger pinnedPeerCertSha256
+    // instead (see xray.cpp).
+    out["skip-cert-verify"] = allow_insecure || !pinned_cert(s).empty();
 
     if (security == "tls") {
         if (!alpn.empty()) {
@@ -268,7 +272,8 @@ json build_ws_outbound(const json& s, const std::string& protocol, const std::st
     if (s.contains("upstreamParams") && s["upstreamParams"].is_object()) {
         upstream_server = s["upstreamParams"].value("upstreamServer", std::string());
     }
-    bool is_tls = is_https(s, port) || (!upstream_server.empty() && address == upstream_server);
+    bool is_tls = port_uses_tls(s, domain, port) ||
+                  (!upstream_server.empty() && address == upstream_server);
 
     auto sni_host = select_sni_host(s, address, domain);
     // gRPC is HTTP/2 only; websocket has to stay on h1.1 because that is the
@@ -628,15 +633,11 @@ bool build_clash_custom(const json& s, std::string& out_json, std::string& error
     std::string custom_domain = str(s, "customDomain");
     std::vector<std::string> domains{main_domain};
     if (!custom_domain.empty()) domains.push_back(custom_domain);
+    // Direct mode: one address, one port (see sub/common.h access model).
+    if (access_mode_direct(s)) domains.assign(1, direct_host(s));
 
     auto protocols = get_protocols(s);
     const std::vector<std::string> transports = get_transports(s);
-    std::vector<int> ports;
-    if (s.contains("ports") && s["ports"].is_array()) {
-        for (auto& p : s["ports"]) {
-            if (p.is_number_integer()) ports.push_back(p.get<int>());
-        }
-    }
     std::string upstream_server;
     int upstream_port = 0;
     if (s.contains("upstreamParams") && s["upstreamParams"].is_object()) {
@@ -654,11 +655,7 @@ bool build_clash_custom(const json& s, std::string& out_json, std::string& error
     json outbounds = json::array();
 
     for (auto& domain : domains) {
-        std::vector<int> total_ports;
-        bool is_workers_dev = ends_with(domain, "workers.dev");
-        for (int port : ports) {
-            if (is_workers_dev || is_https(s, port)) total_ports.push_back(port);
-        }
+        std::vector<int> total_ports = effective_ports(s, domain);
         auto hosts = get_config_addresses(s, domain, false, error);
         if (hosts.empty()) return false;
 

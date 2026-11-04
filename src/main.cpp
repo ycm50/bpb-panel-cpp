@@ -7,6 +7,7 @@
 #include "inbound/proto/xhttp.h"
 #include "net/http_client.h"
 #include "net/net.h"
+#include "net/selfsigned.h"
 #include "net/wg_outbound.h"
 #include "proxy/session.h"
 #include "sub/wireguard.h"
@@ -55,6 +56,7 @@ int main(int argc, char** argv) {
     int port = 8080;
     std::string data_dir = "./.bpbdata";
     std::string asset_dir;  // empty: use the panel assets embedded in the binary
+    int tls_port = 0;              // 0: no separate TLS listener
     std::string tls_cert;
     std::string tls_key;
     std::string export_warp;
@@ -99,6 +101,7 @@ int main(int argc, char** argv) {
         else if (!a.empty() && a[0] != '-') passwd_args.push_back(a);   // bpb --passwd <pw> --data <dir>
         else if (a == "--assets") asset_dir = next("--assets");
         else if (a == "--export-warp") export_warp = next("--export-warp");
+        else if (a == "--tls-port") tls_port = std::atoi(next("--tls-port").c_str());
         else if (a == "--tls-cert") tls_cert = next("--tls-cert");
         else if (a == "--tls-key") tls_key = next("--tls-key");
         else if (a == "--log" || a == "--verbose") {
@@ -155,6 +158,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "settings load failed: %s\n", error.c_str());
         return 1;
     }
+    // Publish what this process can actually serve before anything generates a
+    // subscription: the port it will bind and whether it terminates TLS. The
+    // generators used to guess both (port from settings.ports, TLS from a
+    // hard-coded port whitelist), which is how a --tls-cert-less listener ended
+    // up advertising security=tls.
+    store.set_listen_facts(host, port, !tls_cert.empty() && !tls_key.empty());
     if (!store.save(error)) {
         std::fprintf(stderr, "settings save failed: %s\n", error.c_str());
         return 1;
@@ -259,20 +268,53 @@ int main(int argc, char** argv) {
     });
 #endif
 
-    if (!tls_cert.empty() && !tls_key.empty()) {
+    // --- listener layout -----------------------------------------------------
+    // ONE listener, ONE port. It answers plain HTTP for the panel and TLS for
+    // the proxy inbounds, deciding per connection from the first byte:
+    //
+    //   * Xray 26.x refuses a VLESS outbound with security=none to a public
+    //     address, so the proxy MUST speak TLS;
+    //   * the panel must stay reachable over plain http:// (a self-signed
+    //     https panel locks the operator out, and browsers refuse it);
+    //   * a box behind a port mapping usually has exactly one usable port.
+    //
+    // Certificate: --tls-cert/--tls-key when given, otherwise a self-signed one
+    // generated into the data directory. Self-signed because an IP-only,
+    // non-standard-port deployment cannot satisfy any ACME challenge; clients
+    // pin the SHA-256 from the subscription instead of trusting a CA.
+    if (!tls_cert.empty() || !tls_key.empty() || true) {
+        if (tls_cert.empty() || tls_key.empty()) {
+            tls_cert = store.dir() + "/tls-cert.pem";
+            tls_key = store.dir() + "/tls-key.pem";
+        }
+        const std::string cn = !store.config().directHost.empty()
+                                   ? store.config().directHost
+                                   : (store.config().mainDomain.empty() ? std::string("bpb")
+                                                                        : store.config().mainDomain);
+        if (!bpb::net::ensure_self_signed(tls_cert, tls_key, cn, error)) {
+            std::fprintf(stderr, "certificate setup failed: %s\n", error.c_str());
+            return 1;
+        }
         if (!server.enable_tls(tls_cert, tls_key, error)) {
             std::fprintf(stderr, "tls init failed: %s\n", error.c_str());
             return 1;
         }
+        // Both protocols on the same socket.
+        server.set_tls_detect(true);
+        const bpb::net::CertInfo info = bpb::net::inspect_cert(tls_cert);
+        store.set_tls_port(port);
+        store.set_tls_cert_path(tls_cert);
+        store.set_cert_pin(info.sha256);
+        bpb::log::info("tls certificate: %s (pin: %s)", tls_cert.c_str(), info.sha256.c_str());
     }
 
     if (!server.listen(host, port, error)) {
         std::fprintf(stderr, "listen failed: %s\n", error.c_str());
         return 1;
     }
-    bpb::log::info("bpb native listening on %s://%s:%d (secure path: /%s/, inbounds: %s)",
-                   tls_cert.empty() ? "http" : "https", host.c_str(), port,
-                   store.config().securePath.c_str(), bpb::inbound::id_list().c_str());
+    bpb::log::info("bpb native listening on %s:%d http+tls (secure path: /%s/, inbounds: %s)",
+                   host.c_str(), port, store.config().securePath.c_str(),
+                   bpb::inbound::id_list().c_str());
 
     // Optional embedded Cloudflare Tunnel client. When enabled it registers with
     // the edge and relays inbound requests back to this panel, replacing the

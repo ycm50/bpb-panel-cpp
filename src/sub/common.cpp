@@ -135,6 +135,132 @@ bool is_base64(const std::string& str) {
     return true;
 }
 
+// ---- access model -------------------------------------------------------
+// The single source of truth for "tunnel or direct". settings.accessMode is
+// written by Store::merged(); when a settings blob predates it (or came from
+// share-settings) fall back to the cfTunnel switch, which is the same thing the
+// tunnel supervisor reads.
+bool access_mode_direct(const nlohmann::json& s) {
+    if (s.contains("accessMode") && s["accessMode"].is_string())
+        return s["accessMode"].get<std::string>() == "direct";
+    if (s.contains("cfTunnel") && s["cfTunnel"].is_object())
+        return !s["cfTunnel"].value("enabled", false);
+    if (s.contains("cfTunnelEnabled")) {
+        if (s["cfTunnelEnabled"].is_boolean()) return !s["cfTunnelEnabled"].get<bool>();
+        if (s["cfTunnelEnabled"].is_string())
+            return s["cfTunnelEnabled"].get<std::string>() != "true";
+    }
+    return true;
+}
+
+bool access_mode_tunnel(const nlohmann::json& s) { return !access_mode_direct(s); }
+
+std::string pinned_cert(const nlohmann::json& s) {
+    // Tunnel mode: the Cloudflare edge terminates TLS with its own certificate,
+    // so the self-signed leaf of this process is never what the client sees.
+    if (!access_mode_direct(s)) return std::string();
+    return s.value("certPin", std::string());
+}
+
+std::string direct_host(const nlohmann::json& s) {
+    std::string host = s.value("directHost", std::string());
+    // A tunnel hostname must never leak into direct mode: it is a name only the
+    // Cloudflare edge can resolve, so a client dialing it with no tunnel behind
+    // it gets either NXDOMAIN or a 530 from the edge.
+    if (host.empty() || host == "localhost" || ends_with(host, ".trycloudflare.com")) {
+        const std::string custom = s.value("customDomain", std::string());
+        if (!custom.empty()) return custom;
+        // Never hand a client the edge hostname: with no tunnel behind it the
+        // name resolves at Cloudflare to a 530, which looks like "the panel is
+        // down" instead of "you have not set the public address yet".
+        return "localhost";
+    }
+    return host;
+}
+
+std::vector<int> effective_ports(const nlohmann::json& s, const std::string& domain) {
+    std::vector<int> out;
+    if (access_mode_direct(s)) {
+        // Exactly one truth: the port this process bound. Anything else is a
+        // port nothing is listening on, which is what made direct mode look
+        // "almost usable" -- the config imported, then timed out.
+        // A TLS listener wins: it is the only port that both listens and
+        // satisfies Xray's "no plaintext VLESS to a public address" rule.
+        //
+        // The port published is the PUBLIC one. With a NAT/port-mapping in
+        // front, the TLS listener's bind port and the port a client dials are
+        // different numbers (the test box maps public 45566 -> local 8080);
+        // directPort carries the public value, derived from the Host header of
+        // the request that fetched the subscription.
+        if (s.contains("tlsPort") && s["tlsPort"].is_number_integer() &&
+            s["tlsPort"].get<int>() > 0) {
+            int port = s["tlsPort"].get<int>();
+            if (s.contains("directPort") && s["directPort"].is_number_integer()) {
+                const int pub = s["directPort"].get<int>();
+                if (pub > 0) port = pub;
+            }
+            out.push_back(port);
+            return out;
+        }
+        int port = 0;
+        if (s.contains("directPort") && s["directPort"].is_number_integer())
+            port = s["directPort"].get<int>();
+        if (port <= 0 && s.contains("listenPort") && s["listenPort"].is_number_integer())
+            port = s["listenPort"].get<int>();
+        if (port <= 0) {
+            // Last resort: the first configured port, so an import still yields
+            // something rather than an empty subscription.
+            for (const std::string& p : to_string_list(s, "ports")) {
+                port = std::atoi(p.c_str());
+                if (port > 0) break;
+            }
+            if (port <= 0 && s.contains("ports") && s["ports"].is_array()) {
+                for (auto& p : s["ports"]) {
+                    if (p.is_number_integer()) { port = p.get<int>(); break; }
+                }
+            }
+        }
+        if (port > 0) out.push_back(port);
+        return out;
+    }
+
+    const bool is_workers_dev = ends_with(domain, "workers.dev");
+    if (s.contains("ports") && s["ports"].is_array()) {
+        for (auto& p : s["ports"]) {
+            if (!p.is_number_integer()) continue;
+            const int port = p.get<int>();
+            if (is_workers_dev || is_https(s, port)) out.push_back(port);
+        }
+    }
+    return out;
+}
+
+bool port_uses_tls(const nlohmann::json& s, const std::string& domain, int port) {
+    if (access_mode_direct(s)) {
+        // Xray 26.x refuses a VLESS outbound with security=none to any public
+        // address ("vless without TLS or other encryption is prohibited unless
+        // the server address is a private IP or domain"), so the TLS listener
+        // port and the panel port are not interchangeable: only the port that
+        // actually terminates TLS may be published. tlsPort says which.
+        if (s.contains("tlsPort") && s["tlsPort"].is_number_integer()) {
+            const int tls_port = s["tlsPort"].get<int>();
+            if (tls_port <= 0) return false;
+            // The published port may be the public one (NAT mapping), not the
+            // bind port, so both count as "this is the TLS listener".
+            if (port == tls_port) return true;
+            if (s.contains("directPort") && s["directPort"].is_number_integer() &&
+                s["directPort"].get<int>() == port)
+                return true;
+            return false;
+        }
+        if (s.contains("listenTls") && s["listenTls"].is_boolean())
+            return s["listenTls"].get<bool>();
+        return false;
+    }
+    (void)domain;
+    return is_https(s, port);
+}
+
 bool is_https(const nlohmann::json& s, int port) {
     std::vector<int> https_ports = {443, 8443, 2053, 2083, 2087, 2096};
     if (s.contains("ports") && s["ports"].is_array() && !s["ports"].empty()) {
@@ -253,6 +379,14 @@ bool resolve_dns(const std::string& domain, bool only_ipv4, DnsResult& out, std:
 
 std::vector<std::string> get_config_addresses(const nlohmann::json& s, const std::string& domain,
                                               bool is_fragment, std::string& error) {
+    // Direct mode has no Cloudflare edge to dial back through. cleanIPs and
+    // customCdnAddrs are *edge* addresses: the client connects to a Cloudflare
+    // PoP and the edge routes it to us by the Host/SNI header. With no tunnel
+    // there is no edge, so those entries are third-party hosts that can never
+    // reach this server -- publishing them produced nodes that look fine in an
+    // import and always time out. Exactly one address is real here.
+    if (access_mode_direct(s)) return {direct_host(s)};
+
     bool enable_ipv6 = s.value("enableIPv6", false);
     auto clean_ips = to_string_list(s, "cleanIPs");
     auto custom_cdn = to_string_list(s, "customCdnAddrs");
@@ -286,6 +420,14 @@ SniHost select_sni_host(const nlohmann::json& s, const std::string& address,
         out.sni = s.value("customCdnSni", std::string());
         out.host = s.value("customCdnHost", std::string());
         out.allow_insecure = true;
+    } else if (access_mode_direct(s)) {
+        // Direct transport: there is no Cloudflare edge in front, so the
+        // randomly-cased hostname that exists to dodge SNI blocklists only made
+        // the config look fronted and sent every bug report chasing a TLS
+        // problem that does not exist.
+        out.sni = domain;
+        out.host = domain;
+        out.allow_insecure = false;
     } else {
         out.sni = random_upper_case(domain);
         out.host = domain;

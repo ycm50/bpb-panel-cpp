@@ -13,8 +13,11 @@ set -eu
 REPO="ycm50/bpb-panel-cpp"
 TAG="${BPB_TAG:-latest}"
 LOCAL_BIN=""
-# 发布产物是按协议分开的：bpb-linux-<arch>-<协议>。默认装 VLESS。
-PROTOCOL="${BPB_PROTOCOL:-vless}"
+# 发布产物是按协议分开的：bpb-linux-<arch>-<协议>，另外还有一个全协议产物
+# bpb-linux-<arch>-all。默认装 all —— 分协议二进制会让面板上的 gRPC/XHTTP
+# 开关变成空操作（订阅侧 inbound::has() 直接把它过滤掉），这是最容易被误判为
+# "功能没做"的坑。要精简二进制再显式 --protocol vless。
+PROTOCOL="${BPB_PROTOCOL:-all}"
 PORT=8080
 DATA_DIR=""
 PREFIX="/usr/local/bin"
@@ -36,7 +39,7 @@ bpb installer
   --data DIR      data directory                            [default /root/.bpbdata]
   --tag TAG       release tag to install                    [default latest]
   --local PATH    install this binary instead of downloading it
-  --protocol NAME inbound protocol the binary was built with [default vless]
+  --protocol NAME inbound protocol the binary was built with [default all]
   --no-tunnel     do not enable the built-in quick tunnel
   --uninstall     stop and remove the service
   -h, --help      this text
@@ -80,13 +83,35 @@ fi
 
 if [ "$UNINSTALL" = 1 ]; then
   [ "$(id -u)" = 0 ] || die "run as root"
-  if have systemctl && [ -f "/etc/systemd/system/$SERVICE.service" ]; then
+  # The unit and the install prefix both derive from --data, so uninstalling
+  # without repeating it targets "bpb" and silently leaves the custom install
+  # (and its running service) in place. Clean that up instead of reporting a
+  # success that did not happen.
+  [ "$DATA_DIR" = "/root/.bpbdata" ] && DATA_DIR=""
+  # $unit is only assigned further down (the service section), so build it here.
+  unit="/etc/systemd/system/$SERVICE.service"
+  found=0
+  if have systemctl && [ -f "$unit" ]; then
     systemctl disable --now "$SERVICE" 2>/dev/null || true
-    rm -f "/etc/systemd/system/$SERVICE.service"
+    rm -f "$unit"
     systemctl daemon-reload || true
+    found=1
   fi
-  rm -f "$PREFIX/bpb"
+  if [ -f "$PREFIX/bpb" ]; then
+    rm -f "$PREFIX/bpb"
+    found=1
+  fi
   rmdir "$PREFIX" 2>/dev/null || true
+  if [ "$found" = 0 ]; then
+    warn "nothing installed as '$SERVICE' (looked for $unit and $PREFIX/bpb)"
+    if [ -z "$DATA_DIR" ]; then
+      warn "for a custom install, repeat its --data: sh install.sh --uninstall --data DIR"
+    fi
+    exit 1
+  fi
+  # A leftover drop-in (e.g. the TasksMax override) keeps applying to a later
+  # reinstall of the same unit name, so remove it with the unit.
+  rm -rf "/etc/systemd/system/$SERVICE.service.d" 2>/dev/null || true
   log "uninstalled $SERVICE (data directory kept)"
   exit 0
 fi
@@ -129,9 +154,14 @@ fetch() {
 }
 
 if [ -n "$LOCAL_BIN" ]; then
-  [ -f "$LOCAL_BIN" ] || die "--local: no such file: $LOCAL_BIN"
+  [ -f "$LOCAL_BIN" ] && [ -r "$LOCAL_BIN" ] || die "--local: not a readable file: $LOCAL_BIN"
+  # Refuse the obvious footgun: a Windows build shares the name but cannot run
+  # here, and the failure would surface later as a vague systemd restart loop.
+  if head -c 2 "$LOCAL_BIN" 2>/dev/null | grep -q 'MZ'; then
+    die "--local: $LOCAL_BIN is a Windows executable (MZ header), this installer is Linux-only"
+  fi
   log "installing local binary $LOCAL_BIN"
-  cp "$LOCAL_BIN" "$tmp/bpb"
+  cp "$LOCAL_BIN" "$tmp/bpb" || die "--local: cannot copy $LOCAL_BIN"
 else
 log "downloading $asset ($TAG)"
 if ! fetch "$base/$asset" "$tmp/bpb"; then
@@ -182,6 +212,14 @@ install -d "$PREFIX"
 install -m 0755 "$tmp/bpb" "$PREFIX/bpb"
 log "installed $PREFIX/bpb"
 
+# Say which inbounds the binary really carries. A trimmed binary is not an
+# error, but it silently turns the panel switches for XHTTP/gRPC into no-ops,
+# so the user should see it here rather than discover it in a subscription.
+if [ "$PROTOCOL" != "all" ]; then
+  warn "installed the $PROTOCOL-only binary: protocols not compiled in cannot be"
+  warn "enabled from the panel (reinstall without --protocol to get all of them)"
+fi
+
 # WARP terminates in this process (in-tree WireGuard + lwIP), so there is no
 # sidecar to fetch. An install left over from the retired external-sidecar
 # layout may still carry one: bpb only loads it when the binary is next to
@@ -210,24 +248,51 @@ JSON
   log "wrote $DATA_DIR/settings.json (tunnel=$enabled, origin 127.0.0.1:$PORT)"
 else
   # Existing install: keep every other setting, only repoint the origin.
-  if have python3; then
-    python3 - "$DATA_DIR/settings.json" "$PORT" "$NO_TUNNEL" <<'PY' && log "updated origin port in existing settings.json"
-import json, sys
-path, port, no_tunnel = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "1"
-try:
-    with open(path) as f: d = json.load(f)
-except Exception:
-    sys.exit(1)
-ps = d.setdefault("proxySettings", {})
-ct = ps.setdefault("cfTunnel", {})
-ct["originHost"] = "127.0.0.1"
-ct["originPort"] = port
-if no_tunnel:
-    ct["enabled"] = False
-with open(path, "w") as f: json.dump(d, f, indent=2)
-PY
+  #
+  # --no-tunnel must actually turn the tunnel OFF. The first version only wrote
+  # cfTunnel.enabled=false under python3 and, when python3 was absent, printed
+  # "set originPort yourself" and left the tunnel enabled -- so `--no-tunnel`
+  # silently kept a quick tunnel running and kept republishing its hostname.
+  #
+  # No python3 here on purpose: this runs on a bare box where python may not be
+  # installed, and the file only needs one integer replaced.
+  if grep -q '"cfTunnel"' "$DATA_DIR/settings.json" 2>/dev/null; then
+    sed -i.bpb-bak -e "s#\"originHost\"[[:space:]]*:[[:space:]]*\"[^\"]*\"#\"originHost\":\"127.0.0.1\"#" \
+                     -e "s#\"originPort\"[[:space:]]*:[[:space:]]*[0-9][0-9]*#\"originPort\":$PORT#" \
+        "$DATA_DIR/settings.json"
+    log "updated origin to 127.0.0.1:$PORT in existing settings.json"
   else
-    warn "python3 missing: set cfTunnel.originPort=$PORT in $DATA_DIR/settings.json yourself"
+    warn "$DATA_DIR/settings.json has no cfTunnel block; leaving it untouched"
+  fi
+  # The switch is driven in BOTH directions. Only writing it for --no-tunnel
+  # meant "re-run the installer to (re)enable the tunnel" did nothing: the file
+  # kept enabled=false from an earlier --no-tunnel run, so the process never
+  # started a tunnel and the script printed "domain not assigned yet" forever.
+  if have python3; then
+    python3 - "$DATA_DIR/settings.json" "$NO_TUNNEL" <<'PY'
+import json, sys
+path, no_tunnel = sys.argv[1], sys.argv[2] == "1"
+with open(path) as f:
+    d = json.load(f)
+d.setdefault("proxySettings", {}).setdefault("cfTunnel", {})["enabled"] = not no_tunnel
+with open(path, "w") as f:
+    json.dump(d, f, indent=2)
+PY
+    if [ "$NO_TUNNEL" = 1 ]; then
+      log "tunnel disabled in settings.json (--no-tunnel)"
+    else
+      log "tunnel enabled in settings.json"
+    fi
+  else
+    # Without python3 the only safe edit is the numeric origin rewrite above:
+    # a bare s#enabled...#false# would also flip every other boolean.
+    if [ "$NO_TUNNEL" = 1 ]; then
+      warn "--no-tunnel needs python3 to disable an existing tunnel safely;"
+      warn "turn it off in the panel: /panel -> Cloudflare 隧道 -> 禁用"
+    else
+      warn "python3 missing: make sure cfTunnel.enabled is true in"
+      warn "$DATA_DIR/settings.json (panel -> Cloudflare 隧道 -> 启用)"
+    fi
   fi
 fi
 
@@ -252,6 +317,13 @@ ExecStart=$PREFIX/bpb --host 0.0.0.0 --port $PORT --data $DATA_DIR
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
+# Every proxied session runs two relay threads (one per direction), so the thread
+# budget is the real concurrency limit -- not file descriptors. systemd defaults
+# TasksMax to 15% of the container's pids.max; inside an LXC with pids.max=128
+# that is 19 tasks, i.e. roughly ten concurrent proxy sessions, after which
+# pthread_create fails with EAGAIN, the relay thread never starts, and the client
+# times out. "TasksMax=infinity" defers to the container's own limit.
+TasksMax=infinity
 
 [Install]
 WantedBy=multi-user.target
@@ -270,6 +342,14 @@ fi
 
 # --- wait for it to answer --------------------------------------------------
 SP=""; DOMAIN=""
+
+# curl is required from here on: the readiness and hostname probes below use
+# `-w %{redirect_url}`, which wget cannot do. fetch() above deliberately
+# accepts wget, so say this out loud instead of looping for 40 s and then
+# blaming the panel.
+if ! have curl; then
+  die "curl is required for the readiness probe (wget cannot report a redirect); install curl and re-run"
+fi
 tries=0
 while [ "$tries" -lt 40 ]; do
   sleep 1
@@ -284,12 +364,19 @@ done
 [ -n "$SP" ] || die "panel did not answer on port $PORT; check: journalctl -u $SERVICE -n 50"
 
 # The tunnel registers in the background; poll for the hostname it allocates.
+#
+# `X-BPB-CLI: 1` is mandatory here, not a shortcut: /panel/tunnel-status is
+# behind the panel credential, so on any install that already has a password
+# (i.e. every re-run and every upgrade) an unauthenticated read answers 401 and
+# the hostname comes back empty. The script then told the operator "domain not
+# assigned yet; check journalctl" while the tunnel was perfectly connected.
+# A local process is the operator and gets full access (see README).
 if [ "$NO_TUNNEL" = 0 ]; then
   tries=0
   while [ "$tries" -lt 45 ]; do
     sleep 2
     tries=$((tries + 1))
-    js="$(curl -s "http://127.0.0.1:$PORT/$SP/panel/tunnel-status" 2>/dev/null || true)"
+    js="$(curl -s -H 'X-BPB-CLI: 1' "http://127.0.0.1:$PORT/$SP/panel/tunnel-status" 2>/dev/null || true)"
     DOMAIN="$(printf "%s" "$js" | sed -n 's/.*"hostname":"\([^"]*\)".*/\1/p')"
     [ -n "$DOMAIN" ] && break
   done

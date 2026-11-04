@@ -6,6 +6,7 @@
 #include "crypto/crypto.h"
 #include "net/http_client.h"
 #include "net/wg_outbound.h"
+#include "net/selfsigned.h"
 #include "sub/clash.h"
 #include "sub/raw.h"
 #include "util/log.h"
@@ -189,7 +190,39 @@ std::string App::cookie(const http::Request& req, const std::string& name) const
     return "";
 }
 
+namespace {
+
+// The command line runs on the box as the operator: it gets full access, with
+// no password and no token to manage.
+//
+// What it must NOT share is the old rule of "anything that arrives on loopback
+// is the operator". Two things reach 127.0.0.1 that are not the CLI: a browser on
+// the box, and -- the one that actually mattered -- this process's own outgoing
+// tunnel, whose origin connections come from 127.0.0.1 as well. A browser cannot
+// forge the distinction: a top-level navigation cannot carry a custom request
+// header at all, and a cross-origin page that adds one triggers a CORS preflight
+// this server never answers.
+bool is_loopback(const bpb::http::Request& req) {
+    const std::string& p = req.peer;
+    if (p.empty()) return false;
+    return p == "127.0.0.1" || p == "::1" || p == "::ffff:127.0.0.1";
+}
+
+bool is_cli_request(const bpb::http::Request& req) {
+    if (!is_loopback(req)) return false;
+    return !req.header("x-bpb-cli").empty();
+}
+
+// Session lifetime for a browser. Short on purpose: the cookie is only a
+// convenience for a page that is already open, not a long-lived credential.
+constexpr std::int64_t kSessionSeconds = 10 * 60;
+
+} // namespace
+
 bool App::authenticated(const http::Request& req) const {
+    // The command line has full access, unconditionally and with no secret to
+    // manage: it announces itself with a header only it sends.
+    if (is_cli_request(req)) return true;
     std::string token = cookie(req, "jwtToken");
     if (token.empty()) return false;
     std::string payload;
@@ -225,11 +258,14 @@ http::Response App::login(const http::Request& req) {
     // app/passwd.h). settings.json only remains as the legacy fallback: an
     // install that predates the file still logs in, and the first successful
     // login migrates it so nothing keeps a plaintext password around.
+    // The file is authoritative and is re-read on every attempt: a password
+    // changed while the panel is running must take effect immediately.
     bool ok = false;
     app::passwd::Entry entry;
     if (app::passwd::load(store_.dir(), entry)) {
         ok = app::passwd::verify(store_.dir(), username, password);
     } else {
+        // Legacy value from settings.json; migrate it to <data>/passwd below.
         ok = (username == to_lower(store_.config().accEmail) && password == store_.pwd());
         if (ok && !store_.pwd().empty()) {
             std::string migrate_error;
@@ -243,10 +279,14 @@ http::Response App::login(const http::Request& req) {
     nlohmann::json payload;
     payload["id"] = store_.config().accID;
     payload["iat"] = now;
-    payload["exp"] = now + 24 * 60 * 60;
+    payload["exp"] = now + kSessionSeconds;
     std::string token = crypto::jwt_sign_hs256(payload.dump(), store_.secret());
     http::Response res = json_ok(nullptr);
-    res.set("Set-Cookie", "jwtToken=" + token + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400");
+    // Session cookie, not a durable one: no Max-Age/Expires means the browser
+    // drops it when it closes, and the signed 'exp' above caps it at ten
+    // minutes even while the tab stays open.
+    res.set("Set-Cookie",
+            "jwtToken=" + token + "; Path=/; HttpOnly; SameSite=Strict");
     return res;
 }
 
@@ -297,6 +337,17 @@ http::Response App::panel_settings() {
       {"name":"Wireguard","minVer":"Stable","source":"Official Website","b64Url":"aHR0cHM6Ly93d3cud2lyZWd1YXJkLmNvbS9pbnN0YWxsLw=="},
       {"name":"WG Tunnel","minVer":"5.1.0","source":"Github","b64Url":"aHR0cHM6Ly9naXRodWIuY29tL3dndHVubmVsL2FuZHJvaWQvcmVsZWFzZXMvbGF0ZXN0"}
     ])");
+    // Facts the panel cannot infer from a settings blob: whether this listener
+    // terminates TLS (it only does with --tls-cert/--tls-key), which port it
+    // bound, and which address it advertises for direct (no-tunnel) access.
+    // The panel uses these to decide which port list and which security mode it
+    // may offer, instead of guessing from a hard-coded port whitelist.
+    body["runtime"] = {{"listenPort", store_.listen_port()},
+                       {"listenHost", store_.listen_host()},
+                       {"tls", store_.listen_tls()},
+                       {"accessMode", store_.merged().value("accessMode", std::string("direct"))},
+                       {"directHost", store_.merged().value("directHost", std::string())},
+                       {"directPort", store_.merged().value("directPort", 0)}};
     body["isPassSet"] = store_.has_pwd();
     // 这个二进制真正编进来的入栈协议。面板据此只显示这些；显示没编进来的协议
     // 只会让用户勾出一个连不上的订阅。
@@ -396,6 +447,84 @@ http::Response App::import_raw_files(const http::Request& req) {
     body["note"] = "文件已覆盖，重启进程后生效。";
     return json_ok(body);
 }
+namespace {
+
+// Public address a client used to reach this panel, taken from the request that
+// asked for the subscription. Only the address literal is trusted -- the port
+// comes from the Host header too, because the process may be listening on 8080
+// behind a mapping to 45566 (the experiment VPS is exactly that: 45566 -> 8080),
+// and publishing the bind port produces links nobody can reach.
+//
+// A hand-configured directHost wins: it is an explicit statement of what the
+// public address is, and a reverse proxy that rewrites Host would otherwise
+// silently overwrite it. Only an empty/unset value is filled in here.
+void adopt_request_host(bpb::Store& store, const bpb::http::Request& req) {
+    std::string host = req.header("host");
+    if (host.empty()) return;
+    // Host may be "name", "name:port" or "[v6]:port".
+    std::string name = host;
+    int port = 0;
+    // "name:port", "name", "[v6]:port". A bare IPv6 literal has several colons
+    // and no brackets, so only split when the part after the last colon is
+    // entirely numeric -- that is the only unambiguous case.
+    const auto colon = host.rfind(':');
+    if (colon != std::string::npos) {
+        const std::string tail = host.substr(colon + 1);
+        if (!tail.empty() && tail.size() <= 5 &&
+            tail.find_first_not_of("0123456789") == std::string::npos) {
+            name = host.substr(0, colon);
+            port = std::atoi(tail.c_str());
+            if (port <= 0 || port > 65535) port = 0;
+        }
+    }
+    if (!name.empty() && name.front() == '[' && name.back() == ']')
+        name = name.substr(1, name.size() - 2);
+    name = trim(name);
+    if (name.empty()) return;
+    // Loopback is what a local check uses; publishing it would be useless but
+    // harmless, and the operator may genuinely be on the box. Keep it simple:
+    // only skip when we already have a usable public address.
+    if (!store.config().directHost.empty() && store.config().directHost != "localhost" &&
+        store.config().directHost != name) {
+        return;
+    }
+    bool dirty = false;
+    if (store.config().directHost != name) {
+        store.config().directHost = name;
+        dirty = true;
+    }
+    // The port from the Host header is the *public* one (45566 on the test box,
+    // mapping to 8080 inside). It is exactly what a client must dial, so it is
+    // what directPort means here -- the bind port is a separate fact the
+    // generator falls back to when this is unset.
+    if (port > 0 && store.config().directPort != port) {
+        store.config().directPort = port;
+        dirty = true;
+    }
+    // While the tunnel is off this is also the published domain, so a
+    // subscription fetched from the public address immediately describes that
+    // same address instead of "localhost".
+    const bool tunnel_on = store.kv().contains("cfTunnel") && store.kv()["cfTunnel"].is_object() &&
+                           store.kv()["cfTunnel"].value("enabled", false);
+    if (!tunnel_on) {
+        const std::string adopted = store.kv().value("tunnelAdoptedDomain", std::string());
+        const std::string cur = store.config().mainDomain;
+        if (cur.empty() || cur == "localhost" || cur == adopted || cur != name) {
+            if (cur != name) {
+                store.config().mainDomain = name;
+                dirty = true;
+            }
+        }
+    }
+    if (dirty) {
+        std::string err;
+        if (!store.save(err))
+            bpb::log::error("[panel] could not persist public address: %s", err.c_str());
+    }
+}
+
+} // namespace
+
 http::Response App::update_settings(const http::Request& req) {
     if (req.method != "PUT") return json_err(405, "请求方法不允许。");
     nlohmann::json data;
@@ -433,7 +562,19 @@ http::Response App::update_settings(const http::Request& req) {
 
     auto& kv = store_.kv();
     for (auto it = data.begin(); it != data.end(); ++it) {
-        if (kv.contains(it.key())) kv[it.key()] = it.value();
+        if (!kv.contains(it.key())) continue;
+        // Booleans that the panel renders as a <select> arrive as the strings
+        // "true"/"false" (only checkboxes submit real booleans). Storing the
+        // string in place of the boolean makes every later
+        // value("...", true) throw a json type_error -- which surfaced as
+        // "Internal Server Error" on /panel/warp-status right after turning the
+        // WARP dry run off. Coerce back to the type the key already has.
+        if (kv[it.key()].is_boolean() && it.value().is_string() &&
+            (it.value().get<std::string>() == "true" || it.value().get<std::string>() == "false")) {
+            kv[it.key()] = (it.value().get<std::string>() == "true");
+            continue;
+        }
+        kv[it.key()] = it.value();
     }
 
     // The panel submits the WireGuard outbound as two flat fields; fold them
@@ -455,12 +596,28 @@ http::Response App::update_settings(const http::Request& req) {
         std::string v = data["wgOutboundEndpoint"].get<std::string>();
         if (!v.empty()) wg["endpoint"] = v;
     }
+    // Refuse to switch the outbound on with an empty account pool. It used to be
+    // pre-filled with two hard-coded registrations that no longer worked, so
+    // "enabled" looked applied while every connection quietly fell back to a
+    // direct socket. Storing enabled=false and reporting why is the honest
+    // outcome; the panel turns this into "请先注册账号".
+    bool wg_needs_account = false;
+    if (wg.value("enabled", false) &&
+        (!store_.warps().is_array() || store_.warps().empty())) {
+        wg["enabled"] = false;
+        wg_needs_account = true;
+    }
 
     // Cloudflare Tunnel: flat panel fields folded into the nested cfTunnel object.
     if (!kv.contains("cfTunnel") || !kv["cfTunnel"].is_object()) {
         kv["cfTunnel"] = nlohmann::json::object();
     }
     auto& ct = kv["cfTunnel"];
+    // The connector's origin is not a user setting: it is this process's own
+    // listener, so derive it instead of accepting a typed value. The two fields
+    // used to be free text, which is how a panel showing "监听端口 8080" while
+    // the process listened on 45566 could rewrite the tunnel's back end to a
+    // port nothing was bound to (Cloudflare then answers 502/530).
     if (data.contains("cfTunnelEnabled")) {
         std::string v = data["cfTunnelEnabled"].is_string()
                             ? data["cfTunnelEnabled"].get<std::string>()
@@ -485,22 +642,8 @@ http::Response App::update_settings(const http::Request& req) {
         std::string v = data["cfTunnelToken"].get<std::string>();
         if (!v.empty()) ct["token"] = v;
     }
-    if (data.contains("cfTunnelOrigin") && data["cfTunnelOrigin"].is_string()) {
-        std::string v = data["cfTunnelOrigin"].get<std::string>();
-        if (!v.empty()) {
-            auto colon = v.find(':');
-            if (colon == std::string::npos) {
-                ct["originHost"] = v;
-            } else {
-                ct["originHost"] = v.substr(0, colon);
-                try {
-                    ct["originPort"] = std::stoi(v.substr(colon + 1));
-                } catch (...) {
-                    // keep the previous port when the value is not numeric
-                }
-            }
-        }
-    }
+    ct["originHost"] = "127.0.0.1";
+    ct["originPort"] = store_.listen_port();
 
     // Apply the WireGuard switch immediately. Without this the panel only wrote
     // the flag: saving "enabled" left ready=false until the process was
@@ -516,9 +659,33 @@ http::Response App::update_settings(const http::Request& req) {
     if (data.contains("prefixes")) cfg.prefixes = data["prefixes"].get<std::vector<std::string>>();
     if (data.contains("fallback")) cfg.fallback = data["fallback"].get<std::string>();
     if (data.contains("dohUrl")) cfg.dohUrl = data["dohUrl"].get<std::string>();
+    // Address a client dials when the tunnel is off. Kept out of kv() on
+    // purpose: it lives in config.json next to mainDomain, and the panel's flat
+    // field loop only copies keys that already exist in kv().
+    if (data.contains("directHost") && data["directHost"].is_string()) {
+        const std::string v = trim(data["directHost"].get<std::string>());
+        cfg.directHost = v;
+        // This is also the value the tunnel rollback restores, so keep the
+        // published domain in step whenever the tunnel is not the entrance.
+        const bool tunnel_on = store_.kv().contains("cfTunnel") &&
+                               store_.kv()["cfTunnel"].is_object() &&
+                               store_.kv()["cfTunnel"].value("enabled", false);
+        if (!tunnel_on && !v.empty()) store_.config().mainDomain = v;
+    }
+    if (data.contains("directPort")) {
+        int v = 0;
+        if (data["directPort"].is_number_integer()) v = data["directPort"].get<int>();
+        else if (data["directPort"].is_string()) v = std::atoi(data["directPort"].get<std::string>().c_str());
+        if (v > 0 && v <= 65535) cfg.directPort = v;
+    }
 
     std::string error;
     if (!store_.save(error)) return json_err(500, error);
+
+    // The tunnel switch is applied live, exactly like the WireGuard one below:
+    // writing cfTunnel.enabled without telling the connector left a "disabled"
+    // tunnel connected to the edge until the next restart.
+    if (data.contains("cfTunnelEnabled")) tunnel::apply_store_state(store_);
 
     nlohmann::json out = nlohmann::json::object();
     if (wgTouched) {
@@ -529,7 +696,13 @@ http::Response App::update_settings(const http::Request& req) {
         const bool ready = net::apply_wg_outbound(store_, wgError);
         out["wgOutbound"] = {{"ready", ready},
                              {"status", net::wg_outbound_status()},
-                             {"error", ready ? std::string() : wgError}};
+                             {"error", ready ? std::string() : wgError},
+                             {"needsAccount", wg_needs_account}};
+        if (wg_needs_account) {
+            return json_err(400,
+                            "WireGuard 出栈需要先注册 WARP 账号：面板里点“续期”或"
+                            "“注册”获取，注册成功后再打开这个开关。开关已保持关闭。");
+        }
     }
     return json_ok(out);
 }
@@ -553,19 +726,20 @@ http::Response App::reset_password(const http::Request& req) {
     if (!store_.has_pwd() && username != to_lower(store_.config().accEmail)) {
         return json_err(400, "用户名错误。");
     }
-    store_.pwd() = data.value("password", "");
+    // Write the credential straight to <data>/passwd and keep only a marker in
+    // settings.json: the plaintext password must never be persisted there, and
+    // the hashed file is what every later check reads.
+    const std::string password = data.value("password", "");
+    const std::string user = username.empty() ? store_.config().accEmail : username;
     std::string error;
-    if (!store_.save(error)) return json_err(500, error);
-    // Keep the hashed credential in the data directory in step with the settings
-    // copy: the file is what App::login checks first, so a reset that only
-    // touched settings.json would be silently ignored.
-    if (!store_.pwd().empty()) {
-        std::string pwd_error;
-        const std::string user = username.empty() ? store_.config().accEmail : username;
-        if (!app::passwd::save(store_.dir(), user, store_.pwd(), pwd_error))
-            bpb::log::error("could not write %s: %s", app::passwd::path_for(store_.dir()).c_str(),
-                            pwd_error.c_str());
+    if (!password.empty()) {
+        if (!app::passwd::save(store_.dir(), user, password, error))
+            return json_err(500, "保存密码失败：" + error);
+        store_.pwd() = "\x01";   // marker only
+        // A new credential invalidates every existing session.
+        (void)store_.rotate_secret();
     }
+    if (!store_.save(error)) return json_err(500, error);
     return json_ok(nullptr);
 }
 
@@ -669,7 +843,12 @@ http::Response App::handle(const http::Request& req) {
     }
     if (path == sp + "/login/authenticate") return login(req);
 
-    bool needs_auth = store_.has_pwd();
+    // Every panel request is gated, including one that arrives on the loopback
+    // interface: a browser on the box, an SSH port-forward to the panel, and this
+    // process's own tunnel all reach 127.0.0.1 and used to be let in without a
+    // password. The command line still has full access -- see authenticated(),
+    // where it identifies itself with X-BPB-CLI instead of an address.
+    const bool needs_auth = store_.has_pwd();
     if (path == sp + "/panel") {
         if (needs_auth && !authenticated(req)) return http::Response::redirect("./login");
         std::string page_error;
@@ -785,12 +964,71 @@ http::Response App::handle(const http::Request& req) {
         std::string error;
         if (!store_.save(error)) return json_err(500, "保存设置失败：" + error);
         tunnel::stop();
+        // The tunnel is down now, so the domain it lent us has to go with it:
+        // leaving it in place is what made "sleep" produce configs pointing at
+        // a hostname the edge no longer routes (530).
+        tunnel::release_adopted_domain(store_);
         // Report the live state, not a hard-coded flag: the ingress hostnames
         // survive a sleep and the panel shows them under "隧道域名".
         nlohmann::json st = nlohmann::json::parse(tunnel::status_json(), nullptr, false);
         if (st.is_discarded()) st = nlohmann::json::object();
         st["mainDomain"] = store_.config().mainDomain;
         return json_ok(st);
+    }
+    // ---- TLS certificate: view and regenerate -------------------------------
+    if (path == sp + "/panel/tls-cert") {
+        if (needs_auth && !authenticated(req)) return json_err(401, "未授权或会话已过期。");
+        nlohmann::json out = nlohmann::json::object();
+        const int tls_port = store_.tls_port();
+        out["tlsPort"] = tls_port;
+        out["enabled"] = tls_port > 0;
+        const std::string cert_path = store_.tls_cert_path();
+        out["path"] = cert_path;
+        if (!cert_path.empty()) {
+            const net::CertInfo info = net::inspect_cert(cert_path);
+            out["ok"] = info.ok;
+            out["subject"] = info.subject;
+            out["notAfter"] = info.not_after;
+            out["sha256"] = info.sha256;
+            out["error"] = info.error;
+        } else {
+            out["ok"] = false;
+            out["error"] = "没有启用 TLS 监听（以 --tls-port 启动才会有）";
+        }
+        return json_ok(out);
+    }
+    if (path == sp + "/panel/tls-cert-regenerate") {
+        if (needs_auth && !authenticated(req)) return json_err(401, "未授权或会话已过期。");
+        if (req.method != "POST") return json_err(405, "请求方法不允许。");
+        const std::string cert_path = store_.tls_cert_path();
+        if (cert_path.empty()) return json_err(400, "没有启用 TLS 监听，无法生成证书。");
+        // Keep the key next to the certificate; the naming is the same the
+        // startup path uses.
+        std::string key_path = cert_path;
+        const auto slash = key_path.find_last_of('/');
+        const auto dot = key_path.find_last_of('.');
+        if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+            key_path = key_path.substr(0, dot) + "-key.pem";
+        else
+            key_path += "-key.pem";
+        const std::string cn = !store_.config().directHost.empty() ? store_.config().directHost
+                                                                  : store_.config().mainDomain;
+        std::string error;
+        if (!net::regenerate_self_signed(cert_path, key_path, cn, error))
+            return json_err(500, "生成证书失败：" + error);
+        const net::CertInfo info = net::inspect_cert(cert_path);
+        store_.set_cert_pin(info.sha256);
+        std::string saveError;
+        if (!store_.save(saveError)) return json_err(500, "保存设置失败：" + saveError);
+        // The listening context still holds the previous certificate; say so
+        // instead of pretending the change is live.
+        nlohmann::json out = nlohmann::json::object();
+        out["ok"] = info.ok;
+        out["subject"] = info.subject;
+        out["notAfter"] = info.not_after;
+        out["sha256"] = info.sha256;
+        out["note"] = "证书已重新生成，重启进程后新证书才会用于 TLS 监听；订阅里的指纹已同步更新。";
+        return json_ok(out);
     }
     if (path == sp + "/panel/update-panel") return not_supported("面板自更新（仅 Cloudflare 版）");
     if (path == sp + "/panel/delete-panel") return not_supported("面板删除（仅 Cloudflare 版）");
@@ -800,6 +1038,13 @@ http::Response App::handle(const http::Request& req) {
         // reaches this panel, so adopt it before building anything -- otherwise
         // a recreated tunnel keeps handing out the stale (dead) domain.
         tunnel::sync_ingress_domain(store_);
+        // The panel has no way of knowing the address the outside world uses:
+        // behind NAT / a port mapping / a reverse proxy the bind address and
+        // port are both wrong, and "localhost" is what the operator then gets in
+        // every line. The request itself carries the answer -- the browser asked
+        // for http://<public-host>:<public-port>/<sp>/sub/... -- so when no
+        // public address was configured by hand, adopt it for this request.
+        adopt_request_host(store_, req);
         std::string kind = path.substr((sp + "/sub/").size());
         auto params = req.params();
         std::string client = params.count("app") ? params["app"] : std::string();

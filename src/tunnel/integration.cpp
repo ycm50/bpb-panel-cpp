@@ -24,7 +24,10 @@ namespace {
 std::mutex g_mutex;
 std::atomic<bool> g_running{false};
 TunnelStatus g_status;
-std::unique_ptr<TunnelClient> g_client;
+// Shared, not unique: stop() drops the global handle on the HTTP thread while
+// the detached supervisor may still be unwinding inside run(). The thread keeps
+// the client alive until it returns.
+std::shared_ptr<TunnelClient> g_client;
 std::thread g_thread;
 // Public hostname of this tunnel. Set by the quick-tunnel API for an ad-hoc
 // tunnel, or from the edge's ingress configuration for a named one.
@@ -136,7 +139,14 @@ bool start_from_store(Store& store, bool& started, std::string& error) {
     const nlohmann::json kv = store.merged();
     if (!kv.contains("cfTunnel") || !kv["cfTunnel"].is_object()) return true;
     const auto& t = kv["cfTunnel"];
-    if (!t.value("enabled", false)) return true;
+    if (!t.value("enabled", false)) {
+        // Tunnel off: give the published domain back. Without this the panel
+        // kept handing out the hostname of a tunnel that is not running, which
+        // is a dead name in front of no listener (the "no-tunnel mode is
+        // unusable" report).
+        release_adopted_domain(store);
+        return true;
+    }
 
     // Empty token = ad-hoc quick tunnel: register (or reuse) one and use it.
     // This is what makes the trimmed connector usable without a Cloudflare
@@ -217,8 +227,9 @@ bool start_from_store(Store& store, bool& started, std::string& error) {
         started = true;
         return true;
     }
-    g_client = std::make_unique<TunnelClient>();
-    TunnelClient* raw = g_client.get();
+    g_client = std::make_shared<TunnelClient>();
+    std::shared_ptr<TunnelClient> client = g_client;
+    TunnelClient* raw = client.get();
     const std::uint64_t generation = ++g_generation;
     g_running.store(true);
     // Fresh attempt: never report the previous session's registration as
@@ -229,7 +240,7 @@ bool start_from_store(Store& store, bool& started, std::string& error) {
     g_status.error.clear();
     started = true;
 
-    g_thread = std::thread([raw, cfg, generation]() {
+    g_thread = std::thread([raw, client, cfg, generation]() {
         auto log = [](const std::string& line) {
             std::fprintf(stderr, "[cf-tunnel] %s\n", line.c_str());
         };
@@ -315,7 +326,45 @@ std::string status_json() {
     return os.str();
 }
 
+void release_adopted_domain(Store& store) {
+    const std::string adopted = store.kv().value("tunnelAdoptedDomain", std::string());
+    const std::string cur = store.config().mainDomain;
+    // Only roll back a value this supervisor wrote. Anything else is the
+    // operator's own choice (or a name they typed before the tunnel ever ran)
+    // and must survive the tunnel being switched off.
+    const bool weOwnIt = (cur == adopted) ||
+                         (cur.empty() || cur == "localhost");
+    if (!weOwnIt) return;
+    // Where to go back to: the address the panel advertises for direct access,
+    // falling back to the value the panel started with.
+    std::string fallback = store.config().directHost;
+    if (fallback.empty() || fallback == "localhost") {
+        const std::string host = store.listen_host();
+        if (!host.empty() && host != "0.0.0.0" && host != "::") fallback = host;
+        else if (!adopted.empty()) fallback = "localhost";
+    }
+    if (fallback.empty()) fallback = "localhost";
+    if (cur == fallback && adopted.empty()) return;
+    store.config().mainDomain = fallback;
+    store.kv().erase("tunnelAdoptedDomain");
+    bpb::log::info("[cf-tunnel] mainDomain: \"%s\" -> \"%s\" (tunnel off)", cur.c_str(),
+                   fallback.c_str());
+    std::string saveError;
+    if (!store.save(saveError))
+        bpb::log::error("[cf-tunnel] could not persist mainDomain: %s", saveError.c_str());
+}
+
 void sync_ingress_domain(Store& store) {
+    // The ingress configuration only describes a *running* tunnel. With the
+    // tunnel switched off (or asleep) this must not run at all, otherwise the
+    // hostnames cached from the previous session get adopted again the first
+    // time the panel or a subscription is fetched -- which is exactly how a
+    // disabled tunnel kept reappearing in every config.
+    if (store.kv().contains("cfTunnel") && store.kv()["cfTunnel"].is_object() &&
+        !store.kv()["cfTunnel"].value("enabled", false)) {
+        release_adopted_domain(store);
+        return;
+    }
     std::string picked;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -347,11 +396,42 @@ void sync_ingress_domain(Store& store) {
         bpb::log::error("[cf-tunnel] could not persist mainDomain: %s", saveError.c_str());
 }
 
+// Single entry point the panel calls after it has persisted a new
+// cfTunnel.enabled value. Saving "禁用" used to only write the flag: nothing
+// told the connector to stop, so the process kept dialling the edge until it
+// was restarted. Kept here (not in app.cpp) so the store -> connector decision
+// lives with the connector and cannot drift again.
+void apply_store_state(Store& store) {
+    const nlohmann::json kv = store.merged();
+    bool enabled = false;
+    if (kv.contains("cfTunnel") && kv["cfTunnel"].is_object())
+        enabled = kv["cfTunnel"].value("enabled", false);
+    if (!enabled) {
+        stop();
+        return;
+    }
+    bool started = false;
+    std::string error;
+    if (!start_from_store(store, started, error))
+        bpb::log::error("[cf-tunnel] could not start: %s", error.c_str());
+}
+
 void stop() {
     std::lock_guard<std::mutex> lock(g_mutex);
-    // The client is owned by the supervisor thread; only the flag is touched
-    // here, so nothing can be freed underneath a running run().
-    if (g_client) g_client->stop();
+    // stopping_ is a one-way latch: once set, every later run() on the same
+    // object returns immediately, so the supervisor would spin its reconnect
+    // loop forever if g_client stayed alive (and a wake could never reuse it).
+    // Signal the live connection, drop our reference so the supervisor thread
+    // becomes the sole owner, and let start_from_store() build a fresh client.
+    if (g_client) {
+        g_client->stop();   // latches stopping_ and shutdown(2)s the edge socket
+        // Drop the supervisor's handle. The detached thread holds its own
+        // shared_ptr, so the object stays alive until run() actually returns;
+        // the next start_from_store() then builds a *fresh* client instead of
+        // reusing a latched one (which would return from run() instantly and
+        // spin the reconnect loop).
+        g_client.reset();
+    }
     // Report the tunnel as down right away. The supervisor only clears its own
     // copy once run() returns, and until then the panel kept showing a sleeping
     // tunnel as running/connected.

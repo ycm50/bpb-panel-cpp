@@ -25,7 +25,8 @@ static std::string build_config_url(const std::string& protocol, const std::stri
                                     int port, const std::string& host, const std::string& sni,
                                     const std::string& remark, bool is_tls, const std::string& client,
                                     const std::string& uuid, const std::string& fingerprint,
-                                    const std::string& transport = "ws") {
+                                    const std::string& transport = "ws",
+                                    const std::string& cert_pin = std::string()) {
     std::string user = uuid;
     std::string path = generate_ws_path(protocol, uuid);
     // gRPC is the only one of the three that rides on HTTP/2; XHTTP and
@@ -68,6 +69,12 @@ static std::string build_config_url(const std::string& protocol, const std::stri
         params.push_back("sni=" + url_encode(sni));
         params.push_back("fp=" + url_encode(fingerprint));
         params.push_back("alpn=" + url_encode(is_grpc ? "h2" : "http/1.1"));
+        // Self-signed: the client pins this certificate. allowInsecure was
+        // removed from Xray 26.x, so the pin is the only way to trust it.
+        // The share-link spelling is "pcs"; "pinnedPeerCertSha256" is the name
+        // inside a JSON config and is not recognised by v2rayN / v2rayNG /
+        // Xray's link importer, which silently ignore the whole line.
+        if (!cert_pin.empty()) params.push_back("pcs=" + url_encode(cert_pin));
     }
 
     url += join(params, "&");
@@ -120,15 +127,11 @@ SubResult build_raw_configs(const nlohmann::json& s, const std::string& client) 
         upstream_port = s["upstreamParams"].value("upstreamPort", 0);
     }
 
-    std::vector<int> ports;
-    if (s.contains("ports") && s["ports"].is_array()) {
-        for (auto& p : s["ports"]) {
-            if (p.is_number_integer()) ports.push_back(p.get<int>());
-        }
-    }
-
+    // Direct mode dials the address the panel advertises, not the edge hostname
+    // mainDomain may still be holding from a previous tunnel session.
     std::vector<std::string> domains{main_domain};
     if (!custom_domain.empty()) domains.push_back(custom_domain);
+    if (access_mode_direct(s)) domains.assign(1, direct_host(s));
 
     auto protocols = get_protocols(s);
     const std::vector<std::string> transports = get_transports(s);
@@ -136,11 +139,9 @@ SubResult build_raw_configs(const nlohmann::json& s, const std::string& client) 
     int proxy_index = 1;
 
     for (auto& domain : domains) {
-        std::vector<int> total_ports;
-        bool is_workers_dev = ends_with(domain, "workers.dev");
-        for (int port : ports) {
-            if (is_workers_dev || is_https(s, port)) total_ports.push_back(port);
-        }
+        // tunnel: settings.ports intersected with the edge's https ports.
+        // direct: exactly the port this process bound.
+        std::vector<int> total_ports = effective_ports(s, domain);
 
         std::string error;
         auto addrs = get_config_addresses(s, domain, false, error);
@@ -162,7 +163,8 @@ SubResult build_raw_configs(const nlohmann::json& s, const std::string& client) 
                 bool addr_is_upstream = (!upstream_server.empty() && addr == upstream_server);
                 if (port_is_upstream != addr_is_upstream) continue;
 
-                bool is_tls = is_https(s, port) || (!upstream_server.empty() && addr == upstream_server);
+                bool is_tls = port_uses_tls(s, domain, port) ||
+                              (!upstream_server.empty() && addr == upstream_server);
 
                 for (auto& proto : protocols) {
                     std::string remark =
@@ -179,7 +181,8 @@ SubResult build_raw_configs(const nlohmann::json& s, const std::string& client) 
                     for (const std::string& tr : transports) {
                         std::string url = build_config_url(proto, addr, port, sni_host.host,
                                                            sni_host.sni, remark + transport_suffix(tr),
-                                                           is_tls, client, vl_uuid, fingerprint, tr);
+                                                           is_tls, client, vl_uuid, fingerprint, tr,
+                                                           pinned_cert(s));
                         vl_confs += url + "\n";
                     }
                 }

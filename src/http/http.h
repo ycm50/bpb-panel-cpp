@@ -1,5 +1,6 @@
 #pragma once
 #include "net/net.h"
+#include "net/tls.h"
 
 #include <functional>
 #include <map>
@@ -20,6 +21,10 @@ struct Request {
     std::string version;
     std::map<std::string, std::string> headers; // lowercase keys
     std::string body;
+    // Peer address of the connection that carried this request. Used to let a
+    // local operator tool (`bpb --cur`) read live state without a session, while
+    // remote clients still need to log in.
+    std::string peer;
     std::string header(std::string_view name) const;
     std::map<std::string, std::string> params() const;
 };
@@ -61,15 +66,32 @@ public:
     void set_takeover(Takeover t) { takeover_ = std::move(t); }
     void set_pre_takeover(PreTakeover t) { pre_takeover_ = std::move(t); }
     bool enable_tls(const std::string& cert_path, const std::string& key_path, std::string& error);
+
+    // One listener, two protocols: accept plain HTTP and TLS on the SAME port.
+    // A client that starts with a TLS handshake record (0x16 0x03) is upgraded
+    // to TLS, anything else is served as plain HTTP. Needed because a proxy
+    // endpoint must speak TLS (Xray refuses plaintext VLESS to a public
+    // address) while the panel has to stay reachable over http:// from the same
+    // port, and port mappings in front of the box are usually fixed.
+    void set_tls_detect(bool on) { tls_detect_ = on; }
     bool listen(const std::string& host, int port, std::string& error);
     void run();
     void stop() { running_ = false; }
 
 private:
+    // One TLS context per listener: the panel listener stays plain HTTP while a
+    // second listener terminates TLS for the proxy inbounds.
+    net::TlsContext tls_ctx_;
+    bool tls_detect_ = false;
     struct Conn {
         net::socket_t fd = net::kInvalid;
         SSL* ssl = nullptr;
         bool handshaking = false;
+        // Detect mode: set once the first bytes have been inspected.
+        bool protocol_decided = false;
+        bool want_tls = false;
+        // Peer address, captured at accept() time.
+        std::string peer;
         std::string in;
         std::string out;
         bool close_after_write = false;
@@ -82,6 +104,9 @@ private:
     };
 
     void accept_new();
+    // Connections accepted in detect mode start undecided; the first byte is
+    // peeked before the SSL object is created.
+    bool peek_decide(Conn& c, std::string& error);
     bool handshake_step(Conn& c);
     bool read_into(Conn& c);
     void process(Conn& c);

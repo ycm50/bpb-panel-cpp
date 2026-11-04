@@ -43,17 +43,6 @@
 预期：`TOTAL n=60 fails=0 halfclose=1`（最后一个参数为 1 表示发完请求即半关闭）。
 把最后一个参数改成 0 则验证普通请求路径。
 
-## 2a. 半关闭请求（隧道回源的真实形态）
-
-隧道转发无 body 的 GET 时，会在发完请求后立刻对回源连接 `shutdown(SHUT_WR)`。
-服务端必须把已缓冲的完整请求应答完再关闭连接，否则会随机返回 502。
-
-    g++ -std=c++20 -O1 -Isrc tmpscripts/origin_loop.cpp src/tunnel/proxy.cpp -o /tmp/origin_loop -lpthread
-    /tmp/origin_loop 127.0.0.1 8080 /securepath/panel 60 6 1
-
-预期：`TOTAL n=60 fails=0 halfclose=1`（最后一个参数为 1 表示发完请求即半关闭）。
-把最后一个参数改成 0 则验证普通请求路径。
-
 ## 2c. 双向转发必须两个线程（回归重点）
 
 VLESS over WebSocket 的每个会话用两个线程：client→upstream 与 upstream→client
@@ -589,6 +578,116 @@ fail=0 xfail=1 skip=0`；剩下那个 `XFAIL` 是 `04b` 半关闭的响应体，
 回归时可开 `--log trace` 数 `[h2 tx] WINDOW_UPDATE` 的行数：
 100 MB 传输应只有 ~100 条（每 MB 一条），出现 6400 条说明退回了逐帧还信用。
 
+
+## 11. 面板认证与派生配置回归（回归重点）
+
+三件事在这一轮同时改了，任何一件回退都会静默把面板变回“免密”或把隧道回源指错：
+
+1. **回环地址不再是免密通行证**。以前 `from_loopback(req)` 一真就直接 return true，
+   本机浏览器不用登录、`ssh -L` 转发过来的请求也不用登录（服务端看到的同样是 127.0.0.1），
+   连**经自己隧道进来的公网请求**也不用登录（隧道回源也发到 127.0.0.1）。
+   现在浏览器必须登录，命令行靠 `X-BPB-CLI` 头拿到全权限。
+2. **浏览器会话 10 分钟、且是会话 cookie**（`Max-Age`/`Expires` 都不带）。
+3. **隧道回源地址由进程自己算**，不再接受表单里填的值。
+
+### 11a. 回环地址不再等于管理员
+
+    D=./.bpbtest11; rm -rf $D
+    ./build/bpb --host 127.0.0.1 --port 18430 --data $D &   # 先不设密码
+    curl -s -o /dev/null -w 'no-pw settings=%{http_code}\n' http://127.0.0.1:18430/securepath/panel/settings
+    # 期望 200：还没设密码，面板本来就该能开
+
+    ./build/bpb --passwd admin s3cret --data $D
+    curl -s -o /dev/null -w 'loopback settings=%{http_code}\n' http://127.0.0.1:18430/securepath/panel/settings
+    curl -s -o /dev/null -w 'loopback warp=%{http_code}\n'     http://127.0.0.1:18430/securepath/panel/warp-status
+    # 期望两行都是 401：**这是本节的核心判据**，修复前这里会是 200
+
+判定项：
+
+1. 设了密码之后，**任何**不带凭据的面板请求都 401，包括从回环地址来的；
+   `/<securePath>/panel` 本身 302 到 `login`，而 `panel/*` 一律 401。
+2. `GET <securePath>/login` 仍要能打开（那是登录页），否则会锁死。
+
+### 11b. 会话 cookie：10 分钟、浏览器关掉就没
+
+    curl -s -D - -o /dev/null -X POST http://127.0.0.1:18430/securepath/login/authenticate \
+      -H 'Content-Type: application/json' --data '{"username":"admin","password":"s3cret"}'
+    # 期望 Set-Cookie: jwtToken=...; Path=/; HttpOnly; SameSite=Strict
+    #      不得出现 Max-Age 或 Expires
+    # 期望 JWT 载荷里 exp - iat == 600
+
+    curl -s -o /dev/null -w '%{http_code}\n' -H "Cookie: jwtToken=<token>" \
+      http://127.0.0.1:18430/securepath/panel/settings
+    # 期望 200；同一 token 在 10 分钟后必须 401
+
+判定项：
+
+1. `Set-Cookie` **不带** `Max-Age`/`Expires`，这样浏览器关闭即丢弃（会话 cookie）。
+2. JWT 的 `exp = iat + 600`；只靠 cookie 的“会话”属性不够，页签开着 10 分钟也必须失效。
+3. 面板里任何 `panel/*` 请求拿到 401 都整体跳登录页（`redirectToLogin()`），
+   不要逐个调用点自己弹 toast。
+
+### 11c. 命令行全权限、免密、免令牌
+
+    # 设了密码之后，命令行依然直接读写，不需要任何凭据
+    curl -s -o /dev/null -w 'cli=%{http_code}\n' -H 'X-BPB-CLI: 1' \
+      http://127.0.0.1:18430/securepath/panel/settings        # 期望 200
+
+    # 没有这个头就是从浏览器/隧道来的，必须登录
+    curl -s -o /dev/null -w 'plain=%{http_code}\n' \
+      http://127.0.0.1:18430/securepath/panel/settings        # 期望 401
+
+    # --cur 也是靠这个头拿实时状态，不需要登录、也不需要令牌文件
+    ./build/bpb --cur --data $D --port 18430
+    # 期望 state 列是 offline/connected（[panel]），而不是 locked/unreachable
+
+判定项：
+
+1. **没有任何令牌文件**：`<data>/` 下不得出现 `clitoken`；命令行不该有需要运维维护的秘密。
+   判定：`ls $D | grep -c clitoken` 必须是 0。
+2. `X-BPB-CLI` 只对**回环地址**的请求有效。从外部地址带这个头必须无效
+   （`curl --interface <lan-ip>` 或从另一台机器测），否则等于把面板对公网开放。
+3. 这个头是**浏览器发不出来**的东西：顶层导航不能带自定义请求头，跨源 JS 加头会触发 CORS 预检，
+   而服务端从不回应预检。所以「带上这个头」等价于「在本机以操作者身份跑程序」。
+4. 设过密码之后，`--cur` 仍然要显示实时状态（`[panel]`），不能退化成 `locked (login required)`。
+5. 隧道场景要单独确认：常驻隧道时，经隧道进来的面板请求**必须**要求登录
+   （回源连接同样来自 127.0.0.1，这一条正是老实现漏掉的口子）。
+
+### 11d. WireGuard 开关不能在没有账号时打开
+
+    curl -s -X PUT -H 'Content-Type: application/json' -H "Cookie: jwtToken=<token>" \
+      --data-binary '{"wgOutboundEnabled":"true"}' \
+      http://127.0.0.1:18430/securepath/panel/update-settings
+    # 期望 success:false，message 提示先注册 WARP 账号
+
+    curl -s -H "Cookie: jwtToken=<token>" http://127.0.0.1:18430/securepath/panel/warp-status
+    # 期望 enabled:false, accounts:0
+
+判定项：
+
+1. 账号池为空时保存**必须拒绝**，并把 `wgOutbound.enabled` 保持 `false`
+   —— 不能“存了 but 没生效”，那正是 `warp=off` 却显示「已启用」的来源。
+2. 拒绝时 `body` 是 `null` 而原因在 `message`：面板必须按“非数组”分支提示，
+   否则 `body.forEach` 会抛 TypeError，操作者只看到一条无意义的报错。
+3. `start_wg_outbound()` 报错要能读：账号池空、握手超时是两种不同的原因。
+
+### 11e. 隧道回源地址不接受表单值
+
+    curl -s -X PUT -H 'Content-Type: application/json' -H "Cookie: jwtToken=<token>" \
+      --data-binary '{"cfTunnelOrigin":"10.0.0.9:1234"}' \
+      http://127.0.0.1:18430/securepath/panel/update-settings -o /dev/null
+
+    curl -s -H "Cookie: jwtToken=<token>" http://127.0.0.1:18430/securepath/panel/settings \
+      | python3 -c "import json,sys;print(json.load(sys.stdin)['body']['proxySettings']['cfTunnelOrigin'])"
+    # 期望 127.0.0.1:18430（= 实际 --port），而不是 10.0.0.9:1234
+
+判定项：
+
+1. `originHost`/`originPort` 一律由 `store_.listen_port()` 重算，请求里带什么都被忽略。
+2. 面板上 `#cfTunnelOrigin` 是 `readonly`；「监听端口」改名为「对外端口」，
+   并说明无端口映射时它等于实际监听端口。
+3. 两者语义不能重叠：对外端口是**订阅里写的**端口，回源是**隧道转给谁**，
+   混用会让隧道转到没人监听的端口（边缘 502/530）。
 
 ## 0. 日志开关
 

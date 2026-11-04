@@ -93,6 +93,12 @@ public:
     virtual bool write_rst_stream(std::uint32_t streamId, std::uint32_t errorCode) = 0;
 
     virtual void close() = 0;
+
+    // Wakes a poll()/SSL blocking wait without tearing the object down, and
+    // makes every subsequent read_frame() fail immediately. Used by the
+    // connector's stop() so the relay thread leaves within a poll interval
+    // instead of waiting for the edge to close first.
+    virtual void abort() = 0;
 };
 
 inline constexpr const char* kUpgradeHeader = "cf-cloudflared-proxy-connection-upgrade";

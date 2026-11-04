@@ -82,7 +82,12 @@ target_compile_definitions(lwip PRIVATE LWIP_NO_UNISTD_H=1)
 # It is listed here so "all" and the configure-time summary agree with what the
 # binary reports at startup.
 set(BPB_ALL_INBOUNDS vless trojan shadowsocks vmess vless-xhttp vless-grpc)
-set(BPB_INBOUNDS "vless" CACHE STRING
+# Default is "all": a binary that silently lacks a protocol is a trap this
+# project kept falling into -- the panel offers the gRPC switch, the switch
+# stores true, and the subscription still has no gRPC line because the inbound
+# was never compiled in (src/sub/common.cpp gates on inbound::has("vless-grpc")).
+# A build that wants the old trimmed behaviour passes -DBPB_INBOUNDS=vless.
+set(BPB_INBOUNDS "all" CACHE STRING
     "Inbound protocols to compile: comma separated, or 'all' for every implemented one")
 
 if(BPB_INBOUNDS STREQUAL "all")

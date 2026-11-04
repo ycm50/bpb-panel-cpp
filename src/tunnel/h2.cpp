@@ -5,6 +5,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -13,10 +14,12 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
 #include <cstring>
 #include <set>
 
@@ -306,6 +309,7 @@ public:
     bool send_credit_available(std::uint32_t streamId) override;
     bool write_rst_stream(std::uint32_t streamId, std::uint32_t errorCode) override;
     void close() override;
+    void abort() override;
 
 private:
     // Blocks until the connection-level AND stream-level send windows can take
@@ -336,6 +340,8 @@ private:
     HpackTable reqTable_;
     bool started_ = false;
     bool closed_ = false;
+    // Set by abort(): every blocking wait must fail out immediately.
+    std::atomic<bool> aborted_{false};
     // Set by read_frame/send paths when the transport is gone. Survives into
     // poll()/write_data() so every caller can see "this connection is dead"
     // without having to inspect errno.
@@ -394,8 +400,9 @@ bool H2ServerImpl::send_all(const void* data, std::size_t len) {
         if (n <= 0) {
             int e = SSL_get_error(ssl_, n);
             if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+                if (aborted_.load()) return false;
                 pollfd pfd{fd_, static_cast<short>(e == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT), 0};
-                ::poll(&pfd, 1, 5000);
+                ::poll(&pfd, 1, 100);
                 continue;
             }
             fatal_ = true;
@@ -485,19 +492,47 @@ bool H2ServerImpl::connect(const std::string& host, std::uint16_t port, const st
         return false;
     }
     fd_ = -1;
-    for (addrinfo* p = res; p; p = p->ai_next) {
-        int s = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+    // Non-blocking connect with a real deadline. A blocking connect() honours
+    // neither connectTimeoutMs nor stop(): a black-holed edge kept a SYN-SENT
+    // socket (and its thread) alive for minutes after the panel was told to
+    // sleep. 100 ms slices also let abort() take effect within one tick.
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms > 0 ? timeout_ms : 15000);
+    for (addrinfo* p = res; p && fd_ < 0; p = p->ai_next) {
+        int s = ::socket(p->ai_family, p->ai_socktype | SOCK_NONBLOCK, p->ai_protocol);
         if (s < 0) continue;
-        if (::connect(s, p->ai_addr, p->ai_addrlen) == 0) {
-            fd_ = s;
-            break;
+        int rc = ::connect(s, p->ai_addr, p->ai_addrlen);
+        if (rc != 0 && errno == EINPROGRESS) {
+            for (;;) {
+                if (aborted_.load() || std::chrono::steady_clock::now() >= deadline) {
+                    rc = -1;
+                    break;
+                }
+                pollfd pfd{s, POLLOUT, 0};
+                const int pr = ::poll(&pfd, 1, 100);
+                if (pr == 0) continue;             // still connecting
+                if (pr < 0) { rc = -1; break; }
+                int soerr = 0;
+                socklen_t sl = sizeof(soerr);
+                if (::getsockopt(s, SOL_SOCKET, SO_ERROR, &soerr, &sl) != 0 || soerr != 0)
+                    rc = -1;
+                else
+                    rc = 0;
+                break;
+            }
         }
-        ::close(s);
+        if (rc != 0) { ::close(s); continue; }
+        fd_ = s;
     }
     freeaddrinfo(res);
     if (fd_ < 0) {
-        error = "tcp connect failed";
+        error = aborted_.load() ? "aborted" : "tcp connect failed";
         return false;
+    }
+    // Back to blocking for the TLS layer (its own 5 s poll slices handle EAGAIN).
+    {
+        const int fl = ::fcntl(fd_, F_GETFL, 0);
+        if (fl >= 0) ::fcntl(fd_, F_SETFL, fl & ~O_NONBLOCK);
     }
     int one = 1;
     setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -604,6 +639,7 @@ bool H2ServerImpl::startHttp2(int timeout_ms, std::string& error) {
 
 int H2ServerImpl::read_frame(int timeout_ms, std::uint8_t& type, std::uint8_t& flags,
                              std::uint32_t& streamId, std::vector<std::uint8_t>& payload) {
+    if (aborted_.load()) return -1;
     if (fd_ < 0 || !ssl_ || fatal_) return -1;
     // SSL_pending() must be checked first: a TLS record can already hold the
     // next frame while the socket itself has nothing to report, and poll()
@@ -1003,6 +1039,17 @@ bool H2ServerImpl::write_rst_stream(std::uint32_t streamId, std::uint32_t errorC
     std::vector<std::uint8_t> p;
     put_u32(p, errorCode);
     return send_frame(kFrameRstStream, 0, streamId, p.data(), p.size());
+}
+
+// Stops the connector from the HTTP thread. shutdown(2) -- unlike close(2) --
+// wakes a poll()/SSL_read() blocked in another thread without releasing the
+// descriptor, so close() stays the single owner of SSL_free/::close and no
+// thread can ever be left writing into a freed SSL.
+void H2ServerImpl::abort() {
+    aborted_.store(true);
+    fatal_ = true;
+    if (fatalReason_.empty()) fatalReason_ = "aborted";
+    if (fd_ >= 0) ::shutdown(fd_, SHUT_RDWR);
 }
 
 void H2ServerImpl::close() {

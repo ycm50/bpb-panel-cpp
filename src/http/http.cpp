@@ -3,6 +3,12 @@
 #include "util/util.h"
 
 #include <algorithm>
+#ifdef _WIN32
+#include <ws2tcpip.h>
+#else
+#include <netdb.h>
+#include <sys/socket.h>
+#endif
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -70,8 +76,11 @@ Server::~Server() {
     if (listener_ != net::kInvalid) net::close(listener_);
 }
 
-bool Server::enable_tls(const std::string& cert_path, const std::string& key_path, std::string& error) {
-    if (!net::tls_init_server(cert_path, key_path, error)) return false;
+bool Server::enable_tls(const std::string& cert_path, const std::string& key_path,
+                       std::string& error) {
+    // Per-listener context, so a plain-HTTP panel listener and a TLS proxy
+    // listener can live in the same process.
+    if (!tls_ctx_.init(cert_path, key_path, error)) return false;
     tls_on_ = true;
     return true;
 }
@@ -125,16 +134,26 @@ void Server::accept_new() {
         net::set_nodelay(fd);
         auto c = std::make_unique<Conn>();
         c->fd = fd;
+        // Remember who is calling: the panel needs a password from the outside,
+        // but a local tool must be able to read live state without one.
+        {
+            char hostbuf[64] = {0};
+            if (::getnameinfo(reinterpret_cast<sockaddr*>(&addr), len, hostbuf, sizeof(hostbuf),
+                              nullptr, 0, NI_NUMERICHOST) == 0) {
+                c->peer = hostbuf;
+            }
+        }
         now(c->last_active);
-        if (tls_on_) {
+        if (tls_on_ && !tls_detect_) {
             std::string error;
-            c->ssl = net::tls_new_server(fd, error);
+            c->ssl = net::tls_new_server(tls_ctx_, fd, error);
             if (!c->ssl) {
                 net::close(fd);
                 continue;
             }
             c->handshaking = true;
         }
+        // Detect mode: decide later, from the first byte the peer sends.
         conns_.push_back(std::move(c));
     }
 }
@@ -169,6 +188,41 @@ bool Server::read_into(Conn& c) {
     }
 }
 
+// Detect mode: look at the first byte without consuming it.
+//
+//   * 0x16 (TLS handshake record) -> upgrade to TLS, then run SSL_accept.
+//   * anything else              -> plain HTTP; the bytes stay in the socket and
+//                                   read_into() picks them up as usual.
+//
+// Called once per connection, after the socket reports readable.
+bool Server::peek_decide(Conn& c, std::string& error) {
+    unsigned char first = 0;
+#ifdef _WIN32
+    int n = ::recv(c.fd, reinterpret_cast<char*>(&first), 1, MSG_PEEK);
+    const bool would_block = (n <= 0) && net::would_block(net::last_error());
+#else
+    int n = static_cast<int>(::recv(c.fd, &first, 1, MSG_PEEK));
+    const bool would_block = (n < 0) && net::would_block(net::last_error());
+#endif
+    // Nothing readable yet is not an error: report it and let the poll loop come
+    // back. (Treating it as "connection died" is what killed plain-XHTTP
+    // downlinks whose first bytes had not arrived yet.)
+    if (would_block) return true;
+    if (n <= 0) {
+        error = "closed before protocol byte";
+        return false;
+    }
+    c.protocol_decided = true;
+    // 0x16 0x03 0x0x: TLS handshake record with SSLv3+ major version. A plain
+    // HTTP request always starts with a method token (A-Z), never with 0x16.
+    c.want_tls = (first == 0x16);
+    if (!c.want_tls) return true;
+    c.ssl = net::tls_new_server(tls_ctx_, c.fd, error);
+    if (!c.ssl) return false;
+    c.handshaking = true;
+    return true;
+}
+
 bool Server::handshake_step(Conn& c) {
     if (!c.ssl) return false;
     int rc = SSL_accept(c.ssl);
@@ -179,6 +233,25 @@ bool Server::handshake_step(Conn& c) {
     int err = SSL_get_error(c.ssl, rc);
     if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) return true;
     return false;
+}
+
+// A client handed a TLS config that reaches a plaintext listener opens with a
+// TLS ClientHello (0x16 0x03 ...), never with an HTTP method. Waiting for a
+// "\r\n\r\n" that can never arrive parks that connection for the whole 60 s
+// idle timeout, and the user sees "it connects and then nothing happens".
+// Judging the first line as soon as it can be judged turns that into an
+// immediate 400 instead.
+static bool impossible_http_prefix(const std::string& in) {
+    if (in.empty()) return false;
+    static const std::string kPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    const std::size_t n = in.size() < kPreface.size() ? in.size() : kPreface.size();
+    if (in.compare(0, n, kPreface.substr(0, n)) == 0) return false;   // maybe an h2 preface
+    for (std::size_t i = 0; i < in.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(in[i]);
+        if (c == '\r' || c == '\n' || c == ' ') return false;       // method token ended: fine
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))) return true;
+    }
+    return false;   // only letters so far: still undecided
 }
 
 static bool parse_request(std::string& in, Request& req) {
@@ -247,7 +320,19 @@ void Server::process(Conn& c) {
     }
     while (true) {
         Request req;
-        if (!parse_request(c.in, req)) return;
+        if (!parse_request(c.in, req)) {
+            // Never going to be a request: answer 400 and hang up instead of
+            // holding the socket until the idle timeout.
+            if (impossible_http_prefix(c.in)) {
+                static const char kBad[] =
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                c.out.append(kBad, sizeof(kBad) - 1);
+                c.close_after_write = true;
+                flush(c);
+            }
+            return;
+        }
+        req.peer = c.peer;
         bool keep_alive = true;
         auto conn_hdr = to_lower(req.header("connection"));
         if (req.version == "HTTP/1.0" || conn_hdr.find("close") != std::string::npos) keep_alive = false;
@@ -441,6 +526,14 @@ void Server::run() {
                 }
                 if (c->out.empty()) dead.push_back(idx);
                 continue;
+            }
+            // Detect mode: the protocol is unknown until the first byte lands.
+            // Protocol detection happens lazily inside read_into(): peeking here
+            // raced with XHTTP's split POST/GET ordering and could strand a
+            // connection whose first byte had not arrived yet.
+            if (tls_detect_ && !c->protocol_decided) {
+                std::string derr;
+                if (!peek_decide(*c, derr)) { dead.push_back(idx); continue; }
             }
             if (c->handshaking) {
                 if (!handshake_step(*c)) {

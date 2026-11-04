@@ -81,37 +81,6 @@ std::string trim_slash(std::string s) {
     return s;
 }
 
-std::string json_escape_value(const std::string& in) {
-    std::string out;
-    out.reserve(in.size() + 8);
-    for (char c : in) {
-        if (c == '"' || c == '\\') out.push_back('\\');
-        out.push_back(c);
-    }
-    return out;
-}
-
-// A locked panel still answers "which domain am I serving?" -- it just wants a
-// session first. settings.json keeps the compatibility copy of the password, so
-// --cur can log in, ask the *running* process, and report the live state instead
-// of guessing from files.
-std::string login_cookie(const std::string& base_url, const std::string& user,
-                         const std::string& password) {
-    if (user.empty() || password.empty()) return {};
-    const std::string body = "{\"username\":\"" + json_escape_value(user) +
-                             "\",\"password\":\"" + json_escape_value(password) + "\"}";
-    net::httpc::Response res;
-    std::string error;
-    if (!net::httpc::post(base_url + "login/authenticate", body, res, error, 2500,
-                          {{"Content-Type", "application/json"}}))
-        return {};
-    const std::string cookie = res.header("set-cookie");
-    const auto at = cookie.find("jwtToken=");
-    if (at == std::string::npos) return {};
-    const auto end = cookie.find(';', at);
-    return cookie.substr(at + 9, end == std::string::npos ? std::string::npos : end - (at + 9));
-}
-
 // Fills domain/state for one instance: files first (they survive a dead panel),
 // then ask the running panel, which is the only place that knows whether the
 // tunnel is actually connected.
@@ -135,23 +104,15 @@ void describe(Instance& inst) {
     url += "panel/tunnel-status";
     net::httpc::Response res;
     std::string error;
-    bool ok = net::httpc::get(url, res, error, 2000);
-    if ((!ok || res.status == 401 || res.status == 403)) {
-        const std::string base = url.substr(0, url.size() - std::string("panel/tunnel-status").size());
-        const std::string user = json_string(config, "accEmail");
-        const std::string password = json_string(read_file(inst.data_dir + "/settings.json"), "pwd");
-        const std::string token = login_cookie(base, user, password);
-        if (!token.empty()) {
-            ok = net::httpc::get(url, res, error, 2000, {{"Cookie", "jwtToken=" + token}});
-            if (ok && res.status == 200) inst.source = "panel (authenticated)";
-        }
-    }
+
+    // The command line has full access, so it just says who it is. No token to
+    // read, no login round trip: a header a browser cannot send on a navigation.
+    const bpb::net::httpc::Headers headers = {{"X-BPB-CLI", "1"}};
+    const bool ok = net::httpc::get(url, res, error, 2000, headers);
     if (ok && res.status == 200) {
+        inst.source = "panel";
         const std::string host = json_string(res.body, "hostname");
-        if (!host.empty()) {
-            inst.domain = host;
-            if (inst.source != "panel (authenticated)") inst.source = "panel";
-        }
+        if (!host.empty()) inst.domain = host;
         if (json_bool(res.body, "connected")) {
             inst.state = "connected";
         } else if (json_bool(res.body, "running")) {

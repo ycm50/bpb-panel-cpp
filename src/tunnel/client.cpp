@@ -136,6 +136,11 @@ bool TunnelClient::parse_token(const std::string& token, TunnelConfig& out, std:
     return true;
 }
 
+void TunnelClient::abort_connection() {
+    std::lock_guard<std::mutex> lk(mutex_);
+    if (live_) live_->abort();
+}
+
 // ---- cloudflared header serialization (connection/header.go) ----------------
 // User headers travel inside one h2 header, base64 (RawStd) encoded as
 //   b64(name):b64(value);b64(name):b64(value)
@@ -580,6 +585,27 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
     cb.on_error = [&](const std::string& e) { log("[tunnel] error: " + e); };
 
     H2Server* srv = H2Server::create(cb);
+    {
+        // Published before the first blocking call, so a stop() that lands
+        // while we are still connecting or handshaking can shut the socket
+        // down instead of waiting for connectTimeoutMs (or for the edge).
+        std::lock_guard<std::mutex> lk(mutex_);
+        live_ = srv;
+    }
+    // Owns the server on every return path: clear the published pointer first
+    // (so abort_connection() never touches freed memory), then destroy it,
+    // which closes the TLS session and the socket.
+    struct LiveGuard {
+        TunnelClient* self;
+        H2Server* srv;
+        ~LiveGuard() {
+            {
+                std::lock_guard<std::mutex> lk(self->mutex_);
+                if (self->live_ == srv) self->live_ = nullptr;
+            }
+            delete srv;
+        }
+    } liveGuard{this, srv};
     srvWriteHdrs = [srv](std::uint32_t id, const std::string& st,
                          const std::vector<std::pair<std::string, std::string>>& h, bool end) {
         return srv->write_headers(id, st, h, end);
@@ -595,12 +621,10 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
     std::string err;
     if (!srv->connect(cfg.edgeHost, cfg.edgePort, cfg.edgeSni, cfg.connectTimeoutMs, err)) {
         status.error = err;
-        delete srv;
         return false;
     }
     if (!srv->startHttp2(cfg.connectTimeoutMs, err)) {
         status.error = err;
-        delete srv;
         return false;
     }
     status.connected = true;
@@ -937,6 +961,9 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
         else if (activeStream) pollTimeoutMs = cfg.activePollMs;
         else pollTimeoutMs = cfg.idlePollMs;
         if (!srv->poll(pollTimeoutMs)) {
+            // A stop() shuts the socket down under us; that is not an edge
+            // failure and must not be reported to the panel as one.
+            if (stopping_) break;
             // The edge went away (or sent GOAWAY). Leave the loop so the
             // supervisor can reconnect with backoff; staying here meant every
             // request hit a dead connection and the loop span at full speed.
@@ -987,7 +1014,6 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
                 if (!srv->poll(cfg.idlePollMs)) {
                     status.error = "edge connection lost during bootstrap";
                     log("[tunnel] " + status.error);
-                    delete srv;
                     return false;
                 }
                 // Proxied streams keep flowing while the control stream is
@@ -1009,7 +1035,6 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
             if (!got) {
                 status.error = "bootstrap timed out";
                 log("[tunnel] " + status.error);
-                delete srv;
                 return false;
             }
 
@@ -1044,7 +1069,6 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
                 if (!srv->poll(cfg.idlePollMs)) {
                     status.error = "edge connection lost during registration";
                     log("[tunnel] " + status.error);
-                    delete srv;
                     return false;
                 }
                 if (!streams.empty()) pumpOrigins();
@@ -1073,14 +1097,12 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
                 LI("[tunnel] REGISTERED with edge");
             } else {
                 log("[tunnel] registration failed: " + status.error);
-                delete srv;
                 return false;
             }
             consumed = before;
         }
     }
 
-    delete srv;
     return true;
 }
 

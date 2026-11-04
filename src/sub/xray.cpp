@@ -122,6 +122,11 @@ json build_tls_settings(const json& s, const std::string& server_name, const std
     json j = json::object();
     j["serverName"] = server_name;
     j["fingerprint"] = fp;
+    // Self-signed deployment: the client trusts the pinned certificate instead
+    // of a CA. Xray 26.x removed allowInsecure in favour of exactly this, so a
+    // config that still carried allowInsecure would be refused outright.
+    const std::string pin = pinned_cert(s);
+    if (!pin.empty()) j["pinnedPeerCertSha256"] = pin;
     if (!alpn.empty()) {
         std::vector<std::string> parts;
         for (auto& p : split(alpn, ',')) parts.push_back(p);
@@ -259,7 +264,8 @@ json build_ws_outbound(const json& s, const std::string& tag, const std::string&
     if (s.contains("upstreamParams") && s["upstreamParams"].is_object()) {
         upstream_server = s["upstreamParams"].value("upstreamServer", std::string());
     }
-    bool is_tls = is_https(s, port) || (!upstream_server.empty() && address == upstream_server);
+    bool is_tls = port_uses_tls(s, domain, port) ||
+                  (!upstream_server.empty() && address == upstream_server);
     auto sni_host = select_sni_host(s, address, domain);
 
     bool enable_ech = flag(s, "enableECH") && !is_fragment;
@@ -952,7 +958,18 @@ void add_best_ping_configs(json& configs, const std::string& s_json, const json&
 }
 
 void add_best_fragment_configs(json& configs, const json& s, const json& chain_proxy) {
-    std::string main_domain = str(s, "mainDomain");
+    // The fragment profile is a fixed set of outbounds against ONE entrance, and
+    // that entrance is whatever the subscription would dial anyway: the edge
+    // hostname on 443 in tunnel mode, the advertised address/port in direct
+    // mode. Hard-coding 443 here is what kept the "Smart Fragment" profile
+    // pointing at a TLS edge that direct mode does not have.
+    const std::string main_domain =
+        access_mode_direct(s) ? direct_host(s) : str(s, "mainDomain");
+    int main_port = 443;
+    {
+        auto ports = effective_ports(s, main_domain);
+        if (!ports.empty()) main_port = ports.front();
+    }
     int delay_min = num(s, "fragmentDelayMin", 1);
     int delay_max = num(s, "fragmentDelayMax", 1);
     bool is_chain = !chain_proxy.is_null();
@@ -967,7 +984,7 @@ void add_best_fragment_configs(json& configs, const json& s, const json& chain_p
         if (is_chain) {
             outbounds.push_back(modify_outbound(chain_proxy, "chain-" + std::to_string(i + 1), tag));
         }
-        outbounds.push_back(build_ws_outbound(s, tag, "vless", main_domain, 443, main_domain, true,
+        outbounds.push_back(build_ws_outbound(s, tag, "vless", main_domain, main_port, main_domain, true,
                                               frags[i],
                                               std::to_string(delay_min) + "-" + std::to_string(delay_max)));
     }
@@ -1003,17 +1020,14 @@ bool build_xray_custom(const json& s, bool is_fragment, std::string& out_json, s
     std::string custom_domain = str(s, "customDomain");
     std::vector<std::string> domains{main_domain};
     if (!custom_domain.empty()) domains.push_back(custom_domain);
+    // Direct mode has exactly one address and one port; the custom domain is
+    // not a second entrance, it is the name of that same entrance.
+    const bool is_direct = access_mode_direct(s);
+    if (is_direct) domains.assign(1, direct_host(s));
 
     auto protocols = get_protocols(s);
     // Websocket plus whichever extra transports the panel switches turned on.
     const std::vector<std::string> transports = get_transports(s);
-
-    std::vector<int> ports;
-    if (s.contains("ports") && s["ports"].is_array()) {
-        for (auto& p : s["ports"]) {
-            if (p.is_number_integer()) ports.push_back(p.get<int>());
-        }
-    }
 
     std::string upstream_server;
     int upstream_port = 0;
@@ -1030,11 +1044,9 @@ bool build_xray_custom(const json& s, bool is_fragment, std::string& out_json, s
         json proxies = json::array();
         json chains = json::array();
 
-        std::vector<int> total_ports;
-        bool is_workers_dev = ends_with(domain, "workers.dev");
-        for (int port : ports) {
-            if ((!is_fragment && is_workers_dev) || is_https(s, port)) total_ports.push_back(port);
-        }
+        // tunnel: the edge's https ports from settings.ports. direct: the one
+        // port this process bound -- effective_ports() decides, not a whitelist.
+        std::vector<int> total_ports = effective_ports(s, domain);
 
         auto hosts = get_config_addresses(s, domain, is_fragment, error);
         if (hosts.empty()) return false;

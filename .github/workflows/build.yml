@@ -57,6 +57,8 @@ jobs:
     outputs:
       protocols: ${{ steps.list.outputs.protocols }}
       linux_matrix: ${{ steps.list.outputs.linux_matrix }}
+      combined: ${{ steps.list.outputs.combined }}
+      linux_matrix_all: ${{ steps.list.outputs.linux_matrix_all }}
     steps:
       - uses: actions/checkout@v4
       - id: list
@@ -78,6 +80,24 @@ jobs:
           esac
           json="$(printf '%s\n' $list | sed 's/.*/"&"/' | paste -sd, -)"
           echo "protocols=[$json]" >> "$GITHUB_OUTPUT"
+          # A combined binary with every inbound is published next to the
+          # per-protocol ones. install.sh downloads it by default: a trimmed
+          # binary silently lacks gRPC/XHTTP, so the panel switches store
+          # true while the subscription can never contain such a line.
+          if [ "${{ inputs.protocols }}" = "all" ]; then
+            echo "combined=all" >> "$GITHUB_OUTPUT"
+            combos_all=""
+            for pair in amd64:linux/amd64 arm64:linux/arm64 armv7:linux/arm/v7 386:linux/386 riscv64:linux/riscv64; do
+              arch=${pair%%:*}
+              plat=${pair#*:}
+              [ -n "$combos_all" ] && combos_all="$combos_all,"
+              combos_all="$combos_all{\"protocol\":\"all\",\"arch\":\"$arch\",\"platform\":\"$plat\"}"
+            done
+            echo "linux_matrix_all=[$combos_all]" >> "$GITHUB_OUTPUT"
+          else
+            echo "combined=" >> "$GITHUB_OUTPUT"
+            echo "linux_matrix_all=[]" >> "$GITHUB_OUTPUT"
+          fi
 
           # 架构 -> docker platform 的映射只写一次，直接生成完整的 协议x架构
           # 组合。故意不用 matrix.include 去“补” platform：include 的合并规则
@@ -94,6 +114,11 @@ jobs:
           echo "linux_matrix=[$combos]" >> "$GITHUB_OUTPUT"
           echo "building: $list"
 
+  # --- 并行度：不要给 cmake --build 传 -j -------------------------------------
+  # Ninja 自带默认值 = 可用核心数 + 2（20 核机器上是 22），已经吃满。手工传
+  # -j 不会更快，反而要解决"怎么在容器/MSYS2 里取核心数"这个问题——第一版就是这么
+  # 踩的：Windows 那 6 个 job 全部失败在 Configure and build，而 Linux 35 个全过。
+  # 别加。
   # ---------------------------------------------------------------------------
   # 各架构 × 各协议的静态 Linux 二进制。
   #
@@ -147,6 +172,48 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
+  # 全协议二进制（-DBPB_INBOUNDS=all）：每个架构一个，安装脚本默认取它。
+  # 与下面的分协议矩阵并存，不替换它们。
+  # ---------------------------------------------------------------------------
+  linux-all:
+    name: linux-${{ matrix.arch }}-all
+    needs: plan
+    if: needs.plan.outputs.combined == 'all'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.linux_matrix_all) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        if: matrix.arch != 'amd64'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build static binary (all inbounds)
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v "$PWD:/src" -w /src alpine:3.22 sh -c '
+              set -e
+              apk add --no-cache g++ musl-dev cmake samurai \
+                      openssl-dev openssl-libs-static zlib-dev zlib-static >/dev/null
+              cmake -S . -B /tmp/b -G Ninja -DCMAKE_BUILD_TYPE=Release -DBPB_STATIC=ON \
+                    -DBPB_INBOUNDS=all
+              cmake --build /tmp/b
+              strip /tmp/b/bpb
+              cp /tmp/b/bpb dist/bpb-linux-${{ matrix.arch }}-all
+            '
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bpb-linux-${{ matrix.arch }}-all
+          path: dist/bpb-linux-${{ matrix.arch }}-all
+          if-no-files-found: error
+  # ---------------------------------------------------------------------------
   # Windows（MSYS2 UCRT64；CMake 会拒绝 MSVC），同样按协议分开。
   # ---------------------------------------------------------------------------
   windows:
@@ -199,7 +266,7 @@ jobs:
   # ---------------------------------------------------------------------------
   release:
     name: release
-    needs: [plan, linux, windows]
+    needs: [plan, linux, linux-all, windows]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

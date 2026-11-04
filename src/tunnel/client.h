@@ -1,11 +1,14 @@
 #pragma once
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <functional>
 #include <string>
 #include <vector>
 
 namespace bpb::tunnel {
+
+class H2Server;
 
 // End-to-end Cloudflare Tunnel client: dials the edge over TCP, speaks HTTP/2 as
 // a server, registers over the capnp RPC control stream, then relays the edge's
@@ -65,13 +68,28 @@ public:
              const std::function<void(const std::string&)>& log,
              const std::function<void(const TunnelStatus&)>& on_status = {});
 
-    void stop() { stopping_.store(true); }
+    // Ask the relay to stop. Wakes the connection immediately (shutdown(2) on
+    // the edge socket) so run() returns within one poll slice instead of
+    // sitting in a 100 ms poll -- or, worse, in a minutes-long blocking
+    // connect() to a black-holed edge.
+    void stop() {
+        stopping_.store(true);
+        abort_connection();
+    }
     bool stopping() const { return stopping_.load(); }
 
 private:
+    // shutdown(2)s the live edge socket, if any. Safe to call from another
+    // thread: the pointer is published under mutex_ and cleared before the
+    // server is destroyed.
+    void abort_connection();
+
     // Checked by the run loop and by the supervisor's backoff sleep; atomic so
     // stop() may be called from the HTTP thread.
     std::atomic<bool> stopping_{false};
+    // Guards live_ only; never held across a blocking operation.
+    mutable std::mutex mutex_;
+    H2Server* live_ = nullptr;
 };
 
 } // namespace bpb::tunnel

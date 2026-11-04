@@ -7,6 +7,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <vector>
@@ -106,6 +107,12 @@ bool save(const std::string& data_dir, const std::string& user, const std::strin
 
     const std::string path = path_for(data_dir);
     {
+        // 'bpb --passwd' is the first thing an operator runs on a fresh box, so
+        // the data directory may not exist yet. Without this the write failed
+        // silently and the panel then had a "credential exists" marker but no
+        // file behind it, which rejects every login.
+        std::error_code ec;
+        std::filesystem::create_directories(data_dir, ec);
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
         if (!out) {
             error = "cannot write " + path;
@@ -165,12 +172,15 @@ int run_cli(const std::string& data_dir, int port, const std::vector<std::string
             std::fprintf(stderr, "cannot set password: %s\n", error.c_str());
             return 1;
         }
-        // Keep settings.json in step so a downgrade to the old code still locks
-        // the panel the same way.
+        // settings.json must NOT keep the plaintext password: it is synced to
+        // the panel, copied around, and rewritten on every settings save. Keep
+        // an opaque marker so an older build still locks the panel, and rotate
+        // the JWT key so every existing session dies with the old credential.
         Store store;
         std::string error2;
         if (store.load(data_dir, error2)) {
-            store.pwd() = password;
+            store.pwd() = "\x01";     // marker: "a credential exists", not the secret
+            (void)store.rotate_secret();
             store.save(error2);
         }
         std::printf("password set for user '%s' in %s\n", user.c_str(), path.c_str());

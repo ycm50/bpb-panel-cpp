@@ -281,6 +281,17 @@ h4 {
     align-items: center;
     justify-content: space-between;
     gap: 10px;
+    /* A hint is a third child. In the row layout below 600px it used to be
+       squeezed into a narrow column next to the label, which wrapped the label
+       one character per line ("对/外/端/口"). Let it take a full line of its
+       own instead, under the control it explains. */
+    flex-wrap: wrap;
+}
+
+.form-control>.field-hint {
+    flex: 1 0 100%;
+    width: 100%;
+    text-align: left;
 }
 
 .modal-form-control {
@@ -575,6 +586,8 @@ input[type="url"]:read-only,
 textarea:read-only {
     color: gray;
     background-color: var(--color-bg-card);
+    /* A derived value, not an editable field: say so instead of just greying it. */
+    cursor: not-allowed;
 }
 
 textarea {
@@ -592,6 +605,41 @@ select {
     appearance: none;
     -webkit-appearance: none;
     -moz-appearance: none;
+}
+
+.tls-cert-box {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 100%;
+}
+
+.tls-cert-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    font-size: 0.9em;
+}
+
+.tls-cert-row span {
+    opacity: 0.75;
+    white-space: nowrap;
+}
+
+.tls-pin {
+    font-family: ui-monospace, monospace;
+    font-size: 0.78em;
+    word-break: break-all;
+    text-align: right;
+    opacity: 0.95;
+}
+
+.tls-cert-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 6px;
+    flex-wrap: wrap;
 }
 
 .protocols {
@@ -665,6 +713,29 @@ select {
 .button .material-symbols-rounded {
     text-shadow: none;
     color: var(--color-brand-primary);
+}
+
+/* Inline SVG icon for buttons whose glyph is not in the shipped icon subset.
+   Sized in em so it tracks the button font size, and filled with currentColor
+   so the existing :hover / :disabled rules still apply. */
+.button .button-icon {
+    width: 1.15em;
+    height: 1.15em;
+    flex: none;
+    fill: var(--color-brand-primary);
+}
+
+.button.delete .button-icon,
+.button-danger .button-icon {
+    fill: var(--color-icon-red);
+}
+
+.button:disabled .button-icon {
+    fill: var(--color-text-muted);
+}
+
+.button:hover .button-icon {
+    fill: currentColor;
 }
 
 .button.delete .material-symbols-rounded {
@@ -1669,6 +1740,22 @@ table tr:not(:last-child) {
                             </div>
                         </div>
                         <div class="form-control">
+                            <label for="directHost">公网地址</label>
+                            <div>
+                                <input type="text" id="directHost" name="directHost"
+                                    placeholder="1.2.3.4 或 example.com（关闭隧道时订阅使用该地址）">
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="directPort">对外端口</label>
+                            <div>
+                                <input type="number" id="directPort" name="directPort" min="1" max="65535"
+                                    placeholder="默认与 --port 相同">
+                            </div>
+                            <small id="direct-hint" class="field-hint">没有端口映射时，这里就是本进程实际监听的端口，订阅使用“公网地址:对外端口”；
+                                前面有 NAT/端口映射时填映射后的端口。隧道回源始终用真实监听端口，不受此处影响。</small>
+                        </div>
+                        <div class="form-control">
                             <label for="cfTunnelToken">隧道 Token</label>
                             <div>
                                 <input type="text" id="cfTunnelToken" name="cfTunnelToken"
@@ -1676,11 +1763,41 @@ table tr:not(:last-child) {
                             </div>
                         </div>
                         <div class="form-control">
+                            <label>TLS 证书</label>
+                            <div class="tls-cert-box">
+                                <div class="tls-cert-row"><span>状态</span><b id="tls-cert-state">读取中…</b></div>
+                                <div class="tls-cert-row"><span>主题</span><b id="tls-cert-subject">—</b></div>
+                                <div class="tls-cert-row"><span>到期</span><b id="tls-cert-expiry">—</b></div>
+                                <div class="tls-cert-row"><span>指纹 (SHA-256)</span>
+                                    <code id="tls-cert-pin" class="tls-pin">—</code>
+                                </div>
+                                <div class="tls-cert-actions">
+                                    <!-- These two use inline SVG instead of the icon font: the
+                                         subset shipped in the binary has no restart_alt glyph, so
+                                         the button used to render the literal ligature name. -->
+                                    <button type="button" class="button" onclick="copyTlsPin(this)">
+                                        <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                            <path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/>
+                                        </svg>复制指纹
+                                    </button>
+                                    <button type="button" class="button button-danger" onclick="regenerateTlsCert(this)">
+                                        <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                            <path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/>
+                                        </svg>重新生成证书
+                                    </button>
+                                </div>
+                                <small class="field-hint">自签证书：客户端靠这个指纹固定信任（订阅里写作 pcs=）。
+                                    重新生成后需要重新下载订阅，且重启进程才会用上新证书。</small>
+                            </div>
+                        </div>
+                        <div class="form-control">
                             <label for="cfTunnelOrigin">本地回源地址</label>
                             <div>
-                                <input type="text" id="cfTunnelOrigin" name="cfTunnelOrigin"
-                                    placeholder="127.0.0.1:8080">
+                                <input type="text" id="cfTunnelOrigin" name="cfTunnelOrigin" readonly>
                             </div>
+                            <small class="field-hint">回源就是本进程自己的监听地址，由监听端口推导，
+                                不能手改。两者不一致时隧道会把流量转发到没人监听的端口
+                                （Cloudflare 侧表现为 502/530）。</small>
                         </div>
                     </div>
                 </details>
@@ -2156,23 +2273,85 @@ function syncTransportExclusion() {
     const ids = ['enableXHTTP', 'enableGRPC'];
     const hint = document.getElementById('extra-transports-hint');
     const box = document.getElementById('extra-transports');
+    // Which of the two extra transports this binary can actually serve. A
+    // vless-only build has no vless-grpc inbound, and src/sub/common.cpp gates
+    // the gRPC lines on inbound::has("vless-grpc"), so the switch would store
+    // true and still produce nothing. Grey it out and say why instead.
+    const compiled = Array.isArray(globalThis.binaryInbounds) ? globalThis.binaryInbounds : null;
+    const missing = [];
     ids.forEach(id => {
         const el = document.getElementById(id);
         if (!el) return;
-        el.disabled = tunnelOn;
-        if (tunnelOn) el.checked = false;
+        const inboundId = id === 'enableGRPC' ? 'vless-grpc' : 'vless-xhttp';
+        // compiled === null means /panel/settings has not answered yet: do not
+        // grey anything out on a guess.
+        const notCompiled = compiled !== null && !compiled.includes(inboundId);
+        if (notCompiled) missing.push(inboundId === 'vless-grpc' ? 'gRPC' : 'XHTTP');
+        if (tunnelOn || notCompiled) {
+            // Remember the user's own choice before forcing the box off, so an
+            // on -> off round trip restores it instead of silently saving
+            // enableGRPC=false / enableXHTTP=false (which is how a gRPC-capable
+            // install ends up with no gRPC node in its subscriptions).
+            if (!el.disabled) el.dataset.tunnelStash = el.checked ? 'true' : 'false';
+            el.disabled = true;
+            el.checked = false;
+        } else {
+            el.disabled = false;
+            if (el.dataset.tunnelStash !== undefined) {
+                el.checked = el.dataset.tunnelStash === 'true';
+                delete el.dataset.tunnelStash;
+            }
+        }
     });
     if (hint) {
-        hint.textContent = tunnelOn
-            ? 'Cloudflare 隧道已启用：隧道只透传 WebSocket，XHTTP / gRPC 在此模式下不可用'
-            : '与 Cloudflare 隧道互斥：隧道开启时这两项不可用';
-        hint.classList.toggle('is-warning', tunnelOn);
+        if (missing.length) {
+            hint.textContent = '此二进制未编入 ' + missing.join(' / ') +
+                '：开关在此版本上是空操作，重新安装全协议版本后才会生成对应线路';
+        } else {
+            hint.textContent = tunnelOn
+                ? 'Cloudflare 隧道已启用：隧道只透传 WebSocket，XHTTP / gRPC 在此模式下不可用'
+                : '与 Cloudflare 隧道互斥：隧道开启时这两项不可用';
+        }
+        hint.classList.toggle('is-warning', tunnelOn || missing.length > 0);
     }
     if (box) box.classList.toggle('is-disabled', tunnelOn);
+    // The port list follows the access mode: an edge terminates TLS for us, a
+    // bare listener does not. Re-render from the currently ticked boxes so the
+    // selection survives the switch.
+    const checkedPorts = [];
+    document.querySelectorAll('#tls-ports input[type=checkbox], #non-tls-ports input[type=checkbox]')
+        .forEach(el => { if (el.checked) checkedPorts.push(Number(el.name)); });
+    const rt = globalThis.runtimeFacts || {};
+    globalThis.runtimeFacts = Object.assign({}, rt, {
+        accessMode: tunnelOn ? 'tunnel' : 'direct'
+    });
+    renderPorts(checkedPorts.filter(n => !Number.isNaN(n)));
 }
+
+// A panel session now lasts ten minutes and lives in a session cookie, so an
+// idle tab WILL hit 401 mid-flight. Handle it in one place instead of leaving
+// each caller to print "status 401" into a toast: bounce to the login page,
+// which is the only useful next step.
+function redirectToLogin() {
+    if (globalThis.__bpbAuthRedirect) return;
+    globalThis.__bpbAuthRedirect = true;
+    window.location.href = './login';
+}
+
+// Wrap fetch so every panel API call shares that behaviour. Non-panel URLs
+// (the IP lookup, the version check) are left alone: their 401s, if any, are
+// not about our session.
+const bpbFetch = globalThis.fetch.bind(globalThis);
+globalThis.fetch = async (input, init) => {
+    const res = await bpbFetch(input, init);
+    const url = String(typeof input === 'string' ? input : (input && input.url) || '');
+    if (res.status === 401 && url.includes('panel/')) redirectToLogin();
+    return res;
+};
 
 getUsage();
 initPanel();
+loadTlsCert();
 fetchIPInfo();
 loadRawFiles();
 
@@ -2195,6 +2374,25 @@ async function initPanel(settings, subscriptions, clients) {
 
             settings = body.proxySettings;            subscriptions = body.subscriptions;
             clients = body.clients;
+            // Facts about the running process (does this listener terminate
+            // TLS, which port did it bind, is the tunnel the entrance). The port
+            // list and the security mode a subscription may advertise follow
+            // from these, not from a hard-coded port whitelist.
+            // Which inbound protocols this binary actually contains. The panel
+            // used to ignore this list completely, so ticking gRPC on a vless-only
+            // build stored enableGRPC=true and still produced no gRPC line
+            // (src/sub/common.cpp gates on inbound::has("vless-grpc")). Record it
+            // so the switches can be greyed out with a reason instead.
+            globalThis.binaryInbounds = Array.isArray(body.inbounds)
+                ? body.inbounds.map(inbound => inbound && inbound.id).filter(Boolean)
+                : [];
+            globalThis.runtimeFacts = body.runtime || {};
+            if (globalThis.runtimeFacts.directHost && !settings.directHost) {
+                settings.directHost = globalThis.runtimeFacts.directHost;
+            }
+            if (globalThis.runtimeFacts.directPort && !settings.directPort) {
+                settings.directPort = globalThis.runtimeFacts.directPort;
+            }
             checkVersion(settings.panelVersion);
         }
 
@@ -2311,6 +2509,11 @@ function renderPanel(proxySettings, subscriptions, clients) {
     renderSubscriptions(subscriptions);
     renderClients(clients);
 
+    // syncTransportExclusion() first: with the tunnel on it unchecks and
+    // disables XHTTP/gRPC, and snapshotting the form before that made a freshly
+    // opened panel look dirty -- one click on the apply button then stored both
+    // as false.
+    syncTransportExclusion();
     globalThis.initialFormData = new FormData(proxyForm);
     handleProxyFormChanges();
     proxyForm.addEventListener('input', handleProxyFormChanges);
@@ -2396,7 +2599,9 @@ function generateSubUrl(type, core, tag) {
     url.searchParams.append('app', core);
     url.hash = `💦 BPB ${tag}`;
 
-    if (core === 'sing-box' & type !== 'raw') {
+    // '&&', not the original single '&': bitwise AND only produced the right
+    // answer because type is never the empty string.
+    if (core === 'sing-box' && type !== 'raw') {
         return `sing-box://import-remote-profile?url=${url.href}`;
     }
 
@@ -2450,10 +2655,112 @@ function showQRCode(subUrl) {
     });
 }
 
+// The Clipboard API only exists in a secure context. With the tunnel off the
+// panel is served over plain http (http://<ip>:<port>/<securePath>/panel), where
+// navigator.clipboard is undefined -- the old body threw a TypeError inside the
+// click handler, so the button did nothing and said nothing.
+// Order: async Clipboard API, then legacy execCommand (works without HTTPS),
+// then show the link in a modal that stays until the user closes it.
+// ---- TLS certificate -------------------------------------------------------
+// The proxy listener uses a self-signed certificate, so the only thing a client
+// can trust is its SHA-256 pin. Show it, let it be copied, and let the operator
+// roll it (which invalidates every subscription until they re-fetch).
+async function loadTlsCert() {
+    const state = document.getElementById('tls-cert-state');
+    if (!state) return;
+    try {
+        const res = await fetch('./panel/tls-cert', { credentials: 'include', cache: 'no-store' });
+        const { success, body } = await res.json();
+        if (!success) throw new Error('request failed');
+        document.getElementById('tls-cert-state').textContent = body.ok ? '已启用' : (body.error || '不可用');
+        document.getElementById('tls-cert-subject').textContent = body.subject || '—';
+        document.getElementById('tls-cert-expiry').textContent = body.notAfter || '—';
+        const pin = document.getElementById('tls-cert-pin');
+        pin.textContent = body.sha256 || '—';
+        pin.dataset.pin = body.sha256 || '';
+    } catch (error) {
+        console.error('tls-cert', error);
+        document.getElementById('tls-cert-state').textContent = '读取失败';
+    }
+}
+
+function copyTlsPin() {
+    const pin = document.getElementById('tls-cert-pin');
+    copyToClipboard((pin && pin.dataset.pin) || '');
+}
+
+async function regenerateTlsCert(btn) {
+    if (!confirm('重新生成证书？现有订阅里的指纹会全部失效，需要重新下载订阅并重启进程。')) return;
+    btn.disabled = true;
+    try {
+        const res = await fetch('./panel/tls-cert-regenerate', {
+            method: 'POST', credentials: 'include'
+        });
+        const { success, message, body } = await res.json();
+        if (!success) throw new Error(message || '生成失败');
+        await loadTlsCert();
+        notify('success', '证书已重新生成', [
+            '新指纹：' + (body.sha256 || ''),
+            body.note || '重启进程后生效。'
+        ]);
+    } catch (error) {
+        notify('error', '重新生成证书失败', [String(error)]);
+    } finally {
+        btn.disabled = false;
+    }
+}
+
 function copyToClipboard(url) {
-    navigator.clipboard.writeText(url)
-        .then(() => notify('info', '已复制到剪贴板', [url]))
-        .catch(error => console.error('复制失败：', error));
+    const text = String(url ?? '');
+    const copied = () => notify('info', '已复制到剪贴板', [text]);
+    const legacyCopy = () => {
+        try {
+            const area = document.createElement('textarea');
+            area.value = text;
+            area.setAttribute('readonly', '');
+            area.style.position = 'fixed';
+            area.style.top = '0';
+            area.style.left = '0';
+            area.style.opacity = '0';
+            document.body.appendChild(area);
+            area.select();
+            area.setSelectionRange(0, text.length);
+            const ok = document.execCommand('copy');
+            area.remove();
+            return ok;
+        } catch (error) {
+            console.error('execCommand 复制失败：', error);
+            return false;
+        }
+    };
+    const fallback = () => {
+        if (legacyCopy()) copied();
+        else notifyManualCopy(text);
+    };
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        navigator.clipboard.writeText(text)
+            .then(copied)
+            .catch(error => {
+                console.error('复制失败：', error);
+                fallback();
+            });
+        return;
+    }
+    fallback();
+}
+
+function notifyManualCopy(text) {
+    notify('manual', '请手动复制订阅链接', [
+        '当前地址不是安全上下文（http），浏览器禁止自动写剪贴板。',
+        '下面是要复制的链接，选中后按 Ctrl+C：',
+        escapeHtml(text)
+    ]);
+}
+
+function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, char => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    })[char]);
 }
 
 function copyDoh() {
@@ -2721,7 +3028,7 @@ function updateSettings(event, data) {
         headers: { 'Content-Type': 'application/json' }
     })
         .then(res => res.json())
-        .then(({ success, status, message, body: errors }) => {
+        .then(({ success, status, message, body }) => {
             if (status === 401) {
                 notify(
                     'error',
@@ -2729,12 +3036,23 @@ function updateSettings(event, data) {
                     ['会话已过期，请重新登录。']
                 );
                 window.location.href = './login';
+                return;
             }
 
             if (!success) {
-                errors.forEach(error => {
-                    notify('error', error.field, error.message);
-                });
+                // Field-level errors come back as an array; a whole-request
+                // refusal (for example "WireGuard needs a WARP account first")
+                // comes back as null with the reason in message. Reading
+                // .forEach off null turned every such refusal into a bare
+                // TypeError and the operator never saw why the save failed.
+                const fieldErrors = Array.isArray(body) ? body : [];
+                if (fieldErrors.length) {
+                    fieldErrors.forEach(error => {
+                        notify('error', error.field, error.message);
+                    });
+                } else {
+                    notify('error', '应用设置失败', [message || '未知错误']);
+                }
                 throw new Error(`status ${status} - ${message}`);
             }
 
@@ -2753,6 +3071,26 @@ function updateSettings(event, data) {
                 } else {
                     notify('error', 'WireGuard 出栈未生效', [wgResult.error || wgResult.status]);
                 }
+            }
+
+            // Turning the tunnel off must tear the connector down: the process
+            // keeps a detached supervisor thread that reconnects to the edge on
+            // its own, so storing cfTunnel.enabled=false alone leaves it
+            // running. Turning it on must start it now, not after a restart.
+            // The 唤醒/休眠 buttons already do exactly this.
+            const tunnelWasOn = String(globalThis.initialFormData?.get('cfTunnelEnabled')) === 'true';
+            const tunnelNowOn = form.cfTunnelEnabled === true;
+            if (tunnelWasOn !== tunnelNowOn) {
+                fetch(tunnelNowOn ? './panel/tunnel-wake' : './panel/tunnel-sleep', {
+                    method: 'POST',
+                    credentials: 'include'
+                })
+                    .then(res => res.json())
+                    .then(({ success, message }) => {
+                        if (!success) notify('error', tunnelNowOn ? '唤醒隧道' : '休眠隧道', [message || '失败']);
+                    })
+                    .catch(error => console.error('切换隧道状态失败：', error))
+                    .finally(() => refreshWarpAndTunnel());
             }
 
             renderPanel(form);
@@ -2788,6 +3126,25 @@ function validateSettings() {
         ...defaultHttpPorts,
         ...defaultHttpsPorts
     ].filter(port => formData.has(port.toString()));
+
+    // Direct mode has exactly one entrance: the port this process bound. If the
+    // tick boxes above produced nothing (e.g. only a TLS port was selected while
+    // the tunnel was on), fall back to it rather than saving an empty list --
+    // an empty list is what made the generated subscription empty.
+    const rt = globalThis.runtimeFacts || {};
+    if (rt.accessMode === 'direct') {
+        // Direct mode publishes exactly one port, and it is the one the panel
+        // filled in, not whatever box happened to be ticked. Saving the ticked
+        // set here is what allowed `ports: [443]` (a tunnel-only value) to
+        // survive a no-tunnel save and produce dead 443 links.
+        const listenPort = Number(form.directPort) || Number(rt.directPort) ||
+                           Number(rt.listenPort) || 8080;
+        form.ports = [listenPort];
+    } else if (form.ports.length === 0) {
+        // Tunnel mode with nothing ticked would generate an empty subscription;
+        // keep the previously stored list instead of silently emptying it.
+        form.ports = Array.isArray(globalThis.__lastPorts) ? globalThis.__lastPorts : [443];
+    }
 
     checkboxElements.forEach(elm => {
         form[elm.id] = formData.has(elm.id);
@@ -3035,7 +3392,7 @@ function notify(type, title, text) {
         modal.querySelector('.message-text').innerHTML = text.join('\n');
 
         const icon = modal.querySelector('.message-icon');
-        const isOk = type === 'success' || type === 'info';
+        const isOk = type === 'success' || type === 'info' || type === 'manual';
         const isConfirm = type === 'confirm';
 
         icon.textContent = isOk ? 'check_circle' : isConfirm ? 'help' : 'error';
@@ -3193,13 +3550,57 @@ function renderPorts(ports) {
     let noneTlsPortsBlock = document.createDocumentFragment();
     let tlsPortsBlock = document.createDocumentFragment();
 
-    const totalPorts = [
-        ...(window.origin.includes('workers.dev') ? defaultHttpPorts : []),
-        ...defaultHttpsPorts
-    ];
+    // The port list has to match what this process can serve. Behind a
+    // Cloudflare tunnel the edge terminates TLS, so only its https ports make
+    // sense. Without a tunnel there is no edge: a plain listener can only offer
+    // the http set, and a listener started without --tls-cert cannot answer a
+    // TLS handshake at all, so offering 443/8443 would only produce dead links.
+    const rt = globalThis.runtimeFacts || {};
+    const tunnelMode = rt.accessMode !== 'direct';
+    const tlsCapable = !!rt.tls;
+    const listenPort = Number(rt.listenPort) || Number(rt.directPort) || 8080;
+
+    const directPorts = [
+        Number(rt.directPort) || 0,
+        listenPort
+    ].filter(p => Number.isFinite(p) && p > 0);
+
+    const totalPorts = tunnelMode
+        ? [
+            ...(window.origin.includes('workers.dev') ? defaultHttpPorts : []),
+            ...defaultHttpsPorts
+        ]
+        : [
+            ...(tlsCapable ? defaultHttpsPorts : []),
+            ...defaultHttpPorts,
+            // The port this process actually bound, even when it is not one of
+            // the standard ones -- that is the only port anything listens on.
+            // The port the subscription will actually publish: the operator's
+            // public port if set, otherwise the one this process bound. If it
+            // is not one of the standard boxes it still has to appear, or the
+            // panel renders a list in which nothing is selected.
+            ...directPorts.filter(p => !defaultHttpPorts.includes(p) && !defaultHttpsPorts.includes(p))
+        ];
+
+    // Tunnel mode must keep the historical list untouched: the direct port is a
+    // property of the plain listener, not of the edge, and offering it behind a
+    // tunnel would advertise a port the edge never routes.
+    if (tunnelMode) {
+        totalPorts.splice(0, totalPorts.length,
+            ...(window.origin.includes('workers.dev') ? defaultHttpPorts : []),
+            ...defaultHttpsPorts);
+    }
+
+    // In direct mode settings.ports is the *tunnel* list (usually [443]) and
+    // usually does not intersect the http ports offered above, so the fresh
+    // render produced a wall of unticked boxes and the suggested port was lost.
+    // Tick what this process actually serves instead.
+    const effectiveChecked = tunnelMode
+        ? ports
+        : [Number(rt.directPort) || listenPort].filter(n => Number.isFinite(n) && n > 0);
 
     totalPorts.forEach(port => {
-        const isChecked = ports.includes(port);
+        const isChecked = effectiveChecked.includes(port);
         const isHttpsPort = defaultHttpsPorts.includes(port);
 
         const checkbox = elm('input', {
@@ -3228,7 +3629,14 @@ function renderPorts(ports) {
         nonTlsContainer.innerHTML = '';
         nonTlsContainer.appendChild(noneTlsPortsBlock);
         document.getElementById('none-tls').style.display = 'flex';
+    } else {
+        document.getElementById('none-tls').style.display = 'none';
     }
+    // In direct mode the TLS block is only meaningful when the listener really
+    // terminates TLS; hide an empty list rather than showing a blank row.
+    const tlsBlock = document.getElementById('tls-ports');
+    const tlsRow = tlsBlock ? tlsBlock.closest('.form-control') : null;
+    if (tlsRow) tlsRow.style.display = tlsBlock.childElementCount > 0 ? '' : 'none';
 }
 
 function renderNoises(xrayUdpNoises) {

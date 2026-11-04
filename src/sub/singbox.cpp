@@ -168,7 +168,9 @@ json build_tls(const json& s, const std::string& security, bool is_fragment, boo
     tls["enabled"] = true;
     tls["server_name"] = sni;
     tls["record_fragment"] = is_fragment;
-    tls["insecure"] = allow_insecure;
+    // Self-signed listener: sing-box has no pin field for this transport, so a
+    // certificate the operator generated is trusted by skipping verification.
+    tls["insecure"] = allow_insecure || !pinned_cert(s).empty();
     if (!alpn.empty()) {
         std::vector<std::string> alpns;
         for (auto& a : split(alpn, ',')) {
@@ -277,7 +279,8 @@ json build_ws_outbound(const json& s, const std::string& protocol, const std::st
             : build_transport("ws", "none",
                               generate_ws_path(protocol, s.value("vlUUID", std::string())),
                               sni_host.host, "", 2560);
-    bool is_tls = is_https(s, port) || (!upstream_server.empty() && address == upstream_server);
+    bool is_tls = port_uses_tls(s, domain, port) ||
+                  (!upstream_server.empty() && address == upstream_server);
     json tls = is_tls ? build_tls(s, "tls", is_fragment, sni_host.allow_insecure, sni_host.sni,
                                   flag(s, "enableECH") && !is_fragment, str(s, "echServerName"),
                                   is_grpc ? "h2" : "http/1.1", str(s, "fingerprint", "chrome"))
@@ -691,15 +694,11 @@ bool build_sb_custom(const json& s, bool is_fragment, std::string& out_json, std
     std::string custom_domain = str(s, "customDomain");
     std::vector<std::string> domains{main_domain};
     if (!custom_domain.empty()) domains.push_back(custom_domain);
+    // Direct mode: one address, one port (see sub/common.h access model).
+    if (access_mode_direct(s)) domains.assign(1, direct_host(s));
 
     auto protocols = get_protocols(s);
     const std::vector<std::string> transports = get_transports(s);
-    std::vector<int> ports;
-    if (s.contains("ports") && s["ports"].is_array()) {
-        for (auto& p : s["ports"]) {
-            if (p.is_number_integer()) ports.push_back(p.get<int>());
-        }
-    }
 
     std::string upstream_server;
     int upstream_port = 0;
@@ -719,11 +718,7 @@ bool build_sb_custom(const json& s, bool is_fragment, std::string& out_json, std
     json outbounds = json::array();
 
     for (auto& domain : domains) {
-        std::vector<int> total_ports;
-        bool is_workers_dev = ends_with(domain, "workers.dev");
-        for (int port : ports) {
-            if ((!is_fragment && is_workers_dev) || is_https(s, port)) total_ports.push_back(port);
-        }
+        std::vector<int> total_ports = effective_ports(s, domain);
         auto hosts = get_config_addresses(s, domain, is_fragment, error);
         if (hosts.empty()) return false;
 

@@ -37,11 +37,23 @@ except Exception:
     j = {}
 ok('panel settings', st == 200 and j.get('success'), f"{len(j.get('body',{}).get('proxySettings',{}))} keys" if j.get('success') else str(st))
 
-for kind, app in [('raw','xray'),('normal','xray'),('fragment','xray'),('normal','sing-box'),('normal','clash'),
-                  ('warp','clash'),('warp','wireguard'),('warp-pro','amnezia')]:
+for kind, app in [('raw','xray'),('normal','xray'),('fragment','xray'),('normal','sing-box'),('normal','clash')]:
     st, body, hdrs = get(f'/sub/{kind}?app={app}')
-    ct = (hdrs.get('Content-Type') or '')
     ok(f'sub {kind}/{app}', st == 200, f'{st} {len(body)}B')
+
+# The WARP-based subscriptions need a registered account, and the account pool
+# now starts empty instead of holding two dead placeholder keys. Without a
+# registration the honest answer is 400 "warp accounts are missing"; building a
+# config around a key that never completes a handshake is what produced
+# subscriptions that imported fine and then did nothing.
+for kind, app in [('warp','clash'),('warp','wireguard'),('warp-pro','amnezia')]:
+    st, body, hdrs = get(f'/sub/{kind}?app={app}')
+    try:
+        j = json.loads(body or b'{}')
+    except Exception:
+        j = {}
+    missing = st == 400 and 'warp accounts' in str(j.get('message', ''))
+    ok(f'sub {kind}/{app} (needs account)', missing, f'{st} {j.get("message", "")}')
 
 st, body, _ = get('/sub/share-settings')
 ok('share-settings', st == 200 and b'customDomain' not in body, f'{st} {len(body)}B')

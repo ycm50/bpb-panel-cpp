@@ -20,19 +20,23 @@ Cloudflare Tunnel 客户端。**服务端没有任何 JavaScript/TypeScript**，
 - [分支说明](#分支说明)
 - [快速开始](#快速开始)
 - [安装脚本](#一条命令安装linux)
+- [安装脚本踩过的坑](#安装脚本踩过的坑都已修)
 - [从源码构建](#从源码构建)
 - [命令行](#命令行)
+- [命令行与浏览器的权限怎么分开](#命令行与浏览器的权限怎么分开)
 - [入栈协议与按协议构建](#入栈协议与按协议构建)
 - [日志开关](#日志开关)
 - [接口](#接口)
 - [客户端怎么连](#客户端怎么连)
 - [Cloudflare Tunnel](#cloudflare-tunnel)
+- [隧道回源由进程自己决定，不能手填](#隧道回源由进程自己决定不能手填)
 - [数据面：WebSocket 入栈](#数据面websocket-入栈)
 - [WARP 出口](#warp-出口)
 - [性能实测](#性能实测)
 - [架构](#架构)
 - [测试](#测试)
 - [CI 与发布](#ci-与发布github-actions)
+- [Windows 构建的两个坑](#windows-构建的两个坑)
 - [许可证](#许可证)
 
 ## 单一分支
@@ -105,6 +109,44 @@ Cloudflare Tunnel 客户端。**服务端没有任何 JavaScript/TypeScript**，
 临时隧道的域名不保证长期有效。要固定域名就填命名隧道 token：
 `/<sp>/panel` → Cloudflare 隧道 → 隧道 Token。
 
+### 安装脚本踩过的坑（都已修）
+
+这一节记录的是**实测**出来的问题，不是推测；每个都有复现路径，改完又用同一个路径验过。
+
+**1. 设过密码的实例，装完报不出隧道域名。**
+脚本结尾用 `curl http://127.0.0.1:$PORT/$SP/panel/tunnel-status` 取域名。这个接口要凭据，
+于是任何**已经设过密码**的实例（也就是每一次重装、每一次升级）都返回 `401`，域名解析成空，
+脚本打一行 `tunnel domain not assigned yet; check journalctl` —— 而隧道其实连得好好的。
+现在这里带 `X-BPB-CLI: 1`，命令行本来就该有全权限。
+
+**2. `--no-tunnel` 对已有安装无效。**
+旧代码只在 python3 存在时才写 `cfTunnel.enabled=false`，没有 python3 就只打印一句
+"自己改 originPort"，隧道照旧开着。现在用 `sed` 改端口（不依赖 python3），
+关开关那一步用 python3 精确改 JSON 里的那一个键。
+
+**3. 反过来也一样：重跑脚本不会把隧道重新打开。**
+只写了关闭方向，于是 `--no-tunnel` 跑过一次之后，再跑一次默认的安装脚本，
+`enabled` 还是 `false`，进程根本不连隧道，域名永远打印不出来。现在两个方向都写。
+
+**4. 把 `--local` 指向 Windows 二进制会装上去再失败。**
+两个平台产物同名，装完 systemd 只会反复重启，报错也看不出原因。现在读文件头，
+是 `MZ` 就直接拒绝并说明这是 Linux-only 安装脚本。
+
+**5. 没有 curl 时会空转 40 秒再怪面板。**
+下载那一步 curl/wget 都接受，但就绪探测用的是 `curl -w %{redirect_url}`，wget 做不了。
+现在缺少 curl 时提前报错，而不是等 40 秒后说"面板没应答"。
+
+**6. `--uninstall` 不带 `--data` 时会误删默认部署。**
+`--data` 决定服务名和安装前缀，卸载时不重复它，脚本就按 `bpb` 去删——
+在默认安装上这正是**真实部署**，删完还打印 "uninstalled"。现在删不到东西会明确报
+`nothing installed as 'bpb'` 并提示补 `--data`，退出码 1，不再假装成功。
+（写这一节的过程里，这条命令在测试机上真的把部署删掉过一次，从备份恢复的。）
+
+**7. `--uninstall` 会漏掉 drop-in。**
+`/etc/systemd/system/bpb.service.d/`（例如手写的 `TasksMax` 覆盖）不停用也不删，
+重装同名服务时它会继续生效。现在随 unit 一起删。
+
+
 ### Docker
 
     docker build -t bpb-native:1.0.2 .
@@ -169,9 +211,21 @@ Cloudflare Tunnel 客户端。**服务端没有任何 JavaScript/TypeScript**，
 面板原先从 `fonts.googleapis.com` 拉 `Material Symbols Rounded`。在 Google 不可达的网络里字体会拿不到，
 浏览器就把连字名当普通文字渲染出来（界面上出现 `check_circle`、`settings_backup_restore`、`logout` 这种文字）。
 
-现在字体按面板实际用到的 27 个图标做了子集（`assets/fonts/material-symbols-rounded-subset.woff2`，4.4 KB），
+现在字体按面板实际用到的图标做了子集（`assets/fonts/material-symbols-rounded-subset.woff2`，约 6.6 KB），
 以 `data:font/woff2;base64` 内联进 `assets/panel/index.html` 与 `assets/login/index.html`，页面里不再有指向 Google 的 `<link>`，
-离线/受限网络下图标照常显示。改字体后需要重跑 `tmpscripts/patch_fonts.py` 与 `tmpscripts/gen_assets.py`（后者重生成 `src/assets_gen.cpp`，即装进二进制的内嵌副本）。
+离线/受限网络下图标照常显示。
+
+子集只含页面点名要的图标，所以「新加一个图标却忘了重新生成子集」会原样暴露成连字名文字。
+`tools/check_font.py` 就是在检查这件事：它会报出页面用到但子集没有的图标，改完面板跑一次即可：
+
+    python tools/check_font.py       # font: ... / icons used by pages: N / all page icons render
+    python tools/build_font.py      # 需要完整的 MaterialSymbolsRounded.ttf，见脚本头注释
+    python tools/embed_font.py      # 把 woff2 重新内联进各页面
+    python tools/gen_assets.py      # 重生成 src/assets_gen.cpp（装进二进制的内嵌副本）
+
+个别图标（比如「重新生成证书」用的 `restart_alt`）不再走字体，改用**内联 SVG**：
+矢量、随字号缩放、用 `currentColor` 跟着按钮的 hover/disabled 状态变色，不占字体子集、也不受字体是否加载成功影响。
+新加按钮时优先用这个做法，`<svg class="button-icon" viewBox="0 0 24 24">` 配一条 `path` 即可。
 
 ### 查当前隧道域名：`bpb --cur`
 
@@ -186,7 +240,9 @@ Cloudflare Tunnel 客户端。**服务端没有任何 JavaScript/TypeScript**，
     7754     8080   examinations-widely-occasion-eating.trycloudflare.com   connected   [panel] data=/root/.bpbdata
     6954     18500  (no tunnel)                                    offline      data=/root/.bpbtest18500
 
-面板设了密码时，`--cur` 会用 `settings.json` 里的兼容明文口令登录一次 `/<securePath>/login/authenticate`，再带着 `jwtToken` 去问 `panel/tunnel-status`，所以状态列是**运行中进程的实时状态**（`connected`）而不是猜的；登录不了就退回数据目录里的文件，状态显示为 `locked (login required, from files)`。
+面板设了密码也**不影响** `--cur`：命令行有完全权限，直接带上 `X-BPB-CLI` 头去问
+`panel/tunnel-status`（见下面「命令行与浏览器的权限怎么分开」），所以状态列是**运行中进程的实时状态**
+（`connected` / `offline`）而不是猜的；只有进程没在跑时才退回数据目录里的文件。
 
 这比 `docker logs | grep trycloudflare` 稳：不依赖日志级别（默认 `error` 什么都不打），
 也不会把已经退出的旧实例的域名当成当前的。
@@ -218,6 +274,36 @@ Cloudflare Tunnel 客户端。**服务端没有任何 JavaScript/TypeScript**，
 `passwd`；迁移之后改 `settings.json` 的明文不再生效（`login()` 先看文件）。在面板里改密码
 （`update-settings`）会同步重写这个文件，两条路不会打架。忘了密码就 `bpb --passwd <new>`
 覆盖 —— 只有数据目录里确实没有 `passwd` 时才会退回 `settings.json` 的明文分支。
+
+### 命令行与浏览器的权限怎么分开
+
+老规则是「回环地址 = 管理员」，凡是从 `127.0.0.1` 进来的请求一律放行。这条规则错在把两种完全不同的
+调用方混成了一种，而它们都会落在回环地址上：
+
+- **命令行**（`bpb --cur`、脚本）—— 本来就以操作者身份在机器上跑，应当**全权限、免密、免令牌**；
+- **浏览器** —— 不管是本机开的，还是通过 `ssh -L` 端口转发进来的，都必须登录；
+- 还有第三个：**本进程自己的隧道**。它把回源连接发到 `127.0.0.1`，所以经隧道进来的请求
+  在服务端看起来同样是回环地址 —— 这条旁路等于让整个公网免密进面板。
+
+真正能区分它们的是**浏览器发不出来的东西**：顶层导航（地址栏、点击链接）根本不能带自定义请求头，
+而跨源页面想加一个会触发 CORS 预检，这个服务端从不回应预检。所以命令行用 `X-BPB-CLI` 头表明身份：
+
+```bash
+curl -H 'X-BPB-CLI: 1' http://127.0.0.1:8080/securepath/panel/settings   # 直接拿到 JSON
+```
+
+| 调用方 | 如何获得权限 |
+|---|---|
+| 命令行 / 脚本 | 回环地址 + `X-BPB-CLI` 头 → **全权限，不需要密码，也没有令牌文件要管** |
+| 浏览器 | 登录后拿到 `jwtToken`，签名有效**且**未过期才通过 |
+
+浏览器的会话是**会话 cookie + 10 分钟过期**：
+
+- `Set-Cookie` 不带 `Max-Age`/`Expires`，浏览器一关就丢；
+- JWT 里的 `exp = iat + 600`，页签一直开着也最多 10 分钟后失效；
+- 面板里任何 `panel/*` 请求拿到 401 都会整体跳回登录页（不用逐个调用点自己处理）。
+
+改密码（`bpb --passwd` 或面板里的「重置」）会轮换 JWT 签名密钥，所有已签发的会话立即作废。
 
 ## 入栈协议与按协议构建
 
@@ -349,6 +435,21 @@ TLS 端口会带 `tls=tls` 加 `sni/alpn/fp`，明文端口 `tls` 留空。
 `/panel/settings` 的 `inbounds` 里，也生成不出对应链接（提交不存在的协议返回 400）。
 
 ## Cloudflare Tunnel
+
+### 隧道回源由进程自己决定，不能手填
+
+面板上曾经同时有「监听端口」和「本地回源地址」两个可编辑框，语义重叠且能互相矛盾：截图里出现
+「监听端口 = 8080」而进程实际监听 45566，于是隧道被改成把流量转发到没人监听的端口，
+Cloudflare 侧表现为 502/530。现在：
+
+| 字段 | 含义 | 可编辑 |
+|---|---|---|
+| 对外端口（`directPort`） | 订阅里写的端口。无端口映射时 = 实际监听端口，前面有 NAT 时填映射后的端口 | 是 |
+| 本地回源地址（`cfTunnel.originHost/originPort`） | 隧道把请求转给谁 | **否**，恒为 `127.0.0.1:<实际监听端口>` |
+
+保存时 `originHost`/`originPort` 一律由 `store_.listen_port()` 重算，请求里带什么都忽略；
+面板显示的那个值就是推导结果。
+
 
 面板里打开隧道开关后，进程会自己注册到 Cloudflare 边缘，把公网请求转发回本机
 监听端口，不再需要 40 MB 的 cloudflared。
@@ -487,6 +588,17 @@ TLS 端口会带 `tls=tls` 加 `sni/alpn/fp`，明文端口 `tls` 留空。
 侧车不用 `wg-quick`（普通容器写不了 `/proc/sys`、也跑不了 `resolvconf`），
 而是手工 `wg setconf` + 地址 + 路由，让面板容器共享它的网络命名空间。
 
+### 账号池不预置任何账号
+
+`warpAccounts` 曾经在 `warps_.empty()` 时回落到两条写死的 WARP 注册。它们早已失效，但看起来
+就像一份可用账号池：握手永远不完成，出栈一直是关的，每条连接静静退回直连 socket，而面板照样显示
+「WireGuard 已启用」。现在**默认就是空数组**：
+
+- 打开开关时若账号池为空，保存**直接拒绝**（`success:false`，`wgOutbound.enabled` 保持 `false`），
+  面板弹「需要先注册 WARP 账号」，并说明开关已保持关闭；
+- `start_wg_outbound()` 也据实报错，不再假成功。
+
+所以 `warp=off` 现在只有一个解释：账号池是空的，去点一下「续期」/「注册」。
 ### 面板里的注册（默认 dry run）
 
 `warpRegisterDryRun` 默认 **`true`**：
@@ -660,6 +772,24 @@ TLS 端口会带 `tls=tls` 加 `sni/alpn/fp`，明文端口 `tls` 留空。
 再往上要做的不是继续缩短超时，而是把 origin 的 fd 一并放进 poll 集合
 （现在是 2 ms 粒度的次优解）。
 
+## Windows 构建的两个坑
+
+### 不要把自己的 `FILE*` 交给 OpenSSL
+
+Windows 上 OpenSSL 是独立 DLL，和 exe 不共享 CRT。`PEM_write_X509(FILE*, …)` /
+`PEM_read_X509(FILE*, …)` 会走 `OPENSSL_Uplink` 回调，没有安装 Applink 时进程直接崩：
+
+    OPENSSL_Uplink(00007FFB56A12910,08): no OPENSSL_Applink
+
+表现很迷惑：`tls-cert.pem` 是 0 字节，进程在监听之前就没了，日志只有这一行。
+现在证书读写全部走内存 BIO（`PEM_write_bio_X509` / `PEM_read_bio_X509`），
+文件用 `std::ofstream` 自己写，不跨 CRT 传递流对象。
+
+### 图标子集缺图不会报错，只会显示成文字
+
+见「面板图标不依赖外网」。`tools/check_font.py` 是唯一能提前发现的检查，
+加图标后务必跑一遍；新按钮更稳的做法是直接用内联 SVG。
+
 ## 架构
 
     src/inbound  入栈注册表 + 每协议一个源文件（vless/trojan/shadowsocks/vmess）
@@ -669,8 +799,8 @@ TLS 端口会带 `tls=tls` 加 `sni/alpn/fp`，明文端口 `tls` 留空。
     src/proxy    会话配置与前向声明；各入栈实现见 src/inbound/proto/*
     src/tunnel   内置 Cloudflare Tunnel 客户端：capnp / HTTP/2 / RPC / 回源 / 监督重连
     src/sub      xray / sing-box / clash / raw / wireguard 订阅生成，WARP 注册
-    src/settings JSON 设置存储（原子写）
-    src/app      路由、面板接口、DoH、二维码、Telegram
+    src/settings JSON 设置存储（原子写）；面板凭据 <data>/passwd（命令行不需要凭据）
+    src/app      路由、面板接口（每条请求都验证）、DoH、二维码、Telegram
     src/crypto   SHA-224/256、HMAC、HS256 JWT
     src/wg       用户态 WireGuard（Noise IK）
     assets       浏览器面板源文件，构建前由 tools/gen_assets.py 嵌入二进制
