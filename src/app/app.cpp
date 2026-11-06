@@ -9,6 +9,7 @@
 #include "net/selfsigned.h"
 #include "sub/clash.h"
 #include "sub/raw.h"
+#include "util/budget.h"
 #include "util/log.h"
 #include "sub/singbox.h"
 #include "sub/warp.h"
@@ -688,6 +689,15 @@ http::Response App::update_settings(const http::Request& req) {
     if (data.contains("cfTunnelEnabled")) tunnel::apply_store_state(store_);
 
     nlohmann::json out = nlohmann::json::object();
+    if (data.contains("relayMaxSessions") || data.contains("relayInitialBufferKb") ||
+        data.contains("relayMaxBufferKb") || data.contains("relayPoolBudgetMb")) {
+        const auto limits = util::relay_budget_settings();
+        out["relayBudget"] = {{"maxActive", limits.max_active},
+                              {"active", util::relay_active_sessions()},
+                              {"rejected", util::relay_rejected_sessions()},
+                              {"poolUsed", util::relay_pool_used()},
+                              {"poolLimit", util::relay_pool_limit()}};
+    }
     if (wgTouched) {
         // start_wg_outbound blocks up to 6s waiting for the handshake, so the
         // switch is applied only after the settings are safely on disk: a
@@ -790,32 +800,13 @@ http::Response App::doh(const http::Request& req) {
     return res;
 }
 
+// The whole route lives in app/qrcode.cpp: the PNG encoder and the origin check
+// belong together, and neither needs the store. Only the panel's own 404 page is
+// passed in, so the module does not have to include app.h.
 http::Response App::qrcode(const http::Request& req) {
-    auto params = req.params();
-    std::string data = params.count("data") ? params["data"] : std::string();
-    if (data.empty()) return http::Response::text(400, "缺少 data 参数");
-
-    // only render QR codes that point back at this panel (same as the TS implementation)
-    std::string host = req.header("host");
-    net::httpc::Url parsed;
-    std::string error;
-    if (net::httpc::parse_url(data, parsed, error)) {
-        if (!host.empty() && parsed.host != host &&
-            host.find(parsed.host) == std::string::npos) {
-            return render_error(404, "页面不存在");
-        }
-    }
-
-    std::string png;
-    if (!generate_qr_png(data, png, error)) {
-        return http::Response::text(500, "二维码生成失败： " + error);
-    }
-    http::Response res;
-    res.status = 200;
-    res.set("Content-Type", "image/png");
-    res.set("Cache-Control", "no-store");
-    res.body = std::move(png);
-    return res;
+    return app::qrcode_route(req, [this](int status, const std::string& message) {
+        return render_error(status, message);
+    });
 }
 
 http::Response App::render_error(int status, const std::string& message) {
@@ -872,6 +863,18 @@ http::Response App::handle(const http::Request& req) {
         return reset_settings();
     }
     if (path == sp + "/panel/reset-password") return reset_password(req);
+    // Re-read the files on disk and hand back the same shape /panel/settings
+    // returns. The status readouts used to be built from the in-memory snapshot
+    // taken at startup, so an account pool or a settings.json changed by hand
+    // (or by the CLI) disagreed with the file until the process restarted.
+    if (path == sp + "/panel/reload") {
+        if (needs_auth && !authenticated(req)) return json_err(401, "未授权或会话已过期。");
+        if (req.method != "POST") return json_err(405, "请求方法不允许。");
+        std::string reload_error;
+        if (!store_.reload_from_disk(reload_error))
+            return json_err(500, "重新读取数据目录失败：" + reload_error);
+        return panel_settings();
+    }
     if (path == sp + "/panel/logout") return logout();
     if (path == sp + "/panel/usage") return not_supported("用量统计（仅 Cloudflare 版）");
     if (path == sp + "/panel/my-ip") return my_ip(req);
@@ -884,6 +887,12 @@ http::Response App::handle(const http::Request& req) {
             return json_err(500, "Failed to update WARP configs: " + error);
         store_.warps() = accounts;
         if (!store_.save(error)) return json_err(500, error);
+        // Re-read the file so the reply describes the disk, not the vector this
+        // request happens to hold.
+        std::string reload_error;
+        if (!store_.reload_from_disk(reload_error))
+            bpb::log::error("[warp] saved the accounts but could not re-read them: %s",
+                            reload_error.c_str());
         return json_ok(accounts);
     }
     // ---- WARP outbound ------------------------------------------------------
@@ -891,6 +900,26 @@ http::Response App::handle(const http::Request& req) {
     // surface is just status plus an explicit registration action. Registration
     // defaults to a dry run so the round trip is testable without consuming
     // Cloudflare's per-IP quota.
+    // Relay capacity snapshot: the ceiling the data path enforces right now,
+    // plus how much of it is in use. The panel polls it after a save so the
+    // operator sees the same numbers the relay does.
+    if (path == sp + "/panel/relay-status") {
+        if (needs_auth && !authenticated(req)) return json_err(401, "未授权或会话已过期。");
+        const auto limits = util::relay_budget_settings();
+        nlohmann::json out;
+        out["maxActive"] = limits.max_active;
+        out["active"] = util::relay_active_sessions();
+        out["rejected"] = util::relay_rejected_sessions();
+        out["initialBytes"] = limits.initial_bytes;
+        out["maxBytes"] = limits.max_bytes;
+        out["poolUsed"] = util::relay_pool_used();
+        out["poolLimit"] = util::relay_pool_limit();
+        // The ceiling the kernel enforces, and the one the pool was clamped to.
+        // Reported so an operator can see why growth stopped before the cgroup
+        // would have killed the process.
+        out["memoryLimitBytes"] = util::memory_limit_bytes();
+        return json_ok(out);
+    }
     if (path == sp + "/panel/warp-status") {
         if (needs_auth && !authenticated(req)) return json_err(401, "未授权或会话已过期。");
         nlohmann::json out;
@@ -900,7 +929,12 @@ http::Response App::handle(const http::Request& req) {
         out["ready"] = net::wg_outbound_ready();
         out["status"] = net::wg_outbound_status();
         out["dryRun"] = store_.kv().value("warpRegisterDryRun", true);
-        out["accounts"] = store_.warps().size();
+        // Counted from settings.json, not from the in-memory pool: this endpoint
+        // answers "how many accounts does the box have", and the file is the only
+        // thing that survives a restart or a CLI edit. memoryOnly is reported too
+        // so a mismatch is visible instead of silently papered over.
+        out["accounts"] = store_.warp_accounts_on_disk();
+        out["memoryOnly"] = store_.warps().size();
         return json_ok(out);
     }
     if (path == sp + "/panel/warp-register") {
@@ -917,10 +951,22 @@ http::Response App::handle(const http::Request& req) {
         if (!dry_run) {
             store_.warps() = accounts;
             if (!store_.save(error)) return json_err(500, "保存设置失败：" + error);
+            // Read back what actually landed on disk instead of echoing the
+            // in-memory vector: the panel (and the operator) then sees the file
+            // the process is really going to use on its next start.
+            std::string reload_error;
+            if (store_.reload_from_disk(reload_error)) {
+                bpb::log::info("[warp] reloaded %zu account(s) from disk",
+                               store_.warps().size());
+            } else {
+                bpb::log::error("[warp] saved the accounts but could not re-read them: %s",
+                                reload_error.c_str());
+            }
         }
         nlohmann::json out;
         out["dryRun"] = dry_run;
-        out["accounts"] = accounts;
+        out["accounts"] = dry_run ? accounts : store_.warps();
+        out["count"] = store_.warp_accounts_on_disk();
         out["saved"] = !dry_run;
         out["note"] = dry_run ? "dry run：未访问 Cloudflare，未写入账号池"
                               : "已真实注册并写入账号池";

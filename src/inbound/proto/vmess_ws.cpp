@@ -2,6 +2,7 @@
 
 #include "proxy/session.h"
 #include "net/tls.h"
+#include "util/budget.h"
 #include "util/log.h"
 #include "vmess_aead.h"
 #include "ws_transport.h"
@@ -643,6 +644,7 @@ void session_loop(SSL* client_ssl, socket_t client, const SessionConfig& config,
 
     // ---- origin -> client --------------------------------------------------
     std::thread down([&] {
+        bpb::util::RelayBuffer rb;
         try {
             while (!finished.load()) {
                 if (!upstream_ready.load()) {
@@ -653,10 +655,8 @@ void session_loop(SSL* client_ssl, socket_t client, const SessionConfig& config,
                                      [&] { return upstream_ready.load() || finished.load(); });
                     continue;
                 }
-                char buf[kChunk];
-                // read() polls internally, so an idle session costs one wake-up
-                // per slice instead of a recv()/EAGAIN hot loop.
-                int n = upstream.read(buf, sizeof(buf), kWaitSliceMs);
+                // Grows only after a read that filled it; see util/budget.h.
+                int n = upstream.read(rb.data(), static_cast<int>(rb.size()), kWaitSliceMs);
                 if (n < 0) {
                     // Origin done: seal the response with the termination chunk so
                     // the client sees a clean end rather than a truncated body.
@@ -670,13 +670,14 @@ void session_loop(SSL* client_ssl, socket_t client, const SessionConfig& config,
                     break;
                 }
                 if (n == 0) continue;
+                const bool filled = static_cast<std::size_t>(n) == rb.size();
                 Encoder* enc = encoder.get();
                 if (!enc) break;
                 std::size_t off = 0;
                 while (off < static_cast<std::size_t>(n)) {
                     const std::size_t take = std::min<std::size_t>(Encoder::kMaxPayload,
                                                                    static_cast<std::size_t>(n) - off);
-                    const std::string chunk = enc->seal(buf + off, take);
+                    const std::string chunk = enc->seal(rb.data() + off, take);
                     if (!client_write(chunk.data(), chunk.size())) {
                         exit_reason = "client write failed";
                         finished.store(true);
@@ -685,6 +686,7 @@ void session_loop(SSL* client_ssl, socket_t client, const SessionConfig& config,
                     off += take;
                 }
                 to_client += static_cast<unsigned long long>(n);
+                if (filled) rb.grow();
             }
         } catch (...) {
             exit_reason = "exception in download thread";
@@ -728,6 +730,16 @@ void vmess_serve(net::socket_t client_fd, SSL* client_ssl, std::string accept_ke
     if (bpb::log::enabled(bpb::log::kTrace))
         bpb::log::debug("[vmess] upgrade path=%s wsproto=%zu early=%zu", path.c_str(),
                         ws_protocol.size(), early.size());
+    // Admission before the upgrade and before the session thread exists.
+    auto permit = bpb::util::SessionPermit::try_acquire();
+    if (!permit) {
+        static const char busy[] = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\n"
+                                   "Content-Length: 0\r\nConnection: close\r\n\r\n";
+        send_all(client_ssl, client_fd, busy, sizeof(busy) - 1);
+        if (client_ssl) net::tls_free(client_ssl);
+        net::close(client_fd);
+        return;
+    }
     std::string response = "HTTP/1.1 101 Switching Protocols\r\n"
                            "Upgrade: websocket\r\n"
                            "Connection: Upgrade\r\n";
@@ -739,7 +751,7 @@ void vmess_serve(net::socket_t client_fd, SSL* client_ssl, std::string accept_ke
         net::close(client_fd);
         return;
     }
-    std::thread([client_fd, client_ssl, config, early]() {
+    std::thread([client_fd, client_ssl, config, early, permit]() {
         session_loop(client_ssl, client_fd, config, early);
     }).detach();
 }

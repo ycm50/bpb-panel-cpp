@@ -5,6 +5,7 @@
 #include "net/net.h"
 #include "net/tls.h"
 #include "net/wg_outbound.h"
+#include "util/budget.h"
 #include "util/log.h"
 #include "util/thread.h"
 #include "util/util.h"
@@ -450,7 +451,8 @@ void session_loop(const xhttp::SessionPtr& sess, const SessionConfig& config) {
     // ---- upstream -> client ------------------------------------------------
     bpb::util::Thread toClient;
     toClient.start([&] {
-        char buf[kChunk];
+        // Grows only after a read that filled it; see util/budget.h.
+        bpb::util::RelayBuffer rb;
         try {
             while (!finished.load()) {
                 if (!upstreamReady.load()) {
@@ -459,13 +461,14 @@ void session_loop(const xhttp::SessionPtr& sess, const SessionConfig& config) {
                                     [&] { return upstreamReady.load() || finished.load(); });
                     continue;
                 }
-                const int n = upstream.read(buf, sizeof(buf), kWaitSliceMs);
+                const int n = upstream.read(rb.data(), static_cast<int>(rb.size()), kWaitSliceMs);
                 if (n < 0) {
                     exitReason = "upstream closed";
                     break;
                 }
                 if (n == 0) continue;
-                if (!xhttp::write_downlink(sess, buf, static_cast<std::size_t>(n))) {
+                if (static_cast<std::size_t>(n) == rb.size()) rb.grow();
+                if (!xhttp::write_downlink(sess, rb.data(), static_cast<std::size_t>(n))) {
                     exitReason = "client write failed";
                     break;
                 }
@@ -493,8 +496,15 @@ void session_loop(const xhttp::SessionPtr& sess, const SessionConfig& config) {
 // Transport callback: one relay session per XHTTP stream. The transport already
 // owns the sockets; this thread only moves bytes.
 void vless_xhttp_attach(xhttp::SessionPtr sess, const SessionConfig& config) {
+    // Admission before the thread exists: see util/budget.h.
+    auto permit = bpb::util::SessionPermit::try_acquire();
+    if (!permit) {
+        bpb::log::warn("[xh] relay at capacity, dropping the session");
+        xhttp::finish(sess);
+        return;
+    }
     const bool started = bpb::util::spawn_detached(
-        [sess, config] {
+        [sess, config, permit] {
             session_loop(sess, config);
             // Flushes the downlink (chunked terminator) and drops the table
             // entry, so the next session with this id starts from scratch.

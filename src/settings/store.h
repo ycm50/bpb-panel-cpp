@@ -32,12 +32,30 @@ public:
     bool load(const std::string& dir, std::string& error);
     bool save(std::string& error);
 
+    // Re-reads config.json and settings.json from disk over the live object.
+    //
+    // The panel's status readouts are supposed to describe the files on the
+    // box, but everything the process knows was captured at startup: accounts
+    // written by 'bpb --passwd'-era tooling, or a settings.json edited by hand,
+    // stayed invisible until a restart, and "账号 N" could disagree with the
+    // file it claims to summarise. This makes the disk the only truth again.
+    //
+    // Facts about the running process (listen host/port, TLS port, certificate
+    // path) are NOT in the files, so they are preserved across the reload.
+    bool reload_from_disk(std::string& error);
+
     const Config& config() const { return cfg_; }
     Config& config() { return cfg_; }
 
     nlohmann::json& kv() { return kv_; }
     const nlohmann::json& kv() const { return kv_; }
     nlohmann::json& warps() { return warps_; }
+
+    // Number of accounts actually written in <data>/settings.json. Answered from
+    // the file, not from warps_: the panel reported "账号 N" from the snapshot
+    // the process took at startup, so a registration that landed on disk during
+    // that same request was still shown as the old count.
+    std::size_t warp_accounts_on_disk() const;
     std::string& pwd() { return pwd_; }
     // JWT signing key. Re-read from settings.json on demand: the file is the
     // only copy that survives a restart, and 'bpb --passwd' rotates it so that
@@ -70,6 +88,10 @@ public:
     void set_tls_cert_path(const std::string& p) { tls_cert_path_ = p; }
     std::string cert_pin() const { return cert_pin_; }
     void set_cert_pin(const std::string& p) { cert_pin_ = p; }
+
+    // Pushes the memory ceiling fields into the relay budget module. Called on
+    // load and on every save so the data path never disagrees with the file.
+    void apply_relay_budget();
 
     bool enable_xhttp() const { return enable_xhttp_.load(std::memory_order_relaxed); }
     bool enable_grpc() const { return enable_grpc_.load(std::memory_order_relaxed); }

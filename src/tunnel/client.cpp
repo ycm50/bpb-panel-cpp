@@ -13,6 +13,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -262,6 +264,18 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
     // accepts the registration, so a healthy tunnel displayed "not connected".
     auto publish = [&]() { if (on_status) on_status(status); };
 
+    // Requests served is the only counter that changes while the tunnel is
+    // healthy, and nothing published after it moved: status_json() kept
+    // returning the snapshot from the moment of registration, so the panel
+    // showed "requests: 0" on a tunnel that had served thousands. Publishing on
+    // every request would mean taking the integration mutex once per HTTP
+    // request, so trail the counter and publish at most once per interval.
+    std::uint64_t publishedRequests = status.requestsServed;
+    std::int64_t lastRequestPublish =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+
     // Per-stream request accumulation.
     struct StreamCtx {
         std::string method;
@@ -377,6 +391,20 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
         std::string wsKey;
         for (auto& kv : r.headers) {
             const std::string& k = kv.first;
+            // The edge carries the public name in the HTTP/2 :authority
+            // pseudo-header and sends NO host header of its own. Dropping every
+            // ":"-prefixed pseudo-header (which is right for :method/:path,
+            // already consumed by the caller) also threw this one away, so the
+            // origin saw only the Host that OriginStream invents from
+            // cfg.originHost -- always "127.0.0.1:8080". Anything reasoning
+            // about the public host then got the wrong answer: the QR-code
+            // same-origin check rejected every public URL with 404.
+            //
+            // This must run BEFORE the ":" skip below, not after it.
+            if (k == ":authority" && !kv.second.empty()) {
+                hdrs.emplace_back("Host", kv.second);
+                continue;
+            }
             if (k.empty() || k[0] == ':') continue;
             if (k == kUpgradeHeader) {
                 if (kv.second == "websocket") isWebsocket = true;
@@ -526,6 +554,7 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
         srvWriteHdrs(id, statusOut, h2hdrs, false);
         s.responded = true;
         ++status.requestsServed;
+        requests_served_.store(status.requestsServed, std::memory_order_relaxed);
         LD("[tunnel] origin " + std::to_string(statusCode) + " -> h2 " + statusOut + " on " +
            s.reqPath);
     };
@@ -831,23 +860,47 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
                     s.toEdgeOff = 0;
                 }
             }
-            // Only read more from the origin while the queue is small, so a slow
-            // edge applies backpressure instead of growing memory without bound.
-            constexpr std::size_t kEdgeQueueHighWater = 512 * 1024;
-            // Before the response head arrives, OriginStream::step() owns the
-            // read side; body bytes must not be drained here or they would be
-            // relayed to the edge before the HEADERS frame that precedes them.
-            const bool canRead =
-                headReady && (s.toEdge.size() - s.toEdgeOff) < kEdgeQueueHighWater;
+            // Read-ahead is sized from the edge's flow-control window, not from
+            // a fixed constant.
+            //
+            // A flat 512 KB high-water mark was the dominant per-session RSS
+            // term: with the window closed write_data_some() accepts nothing,
+            // yet the loop kept pulling from the origin until the queue hit the
+            // mark. 40 stalled streams therefore parked ~20 MB of bytes that
+            // could never be sent -- 'pending=557076' in the trace was exactly
+            // that. Gating the read purely on "credit > 0" fixed the memory but
+            // removed every bit of buffering, and at 40 concurrent streams the
+            // strict serialisation through one connection window is fragile:
+            // any stream that wins credit last stalls the whole edge.
+            //
+            // So allow the window's worth of bytes plus a small fixed slack.
+            // The slack is what absorbs a WINDOW_UPDATE round trip; everything
+            // above the window would only sit in memory. Cost is bounded by
+            // kEdgeQueueSlack per stream instead of 512 KB.
+            // kEdgeQueueCeiling keeps the slack from turning into a new fixed
+            // high-water mark: a generous window (the edge grants 4 MB) must
+            // not let one stream park megabytes. One pump iteration runs every
+            // activePollMs (2 ms) and a 50 MB/s stream moves ~100 KB in that
+            // time, so 256 KB still leaves the write side with work to do.
+            constexpr std::size_t kEdgeQueueSlack = 64 * 1024;
+            constexpr std::size_t kEdgeQueueCeiling = 256 * 1024;
+            std::size_t readAhead = 0;
+            if (headReady) {
+                readAhead = srv->send_credit_bytes(id) + kEdgeQueueSlack;
+                if (readAhead > kEdgeQueueCeiling) readAhead = kEdgeQueueCeiling;
+            }
 
             std::uint8_t buf[65536];
             bool gotData = false;
-            // Re-check the high-water mark on every iteration. With a loopback
-            // origin readSome() keeps returning 16 KB until the socket drains,
-            // so testing the queue only once let toEdge grow to megabytes and
-            // every later front-erase memmoved the whole tail: 74% of the tunnel
-            // CPU was memcpy inside that quadratic loop (32 s/GB).
-            for (; headReady && (s.toEdge.size() - s.toEdgeOff) < kEdgeQueueHighWater;) {
+            // Re-check the limit on every iteration. With a loopback origin
+            // readSome() keeps returning 16 KB until the socket drains, so
+            // testing the queue only once let toEdge grow to megabytes and every
+            // later front-erase memmoved the whole tail: 74% of the tunnel CPU
+            // was memcpy inside that quadratic loop (32 s/GB).
+            // Before the response head arrives, OriginStream::step() owns the
+            // read side; body bytes must not be drained here or they would be
+            // relayed to the edge before the HEADERS frame that precedes them.
+            for (; headReady && (s.toEdge.size() - s.toEdgeOff) < readAhead;) {
                 int n = s.origin->readSome(buf, sizeof(buf), 0);
                 if (n > 0) {
                     // Headers were already sent when the origin answered, so we
@@ -997,6 +1050,21 @@ bool TunnelClient::run(const TunnelConfig& cfg, TunnelStatus& status,
             LD("[tunnel] " + std::to_string(streams.size()) + " stream(s), down=" +
                 std::to_string(down) + " up=" + std::to_string(up) +
                 ", served=" + std::to_string(status.requestsServed));
+        }
+
+        // Republish only when the served counter actually moved, and then at
+        // most once a second: the panel reads it for a human, and taking the
+        // integration mutex per request would put the tunnel behind it.
+        if (status.requestsServed != publishedRequests) {
+            const std::int64_t nowMs =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+            if (nowMs - lastRequestPublish >= 1000) {
+                publishedRequests = status.requestsServed;
+                lastRequestPublish = nowMs;
+                publish();
+            }
         }
 
         if (needBootstrap) {

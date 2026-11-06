@@ -4,6 +4,7 @@
 #include "net/tls.h"
 #include "net/wg_outbound.h"
 #include "net/wg_stack.h"
+#include "util/budget.h"
 #include "util/log.h"
 
 #include <openssl/evp.h>
@@ -454,13 +455,20 @@ void relay(SSL* ssl, net::socket_t client, Outbound& ob, WsIn& in, const std::st
         }
         stop.store(true);
     });
-    char buf[kChunk];
+    // The buffer starts small and widens only after a read that filled it: that
+    // is the one signal that says a larger window would actually raise
+    // throughput here, and it keeps idle sessions cheap.
+    bpb::util::RelayBuffer rb;
     while (!stop.load()) {
         // read() polls for up to one slice: an idle session costs one wake-up
         // per slice, not a hot loop.
-        const int n = ob.read(buf, static_cast<int>(sizeof(buf)), kWaitSliceMs);
+        const int n = ob.read(rb.data(), static_cast<int>(rb.size()), kWaitSliceMs);
         if (n < 0) break;
-        if (n > 0 && !ws_send(ssl, client, buf, static_cast<std::size_t>(n))) break;
+        if (n > 0) {
+            const bool full = static_cast<std::size_t>(n) == rb.size();
+            if (!ws_send(ssl, client, rb.data(), static_cast<std::size_t>(n))) break;
+            if (full) rb.grow();
+        }
     }
     stop.store(true);
     upstream.join();
@@ -472,6 +480,18 @@ void trojan_serve(net::socket_t client, SSL* ssl, std::string accept_key, std::s
     (void)path;
     (void)ws_protocol;  // no early data in Trojan: the hash travels as payload
 
+    // Admission before the upgrade and before any session resource is created;
+    // an over-capacity client gets a 503 it can retry instead of a half-open
+    // websocket.
+    auto permit = bpb::util::SessionPermit::try_acquire();
+    if (!permit) {
+        static const char busy[] = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\n"
+                                   "Content-Length: 0\r\nConnection: close\r\n\r\n";
+        send_all(ssl, client, busy, sizeof(busy) - 1);
+        if (ssl) net::tls_free(ssl);
+        net::close(client);
+        return;
+    }
     std::string response =
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
     if (!accept_key.empty()) response += "Sec-WebSocket-Accept: " + accept_key + "\r\n";
@@ -485,7 +505,7 @@ void trojan_serve(net::socket_t client, SSL* ssl, std::string accept_key, std::s
     // The password is the same credential the panel already manages for VLESS:
     // one UUID per panel, used verbatim as the Trojan password.
     const std::string expect = sha224_hex(cfg.vl_uuid);
-    std::thread([client, ssl, expect, cfg] {
+    std::thread([client, ssl, expect, cfg, permit] {
         enable_keepalive(client);
         WsIn in;
         in.ssl = ssl;

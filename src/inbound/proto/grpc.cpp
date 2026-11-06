@@ -1,6 +1,7 @@
 #include "inbound/proto/grpc.h"
 
 #include "inbound/inbound.h"
+#include "util/budget.h"
 #include "util/log.h"
 #include "util/thread.h"
 
@@ -421,7 +422,14 @@ private:
         const SessionConfig config = config_;
         // The session runs on its own thread: this one must get back to reading
         // frames, or the peer's window stays shut and nothing moves.
-        bpb::util::spawn_detached([stream, handler, config] {
+        // Admission before the relay thread exists: see util/budget.h.
+        auto permit = bpb::util::SessionPermit::try_acquire();
+        if (!permit) {
+            bpb::log::warn("[grpc] relay at capacity, refusing the stream");
+            stream->close();
+            return;
+        }
+        bpb::util::spawn_detached([stream, handler, config, permit] {
             handler(stream, config);
             stream->close();
             // Hand this session's pages back instead of parking them in a glibc

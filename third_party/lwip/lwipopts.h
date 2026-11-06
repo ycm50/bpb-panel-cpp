@@ -41,12 +41,34 @@
 #define LWIP_TCP_PCB_NUM_EXT_ARGS       0
 
 #define TCP_MSS                         1240
-#define TCP_SND_BUF                     (16 * TCP_MSS)
-#define TCP_WND                         (16 * TCP_MSS)
+
+/* Window sizes are the throughput ceiling of anything carried over WARP.
+ *
+ * A TCP connection can only have TCP_WND bytes in flight, so its throughput is
+ * TCP_WND / RTT. 52*MSS keeps the window under 65535 so no window scaling is
+ * needed (lwIP rejects TCP_WND > 0xFFFF without LWIP_WND_SCALE).
+ *
+ * WINDOW SCALING WAS TRIED AND REVERTED. The theory was that a ~100 ms round
+ * trip through the WARP userspace stack capped a single stream at
+ * 64480 / 0.103 = 626 KB/s, and a WARP download did sit at ~630 KB/s. But after
+ * enabling LWIP_WND_SCALE with TCP_WND = 1024*MSS, the same download measured
+ * 631385 B/s -- unchanged to within 0.4% -- while the process never exceeded
+ * 10 MB RSS and the relay pool stayed empty. A window that is genuinely the
+ * bottleneck gets filled; this one was never used. The ~630 KB/s was the
+ * download source rate-limiting the Cloudflare egress IP, not the stack.
+ * Do not re-raise these without a source that is known not to throttle.
+ *
+ * TCP_SND_BUF is the same knob for the upload direction. Uploads measured
+ * 21~22 MB/s with 16*MSS, so the send side was already ahead; it is raised to
+ * match so the two directions behave alike. */
+#define TCP_SND_BUF                     (52 * TCP_MSS)
+#define TCP_WND                         (52 * TCP_MSS)
 #define TCP_SND_QUEUELEN                (4 * TCP_SND_BUF / TCP_MSS)
 #define MEMP_NUM_TCP_PCB                32
 #define MEMP_NUM_TCP_PCB_LISTEN         4
-#define MEMP_NUM_TCP_SEG                128
+/* lwIP's sanity checks against MEMP_NUM_TCP_SEG / PBUF_POOL_SIZE are compiled
+ * out because MEMP_MEM_MALLOC=1 (segments and pbufs come from the heap). */
+#define MEMP_NUM_TCP_SEG                256
 #define PBUF_POOL_SIZE                  32
 #define PBUF_POOL_BUFSIZE               1600
 

@@ -1,6 +1,7 @@
 #include "settings/store.h"
 #include "app/passwd.h"
 #include "crypto/crypto.h"
+#include "util/budget.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -47,6 +48,10 @@ static const char* kDefaultKvJson = R"({
   "fragmentDelayMax": 1,
   "fragmentMaxSplitMin": 0,
   "fragmentMaxSplitMax": 0,
+  "relayMaxSessions": 40,
+  "relayInitialBufferKb": 50,
+  "relayMaxBufferKb": 400,
+  "relayPoolBudgetMb": 8,
   "customSubs": [],
   "customConfigs": [],
   "warpRemoteDNS": "1.1.1.1",
@@ -154,6 +159,37 @@ static bool write_file_atomic(const std::string& path, const std::string& data, 
     return true;
 }
 
+bool Store::reload_from_disk(std::string& error) {
+    // Everything the files own is reset first: load() only overwrites keys that
+    // are present, so a key someone deleted from settings.json would otherwise
+    // survive in memory and be written straight back on the next save.
+    cfg_ = Config{};
+    kv_ = nlohmann::json::object();
+    warps_ = nlohmann::json::array();
+    pwd_.clear();
+    secret_.clear();
+
+    // Process facts, not file facts. load() calls set_listen_facts() with the
+    // argv values, and that would overwrite the real listener port with a
+    // default if it were ever re-run from here.
+    const std::string host = listen_host_;
+    const int port = listen_port_;
+    const bool tls = listen_tls_;
+    const int tls_port = tls_port_;
+    const std::string tls_cert = tls_cert_path_;
+    const std::string cert_pin = cert_pin_;
+
+    if (!load(dir_, error)) return false;
+
+    listen_host_ = host;
+    listen_port_ = port;
+    listen_tls_ = tls;
+    tls_port_ = tls_port;
+    tls_cert_path_ = tls_cert;
+    cert_pin_ = cert_pin;
+    return true;
+}
+
 bool Store::load(const std::string& dir, std::string& error) {
     dir_ = dir;
 
@@ -234,11 +270,28 @@ bool Store::load(const std::string& dir, std::string& error) {
     // Publish the transport switches for the connection handlers, which run on
     // other threads and must not read kv_ while the panel writes it.
     set_transport_switches(kv_.value("enableXHTTP", false), kv_.value("enableGRPC", false));
+    apply_relay_budget();
     return true;
+}
+
+void Store::apply_relay_budget() {
+    bpb::util::RelayBudgetSettings s;
+    // 0 or a negative value means "leave the default": a settings.json written by
+    // an older build must not silently disable the ceiling.
+    const int active = kv_.value("relayMaxSessions", 0);
+    if (active > 0) s.max_active = active;
+    const int initial_kb = kv_.value("relayInitialBufferKb", 0);
+    if (initial_kb > 0) s.initial_bytes = static_cast<std::size_t>(initial_kb) * 1024;
+    const int max_kb = kv_.value("relayMaxBufferKb", 0);
+    if (max_kb > 0) s.max_bytes = static_cast<std::size_t>(max_kb) * 1024;
+    const int pool_mb = kv_.value("relayPoolBudgetMb", 0);
+    if (pool_mb > 0) s.pool_bytes = static_cast<std::size_t>(pool_mb) * 1024 * 1024;
+    bpb::util::configure_relay_budget(s);
 }
 
 bool Store::save(std::string& error) {
     set_transport_switches(kv_.value("enableXHTTP", false), kv_.value("enableGRPC", false));
+    apply_relay_budget();
     nlohmann::json j;
     j["proxySettings"] = kv_;
     j["warpAccounts"] = warps_;
@@ -263,6 +316,14 @@ bool Store::save(std::string& error) {
     cfg["directHost"] = cfg_.directHost;
     cfg["directPort"] = cfg_.directPort;
     return write_file_atomic(dir_ + "/config.json", cfg.dump(2), error);
+}
+
+std::size_t Store::warp_accounts_on_disk() const {
+    std::string text;
+    if (!read_file(dir_ + "/settings.json", text)) return 0;
+    auto j = nlohmann::json::parse(text, nullptr, false);
+    if (j.is_discarded() || !j.contains("warpAccounts") || !j["warpAccounts"].is_array()) return 0;
+    return j["warpAccounts"].size();
 }
 
 std::string Store::secret() {

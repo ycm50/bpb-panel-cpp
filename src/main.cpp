@@ -1,6 +1,7 @@
 #include "app/app.h"
 #include "app/cur.h"
 #include "app/passwd.h"
+#include "app/restart.h"
 #include "http/http.h"
 #include "inbound/inbound.h"
 #include "inbound/proto/grpc.h"
@@ -12,7 +13,9 @@
 #include "proxy/session.h"
 #include "sub/wireguard.h"
 #include "tunnel/integration.h"
+#include "util/budget.h"
 #include "util/crash.h"
+#include "util/memlimit.h"
 #include "util/log.h"
 #include "util/thread.h"
 
@@ -61,7 +64,14 @@ int main(int argc, char** argv) {
     std::string tls_key;
     std::string export_warp;
     int cli_log_level = -1;  // -1: not given, fall back to BPB_LOG
+    // Memory ceiling for this process, in MiB. Not given: the compiled-in
+    // default (see util/memlimit.h). The installer passes the value it wrote
+    // into the unit so the relay budget and the cgroup limit are the same
+    // number instead of two constants that drift apart.
+    int mem_limit_mb = 0;
     bool cur_requested = false;
+    bool res_requested = false;
+    std::string res_pid;
     bool passwd_requested = false;
     bool passwd_check = false;
     std::vector<std::string> passwd_args;
@@ -87,6 +97,28 @@ int main(int argc, char** argv) {
             data_given = true;
         }
         else if (a == "--cur") cur_requested = true;
+        else if (a == "--res") {
+            // --res <pid> restarts that instance; --res alone restarts the bpb
+            // with the lowest pid.
+            //
+            // A non-numeric argument is a mistake, not "no pid given": silently
+            // falling back to the lowest pid would restart an unrelated instance
+            // because the operator typed the pid wrong. Only another --flag
+            // means "no pid".
+            res_requested = true;
+            if (i + 1 < argc && std::strncmp(argv[i + 1], "--", 2) != 0) {
+                const char* v = argv[i + 1];
+                bool numeric = *v != '\0';
+                for (const char* p = v; *p; ++p) {
+                    if (*p < '0' || *p > '9') { numeric = false; break; }
+                }
+                if (!numeric) {
+                    std::fprintf(stderr, "error: --res needs a numeric pid, got '%s'\n", v);
+                    return 2;
+                }
+                res_pid = argv[++i];
+            }
+        }
         else if (a == "--passwd") {
             // Positional arguments that follow belong to the credential:
             //   --passwd <password>            set (user = config.accEmail)
@@ -104,6 +136,20 @@ int main(int argc, char** argv) {
         else if (a == "--tls-port") tls_port = std::atoi(next("--tls-port").c_str());
         else if (a == "--tls-cert") tls_cert = next("--tls-cert");
         else if (a == "--tls-key") tls_key = next("--tls-key");
+        else if (a == "--mem-max") {
+            const std::string value = next("--mem-max");
+            std::string parse_error;
+            if (!bpb::util::parse_memory_max_mb(value.c_str(), mem_limit_mb, parse_error)) {
+                std::fprintf(stderr, "error: --mem-max %s\n", parse_error.c_str());
+                return 2;
+            }
+        }
+        else if (a == "--mem-default") {
+            // Asked by install.sh so the unit and the binary agree on one
+            // number. Printed bare (no unit) so a shell can use it directly.
+            std::printf("%d\n", bpb::util::default_memory_max_mb());
+            return 0;
+        }
         else if (a == "--log" || a == "--verbose") {
             const std::string value = next("--log");
             int lvl = 0;
@@ -134,8 +180,15 @@ int main(int argc, char** argv) {
                         "  --fetch <url>    HTTPS diagnostic\n"
                         "  --cur            print the tunnel domain of the bpb instances that are\n"
                         "                   running now (all of them on Linux; with --data on Windows)\n"
+                        "  --res [pid]      restart a running bpb; without a pid, the one with the\n"
+                        "                   lowest pid. A service-managed process restarts its unit,\n"
+                        "                   a hand-started one is re-exec'd with its original arguments\n"
                         "  --log <level>    off|error|warn|info|debug|trace (default error: silent unless\n"
-                        "                   something breaks; also settable with BPB_LOG)\n");
+                        "                   something breaks; also settable with BPB_LOG)\n"
+                        "  --mem-max <N>    memory ceiling in MiB; the relay budget is derived from it\n"
+                        "                   so a burst is refused by admission control instead of\n"
+                        "                   being OOM-killed. Default is --mem-default\n"
+                        "  --mem-default    print the compiled-in ceiling in MiB and exit\n");
             return 0;
         }
     }
@@ -146,11 +199,20 @@ int main(int argc, char** argv) {
     if (cur_requested)
         return bpb::app::print_current_tunnels(data_given ? data_dir : std::string(),
                                                port_given ? port : 0);
+    // --res restarts a live instance; like --cur it must run before the store is
+    // loaded or the port is bound, because the target may be this very binary.
+    if (res_requested) return bpb::app::restart_bpb(res_pid);
     if (passwd_requested)
         return bpb::app::passwd::run_cli(data_dir, port, passwd_args, passwd_check);
 
     // Resolve the log switch before anything can want to log.
     bpb::log::init(cli_log_level);
+
+    // Publish the memory ceiling before the store configures the relay budget,
+    // so the pool is clamped against it from the first session on. The default
+    // is the same number install.sh writes into the unit.
+    if (mem_limit_mb <= 0) mem_limit_mb = bpb::util::default_memory_max_mb();
+    bpb::util::set_memory_limit(bpb::util::memory_max_bytes(mem_limit_mb));
 
     bpb::Store store;
     std::string error;

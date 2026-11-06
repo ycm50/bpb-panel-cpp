@@ -87,6 +87,12 @@ public:
     // treating it as backlog made the relay spin at poll(0) and burn CPU.
     virtual bool send_credit_available(std::uint32_t streamId) = 0;
 
+    // Bytes the peer's flow-control window will accept on this stream right now
+    // (connection window and stream window, whichever is smaller). Callers size
+    // their read-ahead from it: reading far past the window only parks bytes
+    // that cannot be sent, which is per-session memory nobody budgeted for.
+    virtual std::size_t send_credit_bytes(std::uint32_t streamId) = 0;
+
     // Resets a stream. Used when the local origin is gone, so the edge tears
     // the eyeball connection down instead of waiting for a body that will
     // never arrive.

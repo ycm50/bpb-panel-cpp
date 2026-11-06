@@ -3,6 +3,7 @@
 #include "inbound/proto/grpc.h"
 #include "inbound/proto/ws_transport.h"
 #include "proxy/session.h"
+#include "util/budget.h"
 #include "util/log.h"
 #include "util/thread.h"
 #include "util/util.h"
@@ -219,7 +220,8 @@ void session_loop(std::shared_ptr<grpc::Stream> stream, const SessionConfig& con
     // ---- upstream -> client -------------------------------------------------
     bpb::util::Thread toClient;
     toClient.start([&] {
-        char buf[kChunk];
+        // Grows only after a read that filled it; see util/budget.h.
+        bpb::util::RelayBuffer rb;
         try {
             while (!finished.load()) {
                 if (!upstreamReady.load()) {
@@ -228,13 +230,14 @@ void session_loop(std::shared_ptr<grpc::Stream> stream, const SessionConfig& con
                                     [&] { return upstreamReady.load() || finished.load(); });
                     continue;
                 }
-                const int n = upstream.read(buf, static_cast<int>(sizeof(buf)), kWaitSliceMs);
+                const int n = upstream.read(rb.data(), static_cast<int>(rb.size()), kWaitSliceMs);
                 if (n < 0) {
                     exitReason = "upstream closed";
                     break;
                 }
                 if (n == 0) continue;
-                if (!stream->write(buf, static_cast<std::size_t>(n))) {
+                if (static_cast<std::size_t>(n) == rb.size()) rb.grow();
+                if (!stream->write(rb.data(), static_cast<std::size_t>(n))) {
                     exitReason = "client write failed";
                     break;
                 }

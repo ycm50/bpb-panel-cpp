@@ -5,6 +5,7 @@
 #include "net/tls.h"
 #include "net/wg_outbound.h"
 #include "net/wg_stack.h"
+#include "util/budget.h"
 #include "util/log.h"
 #include "util/thread.h"
 #include "util/util.h"
@@ -627,6 +628,7 @@ void session_loop(SSL* client_ssl, socket_t client, const SessionConfig& config,
     // ---- upstream -> client ------------------------------------------------
     bpb::util::Thread toClient;
     toClient.start([&] {
+        bpb::util::RelayBuffer rb;
         try {
             while (!finished.load()) {
                 if (!upstreamReady.load()) {
@@ -638,16 +640,16 @@ void session_loop(SSL* client_ssl, socket_t client, const SessionConfig& config,
                                     [&] { return upstreamReady.load() || finished.load(); });
                     continue;
                 }
-                char buf[kChunk];
-                // No lock: this thread is the only reader. Holding it across a
-                // blocking read starved the upload direction. read() polls
-                // internally now, so an idle session costs one wake-up per slice
-                // instead of a recv()/EAGAIN hot loop.
-                int n = upstream.read(buf, sizeof(buf), kWaitSliceMs);
+                // The download buffer starts at the relay budget's initial size
+                // and only widens when a read filled it completely: a half-empty
+                // read is already keeping up, and growing there would spend the
+                // shared pool on streams that do not need it.
+                int n = upstream.read(rb.data(), static_cast<int>(rb.size()), kWaitSliceMs);
                 if (n < 0) { exitReason = "upstream closed"; break; }
                 if (n == 0) continue;
                 {
-                    if (!ws_send(client_ssl, client, buf, static_cast<std::size_t>(n))) {
+                    const bool filled = static_cast<std::size_t>(n) == rb.size();
+                    if (!ws_send(client_ssl, client, rb.data(), static_cast<std::size_t>(n))) {
                         exitReason = "client write failed";
                         break;
                     }
@@ -662,9 +664,12 @@ void session_loop(SSL* client_ssl, socket_t client, const SessionConfig& config,
                                                      .count() % 1000000),
                                      n);
                         for (int i = 0; i < n && i < 12; ++i)
-                            std::fprintf(stderr, " %02x", static_cast<unsigned char>(buf[i]));
+                            std::fprintf(stderr, " %02x", static_cast<unsigned char>(rb.data()[i]));
                         std::fprintf(stderr, "\n");
                     }
+                    // Only a read that filled the buffer proves a larger window
+                    // could raise throughput; growth re-reserves from the pool.
+                    if (filled) rb.grow();
                 }
             }
         } catch (...) {
@@ -751,6 +756,21 @@ void vless_serve(net::socket_t client_fd, SSL* client_ssl, std::string accept_ke
                  std::string path, std::string ws_protocol, SessionConfig config) {
     (void)path;
     std::string early = ws_protocol.empty() ? std::string() : decode_early_data(ws_protocol);
+    // Admission happens on the accepting thread, before the session allocates a
+    // thread, buffers or a TLS record buffer -- and before the 101 is written, so
+    // an over-capacity client sees a real HTTP refusal instead of an upgrade that
+    // then dies.
+    auto permit = bpb::util::SessionPermit::try_acquire();
+    if (!permit) {
+        static const char busy[] = "HTTP/1.1 503 Service Unavailable\r\n"
+                                   "Retry-After: 1\r\n"
+                                   "Content-Length: 0\r\n"
+                                   "Connection: close\r\n\r\n";
+        send_all(client_ssl, client_fd, busy, sizeof(busy) - 1);
+        if (client_ssl) net::tls_free(client_ssl);
+        net::close(client_fd);
+        return;
+    }
     std::string response = "HTTP/1.1 101 Switching Protocols\r\n"
                            "Upgrade: websocket\r\n"
                            "Connection: Upgrade\r\n";
@@ -770,7 +790,7 @@ void vless_serve(net::socket_t client_fd, SSL* client_ssl, std::string accept_ke
     }
     // A session thread needs tens of KB, not the platform default 8 MB, and it
     // must never be joined: spawn it with an explicit small stack.
-    bpb::util::spawn_detached([client_fd, client_ssl, config, early]() {
+    bpb::util::spawn_detached([client_fd, client_ssl, config, early, permit]() {
         session_loop(client_ssl, client_fd, config, early);
         // Hand this session's pages back to the kernel instead of parking them in
         // a glibc arena: 200 short sessions otherwise leave an idle relay several

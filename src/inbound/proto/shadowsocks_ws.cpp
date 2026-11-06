@@ -4,6 +4,7 @@
 #include "net/tls.h"
 #include "net/wg_outbound.h"
 #include "net/wg_stack.h"
+#include "util/budget.h"
 #include "util/log.h"
 
 #include <openssl/evp.h>
@@ -579,13 +580,19 @@ void relay(SSL* ssl, net::socket_t client, Outbound& ob, SsIn& in, SsOut& out,
         }
         stop.store(true);
     });
-    char buf[kChunk];
+    // Same growth rule as the other inbounds: widen only when a read filled the
+    // buffer, so the shared pool pays only for streams that are actually capped.
+    bpb::util::RelayBuffer rb;
     while (!stop.load()) {
         // read() polls for up to one slice: an idle session costs one wake-up
         // per slice, not a hot loop.
-        const int n = ob.read(buf, static_cast<int>(sizeof(buf)), kWaitSliceMs);
+        const int n = ob.read(rb.data(), static_cast<int>(rb.size()), kWaitSliceMs);
         if (n < 0) break;
-        if (n > 0 && !out.write(buf, static_cast<std::size_t>(n))) break;
+        if (n > 0) {
+            const bool full = static_cast<std::size_t>(n) == rb.size();
+            if (!out.write(rb.data(), static_cast<std::size_t>(n))) break;
+            if (full) rb.grow();
+        }
     }
     stop.store(true);
     upstream.join();
@@ -597,6 +604,16 @@ void shadowsocks_serve(net::socket_t client, SSL* ssl, std::string accept_key, s
     (void)path;
     (void)ws_protocol;
 
+    // Admission before the upgrade and before any session resource exists.
+    auto permit = bpb::util::SessionPermit::try_acquire();
+    if (!permit) {
+        static const char busy[] = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\n"
+                                   "Content-Length: 0\r\nConnection: close\r\n\r\n";
+        send_all_raw(ssl, client, busy, sizeof(busy) - 1);
+        if (ssl) net::tls_free(ssl);
+        net::close(client);
+        return;
+    }
     std::string response =
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
     if (!accept_key.empty()) response += "Sec-WebSocket-Accept: " + accept_key + "\r\n";
@@ -610,7 +627,7 @@ void shadowsocks_serve(net::socket_t client, SSL* ssl, std::string accept_key, s
     // The panel UUID doubles as the Shadowsocks password, like the Trojan
     // inbound: one credential per panel, no extra setting to keep in sync.
     const std::string master = master_key(cfg.vl_uuid);
-    std::thread([client, ssl, master] {
+    std::thread([client, ssl, master, permit] {
         enable_keepalive(client);
         SsIn in;
         in.ssl = ssl;

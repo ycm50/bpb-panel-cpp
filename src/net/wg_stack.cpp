@@ -29,8 +29,12 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #endif
+
+// net::poll_fds / PollFd / kRead live here.
+#include "net/net.h"
 
 namespace bpb::net {
 
@@ -50,6 +54,17 @@ std::uint32_t now_ms() {
     return static_cast<std::uint32_t>(
         duration_cast<milliseconds>(steady_clock::now() - start).count());
 }
+
+// How long one pump() may spend draining the UDP socket before yielding the
+// stack lock. See the comment in pump(): draining "until empty" without a
+// budget would let a saturated link hold the recursive mutex indefinitely and
+// starve the relay threads that need it to write.
+constexpr std::uint32_t kDrainBudgetMs = 4;
+
+// Longest the driver parks in poll() while the stack is idle. Same 100/s idle
+// wake-up rate the old "pump then sleep 10 ms" loop had, so an idle WARP tunnel
+// costs exactly what it did before - only a busy one behaves differently.
+constexpr int kPollSliceMs = 10;
 
 bool resolve_v4(const std::string& host, std::uint32_t& out_ip, std::string& error) {
     // Literal first.
@@ -90,6 +105,10 @@ struct WgStack::Impl {
     int peer_len = 0;
     std::uint32_t last_attempt_ms = 0;
     std::uint32_t backoff_ms = 500;
+    // True between "initiate() accepted" and "a session exists". Concurrent
+    // connect() calls read it to tell "my handshake failed" apart from
+    // "somebody else is handshaking, wait for theirs".
+    bool handshake_in_flight = false;
 
     std::mutex cv_mtx;
     std::condition_variable cv;
@@ -97,6 +116,13 @@ struct WgStack::Impl {
     // Background driver, see start_driver().
     std::thread driver;
     std::atomic<bool> driver_stop{false};
+
+    // Self-pipe used to wake the driver the instant a relay thread queues
+    // outbound work. Without it the driver would still be sleeping up to
+    // kPollSliceMs after the segment was written, which caps upload latency
+    // and, at 100 wake-ups/s, made the send path bursty.
+    os_socket wake_r = kBadSocket;
+    os_socket wake_w = kBadSocket;
 };
 
 // WireGuard -> lwIP
@@ -256,10 +282,21 @@ void WgStack::stop() {
 
 bool WgStack::running() const { return impl_->started; }
 
+// A live transport session: started, handshaked, and the keys have not expired.
+// connect() and the driver both need this test, and it must agree with ready().
+// Templated so it does not have to name the private nested Impl type.
+template <typename Stack>
+static bool session_live(Stack& s) {
+    return s.started && s.device.has_session() && !s.device.expired();
+}
+
 bool WgStack::ready() {
     auto& s = *impl_;
-    bool up = s.started && s.device.has_session() && !s.device.expired();
-    if (up) s.backoff_ms = 500;  // reset once a session is live
+    bool up = session_live(s);
+    if (up) {
+        s.backoff_ms = 500;  // reset once a session is live
+        s.handshake_in_flight = false;
+    }
     return up;
 }
 
@@ -303,6 +340,15 @@ bool WgStack::open_udp(const std::string& endpoint, std::string& error) {
     fcntl(s.udp, F_SETFL, flags | O_NONBLOCK);
 #endif
 
+    // Raise the receive buffer so a burst survives the gap between two pump()
+    // calls. The default (208 KB on Linux) is only ~100 ms of a saturated
+    // 1.6 MB/s tunnel; with the drain budget in place a burst can be larger
+    // than that, and anything the kernel drops is a TCP segment lwIP has to
+    // wait a retransmit for.
+    int rcvbuf = 1 << 20;
+    ::setsockopt(s.udp, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf),
+                 sizeof(rcvbuf));
+
     s.device.set_send([&s](const unsigned char* d, std::size_t n) {
         return ::send(s.udp, reinterpret_cast<const char*>(d), static_cast<int>(n), 0) ==
                static_cast<int>(n);
@@ -318,6 +364,29 @@ bool WgStack::open_udp(const std::string& endpoint, std::string& error) {
 void WgStack::start_driver() {
     auto& s = *impl_;
     if (s.driver.joinable()) return;
+
+    // Self-pipe for wake_driver(). Created before the thread starts so the
+    // loop always sees a valid fd pair.
+    if (s.wake_r == kBadSocket) {
+#ifdef _WIN32
+        // No socketpair() on Windows: emulate with a connected loopback UDP
+        // pair would need a second bound socket, and WARP is POSIX-only in
+        // practice, so the driver simply polls the tunnel socket alone there.
+        s.wake_r = kBadSocket;
+        s.wake_w = kBadSocket;
+#else
+        int pair[2] = {kBadSocket, kBadSocket};
+        if (::socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) == 0) {
+            s.wake_r = pair[0];
+            s.wake_w = pair[1];
+            for (int i = 0; i < 2; ++i) {
+                int fl = fcntl(pair[i], F_GETFL, 0);
+                fcntl(pair[i], F_SETFL, fl | O_NONBLOCK);
+            }
+        }
+#endif
+    }
+
     s.driver_stop.store(false);
     s.driver = std::thread([] {
         auto& st = WgStack::instance().impl();
@@ -361,15 +430,76 @@ void WgStack::start_driver() {
                     last_tx_seen = tx;
                 }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            // Wait for the socket instead of sleeping a fixed 10 ms.
+            //
+            // pump() itself is now unbounded-ish, so the sleep is what used to
+            // set the rate. poll() returns the moment a datagram lands (or
+            // when there is outbound work queued by a relay thread), so an
+            // idle tunnel still costs ~100 wake-ups/s - the same idle cost as
+            // before - but a busy one drains continuously.
+            //
+            // The wake pipe covers the other direction: a relay thread that
+            // just queued a segment calls wake_driver(), and poll() returns
+            // immediately instead of waiting up to kPollSliceMs.
+            net::PollFd fds[2];
+            std::size_t nfds = 0;
+            int wake_slot = -1;
+            if (st.udp != kBadSocket) {
+                fds[nfds].fd = static_cast<net::socket_t>(st.udp);
+                fds[nfds].events = net::kRead;
+                fds[nfds].revents = 0;
+                ++nfds;
+            }
+            if (st.wake_r != kBadSocket) {
+                wake_slot = static_cast<int>(nfds);
+                fds[nfds].fd = st.wake_r;
+                fds[nfds].events = net::kRead;
+                fds[nfds].revents = 0;
+                ++nfds;
+            }
+            if (nfds > 0) {
+                const int pr = net::poll_fds(fds, nfds, kPollSliceMs);
+                if (pr > 0 && wake_slot >= 0 && fds[wake_slot].revents) {
+                    // Clear the wake byte; the actual work is done by the
+                    // pump() at the top of the next iteration.
+                    unsigned char scratch[64];
+                    while (::recv(st.wake_r, reinterpret_cast<char*>(scratch), sizeof(scratch), 0) > 0) {
+                    }
+                }
+            } else {
+                // Nothing to poll (no socket, no wake pipe): keep the old
+                // cadence so handshake retries and timers still tick.
+                std::this_thread::sleep_for(std::chrono::milliseconds(kPollSliceMs));
+            }
         }
     });
+}
+
+void WgStack::wake_driver() {
+    auto& s = *impl_;
+    if (s.wake_w == kBadSocket) return;
+    const unsigned char one = 1;
+    ::send(s.wake_w, reinterpret_cast<const char*>(&one), 1, 0);
 }
 
 void WgStack::stop_driver() {
     auto& s = *impl_;
     s.driver_stop.store(true);
-    if (s.driver.joinable()) s.driver.join();
+    if (s.driver.joinable()) {
+        wake_driver();   // do not wait a full poll slice to notice the stop flag
+        s.driver.join();
+    }
+    if (s.wake_r != kBadSocket) {
+#ifdef _WIN32
+        closesocket(s.wake_r);
+        closesocket(s.wake_w);
+#else
+        ::close(s.wake_r);
+        ::close(s.wake_w);
+#endif
+        s.wake_r = kBadSocket;
+        s.wake_w = kBadSocket;
+    }
 }
 
 bool WgStack::ensure_tunnel(std::string& error) {
@@ -379,21 +509,27 @@ bool WgStack::ensure_tunnel(std::string& error) {
         error = "wireguard stack not started";
         return false;
     }
-    if (s.device.has_session() && !s.device.expired()) return true;
+    if (s.device.has_session() && !s.device.expired()) {
+        s.handshake_in_flight = false;
+        return true;
+    }
 
     // Back off between attempts: the endpoint rate-limits repeated handshakes,
     // and re-initiating invalidates any response already in flight.
+    //
+    // A backoff is NOT a failure for the caller: it means an attempt is already
+    // on its way, so connect() waits on it instead of giving up. handshake_
+    // in_flight tells those two cases apart.
     std::uint32_t now = wg::monotonic_ms();
     if (s.last_attempt_ms != 0 && (now - s.last_attempt_ms) < s.backoff_ms) {
-        error = "handshake backoff";
+        error.clear();
         return false;
     }
     bool ok = s.device.initiate(error);
+    s.last_attempt_ms = now;
+    s.handshake_in_flight = ok;
     if (ok) {
-        s.last_attempt_ms = now;
         s.backoff_ms = std::min<std::uint32_t>(s.backoff_ms * 2, 8000u);
-    } else {
-        s.last_attempt_ms = now;
     }
     return ok;
 }
@@ -412,12 +548,31 @@ void WgStack::pump() {
     std::lock_guard<std::recursive_mutex> lk(s.mtx);
 
     if (s.udp != kBadSocket) {
-        for (int i = 0; i < 32; ++i) {
+        // Drain until the socket is empty, not "32 datagrams then leave".
+        //
+        // The fixed cap of 32 made the pump rate, not the link, the ceiling:
+        // the driver called pump() 100 times a second (one 10 ms sleep per
+        // iteration), so a busy UDP queue could only ever be drained at
+        // 32 x 100 = 3200 datagrams/s. Measured on a 1-core box that showed up
+        // as ~1386 datagrams/s and a hard 1.6 MB/s download ceiling - a number
+        // that did not move when the source got faster, and that split across
+        // parallel streams instead of scaling with them.
+        //
+        // The time budget keeps a flood from starving the relay threads that
+        // are waiting on this same lock: we yield after kDrainBudgetMs even if
+        // the socket still has data, and the next pump() picks up where this
+        // one stopped. rcvbuf (1 MB) holds far more than that, so nothing is
+        // dropped in practice.
+        const std::uint32_t deadline = now_ms() + kDrainBudgetMs;
+        for (;;) {
             unsigned char buf[2048];
             int n = static_cast<int>(recvfrom(s.udp, reinterpret_cast<char*>(buf), sizeof(buf), 0,
                                               nullptr, nullptr));
             if (n <= 0) break;
             s.device.handle_datagram(buf, static_cast<std::size_t>(n));
+            // now_ms() is a steady_clock read; checking every packet is cheap
+            // relative to the AEAD open we just did.
+            if (now_ms() >= deadline) break;
         }
     }
 
@@ -540,6 +695,10 @@ int WgConnection::write(const char* buf, int len) {
     auto& stack = WgStack::instance().impl();
     std::lock_guard<std::recursive_mutex> lk(stack.mtx);
     err_t e = tcp_write(st.pcb, buf, static_cast<u16_t>(len), TCP_WRITE_FLAG_COPY);
+    // The driver may be parked in poll(); nudge it so this segment goes out
+    // now instead of up to one poll slice later. tcp_output() below pushes it
+    // into the netif queue, and the driver's pump() flushes it.
+    WgStack::instance().wake_driver();
     if (bpb::log::enabled(bpb::log::kTrace))
         std::fprintf(stderr, "[wg] tcp_write(%d) -> %d sndbuf=%u\n", len, static_cast<int>(e),
                      static_cast<unsigned>(tcp_sndbuf(st.pcb)));
@@ -578,11 +737,43 @@ std::unique_ptr<WgConnection> WgStack::connect(const std::string& host, int port
     std::uint32_t ip = 0;
     if (!resolve_v4(host, ip, error)) return nullptr;
 
-    // Reuse an existing session; only handshake when there is none. A failure
-    // here is not fatal on its own: the caller loop retries via pump().
-    if (!s.device.has_session() || s.device.expired()) {
+    // Bring the transport session up BEFORE creating a pcb.
+    //
+    // This used to call ensure_tunnel() and discard its result, then build a
+    // pcb and tcp_connect() anyway. With no session the SYN was queued into an
+    // interface that had no key to encrypt with, so nothing ever left the box
+    // and the dial ended as a bare "connect timeout".
+    //
+    // That is what made WARP unusable for concurrent requests: the first
+    // connect() starts the handshake and stamps last_attempt_ms, and every
+    // connect() that arrives inside the 500 ms backoff window gets
+    // "handshake backoff" from ensure_tunnel(). Dropping that error meant those
+    // sessions still dialled into a dead path. Measured: one WARP stream ran at
+    // 15.47 MB/s while N>=2 concurrent streams all failed with zero bytes.
+    //
+    // A refusal now means "somebody else is already handshaking", which is a
+    // reason to wait for that session, not to fail. Only the case where nobody
+    // is handshaking and we cannot start one is reported as an error.
+    if (!session_live(s)) {
         std::string tunnel_error;
-        ensure_tunnel(tunnel_error);
+        const bool initiated = ensure_tunnel(tunnel_error);
+        const std::uint32_t wait_deadline =
+            now_ms() + static_cast<std::uint32_t>(timeout_ms);
+        bool up = false;
+        while (!up) {
+            // pump() both drives the handshake and drains datagrams, so the
+            // reply is consumed here rather than by the background driver
+            // alone -- the driver may be asleep in poll() for a whole slice.
+            pump();
+            up = session_live(s);
+            if (up || now_ms() >= wait_deadline) break;
+            if (!initiated && !s.handshake_in_flight) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        if (!up) {
+            error = tunnel_error.empty() ? "wireguard tunnel unavailable" : tunnel_error;
+            return nullptr;
+        }
     }
 
     std::unique_ptr<WgConnection> conn;

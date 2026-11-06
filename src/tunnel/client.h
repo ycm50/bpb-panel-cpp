@@ -64,6 +64,11 @@ public:
     // invoked every time the status actually changes (connected, registered,
     // ingress hostnames) so the panel reports the live state instead of the
     // snapshot taken after the first connection attempt.
+    //
+    // It is also invoked after a served request is accounted for, but only at
+    // most once per publishIntervalMs: the panel polls status on every render,
+    // and republishing per request would mean taking the tunnel's status mutex
+    // once per HTTP request just to bump a counter nobody reads that often.
     bool run(const TunnelConfig& cfg, TunnelStatus& status,
              const std::function<void(const std::string&)>& log,
              const std::function<void(const TunnelStatus&)>& on_status = {});
@@ -78,6 +83,12 @@ public:
     }
     bool stopping() const { return stopping_.load(); }
 
+    // Requests served so far. The live counter, not a snapshot: run() publishes
+    // its status into the integration layer only at connect/register/ingress
+    // moments, and the panel would otherwise show the value from the last of
+    // those while the tunnel kept serving.
+    std::uint64_t requests_served() const { return requests_served_.load(); }
+
 private:
     // shutdown(2)s the live edge socket, if any. Safe to call from another
     // thread: the pointer is published under mutex_ and cleared before the
@@ -87,6 +98,9 @@ private:
     // Checked by the run loop and by the supervisor's backoff sleep; atomic so
     // stop() may be called from the HTTP thread.
     std::atomic<bool> stopping_{false};
+    // Incremented by the relay for every request whose origin response was
+    // relayed. Atomic because the panel thread reads it while run() writes it.
+    std::atomic<std::uint64_t> requests_served_{0};
     // Guards live_ only; never held across a blocking operation.
     mutable std::mutex mutex_;
     H2Server* live_ = nullptr;

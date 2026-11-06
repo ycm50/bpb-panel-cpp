@@ -1657,6 +1657,34 @@ table tr:not(:last-child) {
                             </div>
                         </div>
                         <div class="form-control">
+                            <label for="relayMaxSessions">最大并发会话</label>
+                            <div>
+                                <input type="number" id="relayMaxSessions" name="relayMaxSessions" min="1"
+                                    max="500">
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="relayInitialBufferKb">每方向初始缓冲 (KiB)</label>
+                            <div>
+                                <input type="number" id="relayInitialBufferKb" name="relayInitialBufferKb"
+                                    min="4" max="1024">
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="relayMaxBufferKb">单连接缓冲上限 (KiB)</label>
+                            <div>
+                                <input type="number" id="relayMaxBufferKb" name="relayMaxBufferKb" min="16"
+                                    max="4096">
+                            </div>
+                        </div>
+                        <div class="form-control">
+                            <label for="relayPoolBudgetMb">缓冲池总预算 (MiB)</label>
+                            <div>
+                                <input type="number" id="relayPoolBudgetMb" name="relayPoolBudgetMb" min="1"
+                                    max="256">
+                            </div>
+                        </div>
+                        <div class="form-control">
                             <label for="warpBestPingInterval">最优延迟测速间隔</label>
                             <div>
                                 <input type="number" id="warpBestPingInterval" name="warpBestPingInterval" min="10"
@@ -2059,8 +2087,15 @@ table tr:not(:last-child) {
                     <span class="material-symbols-rounded">
                         check_circle
                     </span>应用</button>
-                <button type="button" class="panel-settings" title="Reset panel settings to default"
-                    onclick="resetSettings(this)">
+                <!-- Same icon as before, different job. It used to reset the
+                     panel settings to defaults; it now re-reads settings.json /
+                     config.json off the disk and repaints every status readout.
+                     The page paints whatever the process held in memory from
+                     startup, so an account pool or a settings file changed by
+                     hand disagreed with the panel until a restart. Nothing polls
+                     on a timer: this button is the refresh. -->
+                <button type="button" class="panel-settings" title="从磁盘重新读取状态（不自动刷新）"
+                    onclick="reloadFromDisk(this)">
                     <span class="material-symbols-rounded">
                         settings_backup_restore
                     </span>
@@ -2857,11 +2892,46 @@ async function renewWarpAccounts(btn) {
         }
 
         notify('success', '重新获取 Warp 账号', ['Warp 账号已更新！']);
+        // Same rule as registration: show what is on disk now, not what the
+        // in-memory pool happened to hold before this request.
+        await reloadFromDisk(null);
     } catch (error) {
         console.error('更新 Warp 配置失败：', error)
         notify('error', '重新获取 Warp 账号', ['重新获取 Warp 账号失败。']);
     } finally {
         stopWaiting(icons);
+    }
+}
+
+// Repaints the status readouts from ONE request that re-reads the data
+// directory on the server. There is no timer here on purpose: polling made the
+// page disagree with the files whenever something changed them behind the
+// panel's back (CLI, hand edit, another instance).
+async function reloadFromDisk(btn) {
+    const icons = btn ? startWaiting(btn, '', 'refresh') : null;
+    try {
+        const res = await fetch('./panel/reload', { method: 'POST', credentials: 'include' });
+        const j = await res.json();
+        if (!j.success) throw new Error(j.message || '重新读取失败');
+        const settings = j.body && j.body.proxySettings;
+        if (settings) {
+            // The reload may have changed securePath or the compiled-in inbound
+            // list, which the panel mirrors into globalThis for the transport
+            // switches; re-seed those before repainting.
+            if (Array.isArray(j.body.inbounds)) {
+                globalThis.binaryInbounds = j.body.inbounds.map(i => i && i.id).filter(Boolean);
+            }
+            if (j.body.runtime) globalThis.runtimeFacts = j.body.runtime;
+            if (typeof j.body.isPassSet === 'boolean') globalThis.isPassSet = j.body.isPassSet;
+            renderPanel(settings, j.body.subscriptions, j.body.clients);
+        }
+        await refreshWarpAndTunnel();
+        notify('success', '已从磁盘重新读取', ['账号、隧道与设置均以数据目录里的文件为准。']);
+    } catch (error) {
+        console.error('reload', error);
+        notify('error', '重新读取失败', [String(error.message || error)]);
+    } finally {
+        if (icons) stopWaiting(icons);
     }
 }
 
@@ -2922,8 +2992,11 @@ async function registerWarpAccount(btn) {
         const res = await fetch('./panel/warp-register', { method: 'POST', credentials: 'include' });
         const j = await res.json();
         if (!j.success) notify('error', '注册 WARP 账号', [j.message || '失败']);
-        else notify('success', '注册 WARP 账号', [(j.body & j.body.note) || '完成']);
-        refreshWarpAndTunnel();
+        else notify('success', '注册 WARP 账号', [(j.body && j.body.note) || '完成']);
+        // Re-read the data directory instead of trusting the reply: the count
+        // shown must be the one in settings.json, which is what the next start
+        // will use.
+        await reloadFromDisk(null);
     } catch (e) {
         console.error('warp-register', e);
         notify('error', '注册 WARP 账号', ['请求失败']);

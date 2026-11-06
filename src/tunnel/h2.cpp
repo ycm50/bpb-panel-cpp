@@ -307,6 +307,7 @@ public:
     std::size_t write_data_some(std::uint32_t streamId, const std::uint8_t* data, std::size_t len,
                                 bool endStream) override;
     bool send_credit_available(std::uint32_t streamId) override;
+    std::size_t send_credit_bytes(std::uint32_t streamId) override;
     bool write_rst_stream(std::uint32_t streamId, std::uint32_t errorCode) override;
     void close() override;
     void abort() override;
@@ -1032,6 +1033,17 @@ bool H2ServerImpl::send_credit_available(std::uint32_t streamId) {
     // available so the first write establishes the window.
     if (it == streamSendWindow_.end()) return true;
     return it->second > 0;
+}
+
+std::size_t H2ServerImpl::send_credit_bytes(std::uint32_t streamId) {
+    if (connSendWindow_ <= 0) return 0;
+    auto it = streamSendWindow_.find(streamId);
+    // Unknown stream: the first write establishes the window, so report the
+    // peer's per-stream initial credit as the budget.
+    std::int64_t sw = (it == streamSendWindow_.end()) ? peerInitialWindow_ : it->second;
+    if (sw <= 0) return 0;
+    const std::int64_t credit = sw < connSendWindow_ ? sw : connSendWindow_;
+    return static_cast<std::size_t>(credit);
 }
 
 bool H2ServerImpl::write_rst_stream(std::uint32_t streamId, std::uint32_t errorCode) {
