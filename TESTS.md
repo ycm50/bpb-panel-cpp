@@ -539,6 +539,28 @@ fail=0 xfail=1 skip=0`；剩下那个 `XFAIL` 是 `04b` 半关闭的响应体，
 - **连接级窗口被卡在 65 KB**：只靠每个 DATA 帧还 1 次信用时，连接窗口永远只有一个帧，
   吞吐 ≈ 64 KB/RTT，与 CPU 空闲无关。
 
+### 10a-pre. 同机客户端时，隧道吞吐的物理上限是「带宽 / 2」
+
+客户端、bpb、Cloudflare 隧道客户端跑在**同一台机器**上时，一条下载的数据要把网卡走三遍：
+
+    bpb 从源站取数据        -> 网卡 rx  100 MB
+    bpb 送进 CF 隧道        -> 网卡 tx  100 MB   （发到 CF 边缘）
+    CF 边缘回送到本机客户端  -> 网卡 rx  100 MB
+
+100 MB 的下载，网卡实测 rx +202.68 MB、tx +101.89 MB，**放大 3.05 倍**。
+而直连 bpb（不经隧道）时是 rx +100.73 MB、tx +0.37 MB，放大 1.01 倍。
+
+    # 量法
+    IF=$(ip route get 1.1.1.1 | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)
+    rx() { cat /sys/class/net/$IF/statistics/rx_bytes; }
+    r0=$(rx); curl -s -o /dev/null --socks5-hostname 127.0.0.1:10801 "$SRC"; r1=$(rx)
+    echo "rx +$(( (r1-r0)/1048576 )) MB"
+
+**结论：下载方向上有 2 份流量要走 rx，所以隧道的吞吐上限 ≈ 单向带宽 / 2。**
+实测裸链路 51.6 MB/s → 隧道 24.6~26.2 MB/s，正好是一半。
+这不是 bpb 的缺陷，是「客户端和服务端同机」这个测法的固有开销；真实部署里
+客户端在别处，不占服务端的下行带宽。
+
 ### 10a. 全链路吞吐 / CPU 基线（同机客户端）
 
 被测机：1 核 / 469 MB。客户端用 xray 跑在同一台机上（所以客户端也吃这颗核），
@@ -653,6 +675,99 @@ fail=0 xfail=1 skip=0`；剩下那个 `XFAIL` 是 `04b` 半关闭的响应体，
 5. 隧道场景要单独确认：常驻隧道时，经隧道进来的面板请求**必须**要求登录
    （回源连接同样来自 127.0.0.1，这一条正是老实现漏掉的口子）。
 
+### 11f. 状态以磁盘为准，且不自动刷新
+
+    D=./.bpbtest11f; rm -rf $D
+    ./build/bpb --host 127.0.0.1 --port 18430 --data $D &
+    sleep 1
+
+    # 1) 直接改文件，模拟命令行/手改；进程内存不动
+    python3 - "$D/settings.json" <<'PY'
+    import json, sys
+    p = sys.argv[1]
+    d = json.load(open(p))
+    d["warpAccounts"] = [{"privateKey":"a","publicKey":"b","warpIPv6":"2606:4700:110::1/128","reserved":"AAAA"},
+                         {"privateKey":"c","publicKey":"d","warpIPv6":"2606:4700:110::2/128","reserved":"BBBB"}]
+    json.dump(d, open(p, "w"), indent=2)
+    PY
+
+    curl -s -H 'X-BPB-CLI: 1' http://127.0.0.1:18430/securepath/panel/warp-status
+    # 期望 accounts=2（按磁盘数），memoryOnly=0（内存还是启动时那份）
+
+    # 2) 点面板上那个图标 = POST panel/reload
+    curl -s -H 'X-BPB-CLI: 1' -X POST http://127.0.0.1:18430/securepath/panel/reload -o /dev/null
+    curl -s -H 'X-BPB-CLI: 1' http://127.0.0.1:18430/securepath/panel/warp-status
+    # 期望 accounts=2 memoryOnly=2：内存追平磁盘
+
+    # 3) 从文件里删掉的键，保存后不得复活
+    python3 -c "import json;p='$D/settings.json';d=json.load(open(p));d['proxySettings'].pop('blockAds',None);json.dump(d,open(p,'w'),indent=2)"
+    curl -s -H 'X-BPB-CLI: 1' -X POST http://127.0.0.1:18430/securepath/panel/reload -o /dev/null
+    curl -s -H 'X-BPB-CLI: 1' -X PUT -H 'Content-Type: application/json' \
+      --data-binary '{"warpReservedBytes":"true"}' http://127.0.0.1:18430/securepath/panel/update-settings -o /dev/null
+    python3 -c "import json;d=json.load(open('$D/settings.json'));print('blockAds present:', 'blockAds' in d['proxySettings'])"
+    # 期望 False
+
+判定项：
+
+1. `warp-status` 的 `accounts` 必须**按文件计数**，不能取内存 vector；`memoryOnly` 用来暴露两者差异。
+2. `POST panel/reload` 之后内存必须与磁盘一致。真正要证明的是**内存不会把旧值写回文件**：
+
+       # 文件改成 true，进程内存里还是 false，不 reload 直接保存
+       blockAds = False      <- 内存旧值把磁盘的 true 覆盖掉了
+       # reload 之后再保存
+       blockAds = True       <- 以磁盘为准
+
+   `reload_from_disk()` 先把 `kv_`/`warps_`/`cfg_` 整个重置再 load，就是为了这个：
+   `load()` 只覆盖文件里存在的键，不重置的话被删的键会留在内存里、下一次 save 又写回去。
+   注意 `kv_` 只接受 `default_kv()` 里已有的键，所以**自定义键**（不在 schema 里的）
+   重载后不会保留——这是既有行为，不是本轮引入的。
+3. 重载**不能**ports/TLS 这些进程事实：`listenPort`、`cfTunnelOrigin`、`tlsPort` 必须还是真实值，
+   不能被 `set_listen_facts()` 的 argv 默认值顶掉。
+4. **页面里不得有任何定时器**：`grep -c setInterval assets/panel/index.html` 必须是 0。
+   状态刷新只发生在：打开页面、保存设置、注册/续期账号、以及点那个图标。
+5. 那个图标（`settings_backup_restore`）的语义是「从磁盘重新读取」，不再是「重置面板设置」。
+6. `POST panel/reload` 必须受凭据保护：无凭据 401、带 `X-BPB-CLI` 或 jwtToken 才 200、GET 一律 405。
+### 11g. `bpb --res`：重启，按“谁拉起的”分流
+
+    # 服务实例（VPS 上 bpb.service）
+    PID=$(systemctl show bpb -p MainPID --value)
+    sudo bpb --res "$PID"
+    # 期望：managed by systemd unit bpb.service -> systemctl restart bpb.service
+    #       MainPID 变、NRestarts 保持 0（是 restart，不是崩溃重启）
+
+    # 手工实例：必须按原样参数重放
+    cd /tmp && setsid bpb --host 127.0.0.1 --port 18500 --data /tmp/rx --log warn &
+    OLD=$(pgrep -f 'bpb --host 127.0.0.1 --port 18500' | head -1)
+    bpb --res "$OLD"
+    # 期望：not managed by a service -> terminate and re-exec the same command
+    NEW=$(pgrep -f 'bpb --host 127.0.0.1 --port 18500' | head -1)
+    tr '\0' ' ' < /proc/$NEW/cmdline    # 与旧进程逐字节一致
+    readlink /proc/$NEW/cwd             # 仍是 /tmp
+
+    # 不带 pid：最低 pid
+    bpb --res
+
+判定项：
+
+1. **必须读 `/proc/<pid>/cgroup` 判断归属，并且先 trim 掉行尾换行**。
+   `/proc/PID/cgroup` 的内容是 `0::/system.slice/bpb.service\n`；不 trim 时最后一个组件是
+   `"bpb.service\n"`，不以 `.service` 结尾，于是每个服务实例都被判成手工进程，
+   绕过 systemd 直接 exec，`Restart=`/cgroup/环境变量全部丢失。
+2. 手工实例必须**按原样 argv 重放**：`tr '\0' ' ' < /proc/$NEW/cmdline` 与旧进程一致，
+   cwd 也一致。不许补默认值、不许重排参数。
+3. 新进程三个标准流都接 `/dev/null`。否则 `bpb --res | tee` 永远等不到 EOF（守护进程握着管道写端）。
+4. 报成功前必须确认新进程还活着；替换进程立刻退出（二进制被删）时要报错并返回 1。
+5. 终止顺序与 systemd 一致：`SIGTERM` → 最多等 10 s → `SIGKILL`。
+6. 错误路径：pid 不存在 → 1；pid 不是数字 → **2（参数错误，不许退回最低 pid）**；
+   目标不是 bpb → 1。
+7. Windows 构建直接拒绝（没有 `/proc` 读不到 argv，无法原样重放）。
+
+VPS 实测（11 条判据全过）：
+
+    PASS service active / MainPID changed / panel responds
+    PASS argv identical / port 18500 up / cwd preserved
+    PASS lowest-pid restart / 三条错误路径退出码
+    TOTAL pass=11 fail=0
 ### 11d. WireGuard 开关不能在没有账号时打开
 
     curl -s -X PUT -H 'Content-Type: application/json' -H "Cookie: jwtToken=<token>" \
@@ -830,6 +945,188 @@ CI 会为 amd64 / arm64 / armv7 / 386 / riscv64 各产出一个静态二进制�
    提交混合列表时没编进去的项被静默剔除。
 7. **订阅裁剪**：`sub::get_protocols()` 与协议表求交集；把一个没编进去的协议写进
    settings.json，生成出来的订阅里不应出现它。
+
+## 13. WARP 出栈吞吐：pump 速率是硬上限（回归重点）
+
+`bpb` 内置的 WARP 出栈把 lwIP 跑在用户态，所有收包都靠一个 pump 循环：
+
+```cpp
+// src/net/wg_stack.cpp
+void WgStack::pump() {
+    std::lock_guard<std::recursive_mutex> lk(s.mtx);
+    for (int i = 0; i < 32; ++i) {              // 每次最多 32 个 datagram
+        if (recvfrom(...) <= 0) break;
+        s.device.handle_datagram(buf, n);
+    }
+    s.device.tick();
+    sys_check_timeouts();
+}
+// 驱动线程的循环体（start_driver）
+std::this_thread::sleep_for(std::chrono::milliseconds(10));   // 每次 pump 后睡 10ms
+```
+
+于是在 **没有流量** 时循环是 100 次/秒（休眠主导），一旦有数据，UDP 就绪队列让
+`recvfrom` 持续返回，循环退化成 **每 10 ms 最多搬 32 个包 = 3200 pkt/s** 的硬上限。
+
+### 13a. 实测数据（VPS：1 核 / 469 MB，CF quick tunnel，测速源 speed.cloudflare.com）
+
+用 cachefly 100MB（speed.cloudflare.com 后来返回 429，数据作废）：
+
+| 场景 | 下载 | 上传 | bpb CPU / 100MB |
+|---|---:|---:|---:|
+| 裸链路（VPS 直接出网） | **51.6 / 51.6** MB/s | 25.7 MB/s | — |
+| bpb 直连，WARP **关** | **53.1 / 52.6** MB/s | 24.6 MB/s | 0.61 核·秒 |
+| 全链路（CF 隧道），WARP **关** | **24.6 / 26.2** MB/s | 9.7 MB/s | 1.49 核·秒 |
+| bpb 直连，WARP **开** | **1.66 ~ 1.69** MB/s | 11.9 MB/s | — |
+| 全链路（CF 隧道），WARP **开** | **1.60 ~ 1.64** MB/s | 17.7 MB/s | — |
+
+**结论一：隧道让下载掉约 50%，但这 50% 是同机测法的物理上限**，不是缺陷 ——
+见 10a-pre 的网卡放大 3.05 倍实验。直连 bpb 能跑满 53 MB/s（甚至略高于裸链路），
+说明 bpb 本身的数据面不是瓶颈。
+
+**结论二：WARP 出栈掉 23 倍**（53 → 1.68），把隧道的差异完全掩盖
+（WARP 开时隧道 1.60 vs 直连 1.68，几乎一样）。上传方向不受 WARP 影响。
+
+**隧道并发扩展性**（每流 25MB，WARP 关）：1 → 19.1、2 → 22.9、4 → 25.1 MB/s，
+随流数上升而趋于 25 MB/s 的平台 —— 与「上限 = 带宽/2」吻合，不是全局封顶。
+直连对照：37.2 → 42.0 → 41.7 MB/s，平台在 42 MB/s。
+
+### 13b. 判定“per-connection 窗口”还是“全局包速率”
+
+并行流数 vs 聚合吞吐（WARP 开，直连 bpb，每流 5 MB）：
+
+| 流数 | 单流均值 | 聚合 |
+|---:|---:|---:|
+| 1 | 1.59 MB/s | 1.59 MB/s |
+| 2 | 1.22 MB/s | 2.43 MB/s |
+| 4 | 0.65 MB/s | 2.61 MB/s |
+| 8 | 0.33 MB/s | **2.64 MB/s（饱和）** |
+
+WARP 关时同样测试：19.5 → 21.0 → 21.7 → 22.0 MB/s（线性上升，不饱和）。
+
+**聚合吞吐在 ~2.6 MB/s 封顶，且单流吞吐随流数成反比下降** —— 这是全局包速率的特征，
+不是窗口特征（窗口不足时聚合才线性增长）。
+
+### 13c. 直接验证：数 UDP 收包
+
+```bash
+PID=$(systemctl show bpb -p MainPID --value)
+SNMP=/proc/$PID/net/snmp
+udprx() { sed -n '/^Udp:/{n;p}' "$SNMP" | cut -d' ' -f2; }
+
+a=$(udprx)
+curl -s -o /dev/null --socks5-hostname 127.0.0.1:10802 \
+  'https://speed.cloudflare.com/__down?bytes=20000000' &
+sleep 2; a=$(udprx); sleep 10; b=$(udprx); wait
+echo "10s UDP InDatagrams = $((b-a))  => $(( (b-a)/10 )) pkt/s"
+```
+
+实测：**13864 pkts / 10 s = 1386 pkt/s**，× 1240 B 载荷 = **1.64 MB/s** —— 与测得的
+1.66~1.69 MB/s 吻合到小数点后一位。上限算的是 3200 pkt/s（4.2 MB/s），实际只有 1386，
+因为 pump 还要和 `WgConnection::read()` 的 `cv.wait_for(100ms)` 抢同一把递归锁。
+
+### 13d. 判据
+
+1. WARP 关 + 全链路 单流 ≥ **20 MB/s**；WARP 关 + 直连 ≥ **35 MB/s**。
+2. WARP 开时，聚合吞吐必须随并行流数增长到接近链路带宽；**出现 ~2.6 MB/s 的平台**
+   说明 pump 速率又成了瓶颈。
+3. `pkt/s × 1240 / 1048576` 必须与实际 MB/s 对得上（差太多说明瓶颈换地方了）。
+4. 上传方向不应受 WARP 影响（实测 12~25 MB/s，与下载的 1.7 无关）。
+
+### 13e. 修法方向（未实施，仅记录）
+
+- 去掉 `pump()` 后的固定 10 ms 休眠，改成 `poll()` 在 UDP fd 上等待，有包立刻返回；
+- 把每轮 32 个包的上限提到“排空为止”（加一个总时间预算防饿死）；
+- `pump()` 的锁只保护 `wg::Device` 的状态更新，不要罩住整个 `recvfrom` 循环。
+
+## 14. 并发与长连接（全链路回归基线）
+
+被测机：VPS 1 核 / 469 MB，CF quick tunnel，客户端 xray 跑在同一台机上（所以客户端也吃这颗核）。
+下载源 `speed.cloudflare.com`。
+
+### 14a. 并发连接数（隧道 + WARP 关）
+
+| 并发 | 每连接 | 成功 | 墙钟 |
+|---:|---:|---:|---:|
+| 1 | 500 KB | 1/1 | 0.58 s |
+| 10 | 500 KB | 10/10 | 4.2 s |
+| 20 | 500 KB | 20/20 | 9.1 s |
+| 30 | 500 KB | 30/30 | 13.8 s |
+| 50 | 500 KB | 50/50 | ~20 s |
+| 100 | 500 KB | **30/100** | — |
+
+失败形态一律是 `curl: (52) Empty reply from server`（HTTP 000），不是超时。
+WARP 开时更差：50 并发 46~50/50，100 并发 1~24/100。
+
+判定：**50 并发必须全绿**；100 并发掉到 30% 说明还有连接层瓶颈（未定位）。
+
+### 14b. 长连接持续时间（隧道 + WARP 关）
+
+| 项 | 结果 |
+|---|---|
+| 单流 50 MB | **25.56 MB/s，1.87 s 跑完，不断** |
+| 单流 60 MB | **26.17 MB/s，2.19 s，不断** |
+| 连续 30 次 1 MB | **30/30** |
+| 限速 20 MB @ 200 KB/s（≈93 s 单连接） | **93.5 s 不断线** |
+| 空闲 30 s 后复用 | 正常，1.47 MB/s |
+
+WARP 开时：单流 50 MB 撑 28.8 s 不断，30 次 1 MB 也是 30/30。
+**长连接不是薄弱项**，两个方向都能撑住分钟级。
+
+### 14c. 堆损坏回归（旧版必崩，新版必须不崩）
+
+v1.0.3（`ae33748`）在高并发下会堆损坏崩溃，栈落在 OpenSSL 的证书签名路径上：
+
+```
+malloc(): unaligned tcache chunk detected
+[bpb] fatal signal 6 -- backtrace:
+  bpb::(anonymous namespace)::handler(int)   <- crash.cpp 信号处理
+  abort / malloc_printerr
+  CRYPTO_zalloc -> rsa_dupctx -> EVP_PKEY_CTX_dup
+  EVP_DigestSignFinal -> tls_construct_cert_verify -> state_machine
+  bpb::http::Server::run()
+```
+
+即 **TLS 握手的 RSA 签名过程中堆已损坏**，不是 WARP 的问题。
+
+当前构建（`4cf5c08`）压测 5 轮 × 50 并发 + 60 MB 大文件：
+
+```
+round 1..5: ok=50/50 pid 不变 threads=3 rss=12~14 MB restarted=no
+60 MB: 26.17 MB/s 2.19 s
+本次启动以来内存错误: 0    NRestarts=0
+```
+
+ASan 构建（`-fsanitize=address`，WSL）跑 200 次顺序请求 + 30 并发订阅生成：
+`ok=200/200`、`ok=30/30`，**`/tmp/asanreport*` 无任何报告**，线程数保持 2，无泄漏增长。
+
+判定：崩溃类问题只在旧二进制复现；新构建 + ASan 都干净。但**根因未定位**，
+回归时必须继续压：并发 50 起、至少 5 轮。
+
+### 14d. 功能回归（22 项，当前构建）
+
+| 项 | 期望 | 实测 |
+|---|---:|---:|
+| `panel/` 无凭据 | 302 | 302 |
+| `panel/` 带 `X-BPB-CLI` | 200 | 200 |
+| `panel/settings` 无凭据 | 401 | 401 |
+| `panel/settings` 带头 | 200 | 200 |
+| `panel/reload` POST 带头 | 200 | 200 |
+| `panel/reload` GET | 405 | 405 |
+| `panel/reload` 无凭据 | 401 | 401 |
+| `sub/raw|normal|fragment` × xray | 200 | 200 |
+| `sub/normal` sing-box / clash | 200 | 200 |
+| `sub/warp` clash / wireguard | 200 | 200 |
+| `sub/warp-pro` amnezia | 200 | 200 |
+| `sub/share-settings` | 200 | 200 |
+| `qrcode` 同源 | 200 | 200 |
+| `qrcode` 跨源 | 404（设计如此） | 404 |
+| `dns-query` | 200 | 200 |
+| `--cur` | 0 | 0 |
+| `--res <pid>` | 0 | 0 |
+| `--res` 不存在的 pid | 1 | 1 |
+| `--res` 非数字 | 2 | 2 |
+| 账号数按磁盘计 | accounts == memoryOnly | 2 == 2 |
 
 ## 11. 传输开关与订阅一致性（回归重点）
 

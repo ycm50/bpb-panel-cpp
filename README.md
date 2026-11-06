@@ -24,6 +24,8 @@ Cloudflare Tunnel 客户端。**服务端没有任何 JavaScript/TypeScript**，
 - [从源码构建](#从源码构建)
 - [命令行](#命令行)
 - [命令行与浏览器的权限怎么分开](#命令行与浏览器的权限怎么分开)
+- [重启：bpb --res pid](#重启bpb---res-pid)
+- [状态以磁盘为准，且只在按钮上刷新](#状态以磁盘为准且只在按钮上刷新)
 - [入栈协议与按协议构建](#入栈协议与按协议构建)
 - [日志开关](#日志开关)
 - [接口](#接口)
@@ -204,8 +206,53 @@ Cloudflare Tunnel 客户端。**服务端没有任何 JavaScript/TypeScript**，
 | `--fetch <url>` | 出网诊断 |
 | `--cur` | 打印**当前正在运行**的 bpb 实例的隧道域名（Linux 自动发现全部实例：pid/端口/域名/连接状态/数据目录；Windows 构建无隧道，用 `--cur --data <dir> [--port <n>]` 读指定实例） |
 | `--passwd [user] <password> [--check]` | 设置 / 查看面板凭据：写 `<data>/passwd`（加盐 SHA-256）。不带参数只看状态并可跟 `--check` 向运行中的面板验证一次 |
+| `--res [pid]` | 重启一个正在运行的 bpb（见下） |
 | `--log <level>` | 日志级别，默认 `error`（见下） |
 
+### 重启：`bpb --res [pid]`
+
+改完配置、换完二进制之后要重启，但“怎么重启”取决于这个进程是谁拉起来的：
+`systemctl restart` 对服务实例有效，对手工跑的实例无效；`kill` 之后手工实例不会自己回来。
+`--res` 把这件事收进二进制，由它自己判断：
+
+| 场景 | 行为 |
+|---|---|
+| 目标由 systemd 管理 | `systemctl restart <unit>` —— 单元文件里的 `Restart=`、环境变量、cgroup 限额全部保留 |
+| 目标是手工启动的 | 终止它，然后按**原样的 argv 和原工作目录**重新拉起 |
+| 不带 pid | 重启本机 **pid 最小的那个 bpb** |
+
+    bpb --res            # 重启 pid 最小的 bpb（多实例时会先提示找到了几个）
+    bpb --res 3249       # 重启指定 pid
+
+实测输出：
+
+    $ bpb --res 3421
+      pid 3421: /usr/local/bin/bpb --host 0.0.0.0 --port 8080 --data /root/.bpbdata
+      cwd    : /root/.bpbdata
+      managed by systemd unit bpb.service -> systemctl restart bpb.service
+
+    $ bpb --res 3490
+      pid 3490: /root/bpb.res --host 127.0.0.1 --port 18500 --data /tmp/res-d --log warn
+      cwd    : /tmp
+      not managed by a service -> terminate and re-exec the same command
+      started pid 3500 with the same arguments
+
+几个刻意的取舍：
+
+- **认服务靠 cgroup，不靠 `systemctl status <pid>`**：读 `/proc/<pid>/cgroup`，取最后一个
+  `.service` 组件。这不是可选项——`/proc/PID/cgroup` 结尾带换行符，不先 trim 掉，最后一个
+  组件就是 `"bpb.service\n"`，判定永远不成立，于是每个服务实例都被当成手工进程。
+  （第一次实现就踩了这个，实测后者会绕过 systemd 直接 exec，把 `Restart=` 和 cgroup 全丢掉。）
+- **原样重放 argv，不做任何规范化**：操作者的参数是这个实例唯一的描述，`--port 45566 --host 0.0.0.0`
+  必须字节级重放，不能“智能”补默认值。
+- **子进程三个标准流都接到 `/dev/null`**：只接 stdin 的话，重启后的守护进程仍握着调用方的
+  stdout，`bpb --res | tee` 就永远等不到 EOF，看起来像卡死。
+- **启动后确认新进程还活着**再报成功：execvp 失败（二进制被删/移动）时立刻退出，
+  这时说“started pid N”比报错更糟，操作者会停止排查。
+- **pid 不是数字就报错，不退回“最低 pid”**：否则打错一个 pid 会重启另一个无关实例。
+- **Windows 上直接拒绝**：没有 `/proc` 读不到别人的 argv，无法按原样重放，
+  这与 `--cur` 在 Windows 上需要 `--data` 是同一个原因。
+- 终止策略与 systemd 一致：先 `SIGTERM` 等最多 10 秒，不走再 `SIGKILL`。
 ### 面板图标不依赖外网
 
 面板原先从 `fonts.googleapis.com` 拉 `Material Symbols Rounded`。在 Google 不可达的网络里字体会拿不到，
@@ -305,6 +352,43 @@ curl -H 'X-BPB-CLI: 1' http://127.0.0.1:8080/securepath/panel/settings   # 直�
 
 改密码（`bpb --passwd` 或面板里的「重置」）会轮换 JWT 签名密钥，所有已签发的会话立即作废。
 
+### 状态以磁盘为准，且只在按钮上刷新
+
+面板的状态读数（账号数、WARP 是否就绪、隧道域名）原先全部来自进程启动时抓的那份内存快照。
+于是出现两种不一致：
+
+- **注册完成后看到的还是旧账号数**：`/panel/warp-register` 把账号写进文件，但它回给浏览器的
+  数量取自内存里的 vector，下一次启动才会真正用上这一批；
+- **命令行或手改 settings.json 之后面板毫无反应**，直到重启进程。
+
+现在改成「磁盘是唯一真相」：
+
+| 接口 | 行为 |
+|---|---|
+| `GET panel/warp-status` | `accounts` 直接数 `settings.json` 里的 `warpAccounts`；另给 `memoryOnly` 暴露内存值，两者不一致时一目了然 |
+| `POST panel/warp-register` / `update-warp` | 写盘后立刻 `reload_from_disk()`，回给浏览器的是文件里真实的内容 |
+| `POST panel/reload` | 重读 config.json + settings.json，返回与 `panel/settings` 同构的响应 |
+
+`Store::reload_from_disk()` 把内存整个重置后再 load：`load()` 只覆盖文件里存在的键，
+于是「文件里是 true、内存里还是 false」的值原来会在下一次保存时被内存覆盖回 false——现在以磁盘为准。
+进程事实（监听地址/端口、TLS 端口、证书路径）不在文件里，重载时显式保留，否则会被
+`set_listen_facts()` 的 argv 值顶掉。
+
+注意 `kv_` 只接受 `default_kv()` 里已有的键，所以**不在 schema 里的自定义键**重载后不会保留；
+这是既有行为，不是这次改的。
+
+**不自动刷新。** 页面上没有任何 `setInterval`：设置区那个图标（`settings_backup_restore`）
+原本是「重置面板设置」，现在改成「从磁盘重新读取状态」。点它 = `POST panel/reload` +
+重画设置/订阅/客户端列表 + `refreshWarpAndTunnel()`，并弹一句「已从磁盘重新读取」。
+
+实测：
+
+    # 只改文件，内存没动
+    accounts=2  memoryOnly=0      <- warp-status 已按磁盘计数
+    # 点按钮（POST panel/reload）之后
+    accounts=2  memoryOnly=2      <- 内存追平磁盘
+    # 文件里删掉的键不会在 save 时复活
+    blockAds 是否被写回: False
 ## 入栈协议与按协议构建
 
 各入栈协议是**独立源文件**，用 CMake 选项选择编哪些，没选中的**不参与编译**

@@ -154,6 +154,37 @@ static bool write_file_atomic(const std::string& path, const std::string& data, 
     return true;
 }
 
+bool Store::reload_from_disk(std::string& error) {
+    // Everything the files own is reset first: load() only overwrites keys that
+    // are present, so a key someone deleted from settings.json would otherwise
+    // survive in memory and be written straight back on the next save.
+    cfg_ = Config{};
+    kv_ = nlohmann::json::object();
+    warps_ = nlohmann::json::array();
+    pwd_.clear();
+    secret_.clear();
+
+    // Process facts, not file facts. load() calls set_listen_facts() with the
+    // argv values, and that would overwrite the real listener port with a
+    // default if it were ever re-run from here.
+    const std::string host = listen_host_;
+    const int port = listen_port_;
+    const bool tls = listen_tls_;
+    const int tls_port = tls_port_;
+    const std::string tls_cert = tls_cert_path_;
+    const std::string cert_pin = cert_pin_;
+
+    if (!load(dir_, error)) return false;
+
+    listen_host_ = host;
+    listen_port_ = port;
+    listen_tls_ = tls;
+    tls_port_ = tls_port;
+    tls_cert_path_ = tls_cert;
+    cert_pin_ = cert_pin;
+    return true;
+}
+
 bool Store::load(const std::string& dir, std::string& error) {
     dir_ = dir;
 
@@ -263,6 +294,14 @@ bool Store::save(std::string& error) {
     cfg["directHost"] = cfg_.directHost;
     cfg["directPort"] = cfg_.directPort;
     return write_file_atomic(dir_ + "/config.json", cfg.dump(2), error);
+}
+
+std::size_t Store::warp_accounts_on_disk() const {
+    std::string text;
+    if (!read_file(dir_ + "/settings.json", text)) return 0;
+    auto j = nlohmann::json::parse(text, nullptr, false);
+    if (j.is_discarded() || !j.contains("warpAccounts") || !j["warpAccounts"].is_array()) return 0;
+    return j["warpAccounts"].size();
 }
 
 std::string Store::secret() {

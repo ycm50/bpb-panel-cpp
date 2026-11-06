@@ -41,12 +41,31 @@
 #define LWIP_TCP_PCB_NUM_EXT_ARGS       0
 
 #define TCP_MSS                         1240
-#define TCP_SND_BUF                     (16 * TCP_MSS)
-#define TCP_WND                         (16 * TCP_MSS)
+
+/* Window sizes are the throughput ceiling of anything carried over WARP.
+ *
+ * A TCP connection can only have TCP_WND bytes in flight, so its throughput is
+ * TCP_WND / RTT. With the old 16*MSS (= 19840 B) and a ~2 ms round trip through
+ * WARP that is 9.5 MB/s - which is exactly what a single download measured
+ * (8.89~9.71 MB/s), and why adding more streams did not help: each new stream
+ * got its own window but the per-stream rate fell by the same factor.
+ *
+ * 52*MSS keeps the window under 65535 so no window scaling is needed (lwIP
+ * rejects TCP_WND > 0xFFFF without LWIP_WND_SCALE). Raising it further would
+ * require LWIP_WND_SCALE=1 and a negotiated shift, which costs an option on
+ * every handshake and buys little on a 1-core box.
+ *
+ * TCP_SND_BUF is the same knob for the upload direction. Uploads measured
+ * 21~22 MB/s with 16*MSS, so the send side was already ahead; it is raised to
+ * match so the two directions behave alike. */
+#define TCP_SND_BUF                     (52 * TCP_MSS)
+#define TCP_WND                         (52 * TCP_MSS)
 #define TCP_SND_QUEUELEN                (4 * TCP_SND_BUF / TCP_MSS)
 #define MEMP_NUM_TCP_PCB                32
 #define MEMP_NUM_TCP_PCB_LISTEN         4
-#define MEMP_NUM_TCP_SEG                128
+/* lwIP's sanity checks against MEMP_NUM_TCP_SEG / PBUF_POOL_SIZE are compiled
+ * out because MEMP_MEM_MALLOC=1 (segments and pbufs come from the heap). */
+#define MEMP_NUM_TCP_SEG                256
 #define PBUF_POOL_SIZE                  32
 #define PBUF_POOL_BUFSIZE               1600
 

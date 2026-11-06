@@ -34,6 +34,12 @@ public:
     // Drains the UDP socket into the WireGuard device and runs lwIP timers.
     void pump();
 
+    // Nudges the background driver out of poll() so it pumps immediately.
+    // Called after queueing outbound data, otherwise the segment sits in the
+    // lwIP send buffer for up to kPollSliceMs. Safe to call from any thread,
+    // and a no-op when no driver is running.
+    void wake_driver();
+
     // The handshake response only ever arrives on the UDP socket, so the stack
     // must be driven even when no connect() is in flight. Without this,
     // has_session() never becomes true and every connection silently falls back

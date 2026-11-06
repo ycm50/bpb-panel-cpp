@@ -1,6 +1,7 @@
 #include "app/app.h"
 #include "app/cur.h"
 #include "app/passwd.h"
+#include "app/restart.h"
 #include "http/http.h"
 #include "inbound/inbound.h"
 #include "inbound/proto/grpc.h"
@@ -62,6 +63,8 @@ int main(int argc, char** argv) {
     std::string export_warp;
     int cli_log_level = -1;  // -1: not given, fall back to BPB_LOG
     bool cur_requested = false;
+    bool res_requested = false;
+    std::string res_pid;
     bool passwd_requested = false;
     bool passwd_check = false;
     std::vector<std::string> passwd_args;
@@ -87,6 +90,28 @@ int main(int argc, char** argv) {
             data_given = true;
         }
         else if (a == "--cur") cur_requested = true;
+        else if (a == "--res") {
+            // --res <pid> restarts that instance; --res alone restarts the bpb
+            // with the lowest pid.
+            //
+            // A non-numeric argument is a mistake, not "no pid given": silently
+            // falling back to the lowest pid would restart an unrelated instance
+            // because the operator typed the pid wrong. Only another --flag
+            // means "no pid".
+            res_requested = true;
+            if (i + 1 < argc && std::strncmp(argv[i + 1], "--", 2) != 0) {
+                const char* v = argv[i + 1];
+                bool numeric = *v != '\0';
+                for (const char* p = v; *p; ++p) {
+                    if (*p < '0' || *p > '9') { numeric = false; break; }
+                }
+                if (!numeric) {
+                    std::fprintf(stderr, "error: --res needs a numeric pid, got '%s'\n", v);
+                    return 2;
+                }
+                res_pid = argv[++i];
+            }
+        }
         else if (a == "--passwd") {
             // Positional arguments that follow belong to the credential:
             //   --passwd <password>            set (user = config.accEmail)
@@ -134,6 +159,9 @@ int main(int argc, char** argv) {
                         "  --fetch <url>    HTTPS diagnostic\n"
                         "  --cur            print the tunnel domain of the bpb instances that are\n"
                         "                   running now (all of them on Linux; with --data on Windows)\n"
+                        "  --res [pid]      restart a running bpb; without a pid, the one with the\n"
+                        "                   lowest pid. A service-managed process restarts its unit,\n"
+                        "                   a hand-started one is re-exec'd with its original arguments\n"
                         "  --log <level>    off|error|warn|info|debug|trace (default error: silent unless\n"
                         "                   something breaks; also settable with BPB_LOG)\n");
             return 0;
@@ -146,6 +174,9 @@ int main(int argc, char** argv) {
     if (cur_requested)
         return bpb::app::print_current_tunnels(data_given ? data_dir : std::string(),
                                                port_given ? port : 0);
+    // --res restarts a live instance; like --cur it must run before the store is
+    // loaded or the port is bound, because the target may be this very binary.
+    if (res_requested) return bpb::app::restart_bpb(res_pid);
     if (passwd_requested)
         return bpb::app::passwd::run_cli(data_dir, port, passwd_args, passwd_check);
 

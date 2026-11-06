@@ -872,6 +872,18 @@ http::Response App::handle(const http::Request& req) {
         return reset_settings();
     }
     if (path == sp + "/panel/reset-password") return reset_password(req);
+    // Re-read the files on disk and hand back the same shape /panel/settings
+    // returns. The status readouts used to be built from the in-memory snapshot
+    // taken at startup, so an account pool or a settings.json changed by hand
+    // (or by the CLI) disagreed with the file until the process restarted.
+    if (path == sp + "/panel/reload") {
+        if (needs_auth && !authenticated(req)) return json_err(401, "未授权或会话已过期。");
+        if (req.method != "POST") return json_err(405, "请求方法不允许。");
+        std::string reload_error;
+        if (!store_.reload_from_disk(reload_error))
+            return json_err(500, "重新读取数据目录失败：" + reload_error);
+        return panel_settings();
+    }
     if (path == sp + "/panel/logout") return logout();
     if (path == sp + "/panel/usage") return not_supported("用量统计（仅 Cloudflare 版）");
     if (path == sp + "/panel/my-ip") return my_ip(req);
@@ -884,6 +896,12 @@ http::Response App::handle(const http::Request& req) {
             return json_err(500, "Failed to update WARP configs: " + error);
         store_.warps() = accounts;
         if (!store_.save(error)) return json_err(500, error);
+        // Re-read the file so the reply describes the disk, not the vector this
+        // request happens to hold.
+        std::string reload_error;
+        if (!store_.reload_from_disk(reload_error))
+            bpb::log::error("[warp] saved the accounts but could not re-read them: %s",
+                            reload_error.c_str());
         return json_ok(accounts);
     }
     // ---- WARP outbound ------------------------------------------------------
@@ -900,7 +918,12 @@ http::Response App::handle(const http::Request& req) {
         out["ready"] = net::wg_outbound_ready();
         out["status"] = net::wg_outbound_status();
         out["dryRun"] = store_.kv().value("warpRegisterDryRun", true);
-        out["accounts"] = store_.warps().size();
+        // Counted from settings.json, not from the in-memory pool: this endpoint
+        // answers "how many accounts does the box have", and the file is the only
+        // thing that survives a restart or a CLI edit. memoryOnly is reported too
+        // so a mismatch is visible instead of silently papered over.
+        out["accounts"] = store_.warp_accounts_on_disk();
+        out["memoryOnly"] = store_.warps().size();
         return json_ok(out);
     }
     if (path == sp + "/panel/warp-register") {
@@ -917,10 +940,22 @@ http::Response App::handle(const http::Request& req) {
         if (!dry_run) {
             store_.warps() = accounts;
             if (!store_.save(error)) return json_err(500, "保存设置失败：" + error);
+            // Read back what actually landed on disk instead of echoing the
+            // in-memory vector: the panel (and the operator) then sees the file
+            // the process is really going to use on its next start.
+            std::string reload_error;
+            if (store_.reload_from_disk(reload_error)) {
+                bpb::log::info("[warp] reloaded %zu account(s) from disk",
+                               store_.warps().size());
+            } else {
+                bpb::log::error("[warp] saved the accounts but could not re-read them: %s",
+                                reload_error.c_str());
+            }
         }
         nlohmann::json out;
         out["dryRun"] = dry_run;
-        out["accounts"] = accounts;
+        out["accounts"] = dry_run ? accounts : store_.warps();
+        out["count"] = store_.warp_accounts_on_disk();
         out["saved"] = !dry_run;
         out["note"] = dry_run ? "dry run：未访问 Cloudflare，未写入账号池"
                               : "已真实注册并写入账号池";
