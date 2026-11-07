@@ -3,6 +3,12 @@
 #include "util/util.h"
 
 #include <algorithm>
+#ifdef _WIN32
+#include <ws2tcpip.h>
+#else
+#include <netdb.h>
+#include <sys/socket.h>
+#endif
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -70,8 +76,11 @@ Server::~Server() {
     if (listener_ != net::kInvalid) net::close(listener_);
 }
 
-bool Server::enable_tls(const std::string& cert_path, const std::string& key_path, std::string& error) {
-    if (!net::tls_init_server(cert_path, key_path, error)) return false;
+bool Server::enable_tls(const std::string& cert_path, const std::string& key_path,
+                       std::string& error) {
+    // Per-listener context, so a plain-HTTP panel listener and a TLS proxy
+    // listener can live in the same process.
+    if (!tls_ctx_.init(cert_path, key_path, error)) return false;
     tls_on_ = true;
     return true;
 }
@@ -125,16 +134,26 @@ void Server::accept_new() {
         net::set_nodelay(fd);
         auto c = std::make_unique<Conn>();
         c->fd = fd;
+        // Remember who is calling: the panel needs a password from the outside,
+        // but a local tool must be able to read live state without one.
+        {
+            char hostbuf[64] = {0};
+            if (::getnameinfo(reinterpret_cast<sockaddr*>(&addr), len, hostbuf, sizeof(hostbuf),
+                              nullptr, 0, NI_NUMERICHOST) == 0) {
+                c->peer = hostbuf;
+            }
+        }
         now(c->last_active);
-        if (tls_on_) {
+        if (tls_on_ && !tls_detect_) {
             std::string error;
-            c->ssl = net::tls_new_server(fd, error);
+            c->ssl = net::tls_new_server(tls_ctx_, fd, error);
             if (!c->ssl) {
                 net::close(fd);
                 continue;
             }
             c->handshaking = true;
         }
+        // Detect mode: decide later, from the first byte the peer sends.
         conns_.push_back(std::move(c));
     }
 }
@@ -145,6 +164,7 @@ bool Server::read_into(Conn& c) {
         net::IoResult result = net::IoResult::Error;
         int n = net::tls_read(c.ssl, c.fd, buf, static_cast<int>(sizeof(buf)), result);
         if (n > 0) {
+            now(c.last_active);
             c.in.append(buf, static_cast<std::size_t>(n));
             if (c.in.size() > kMaxHeader + kMaxBody) {
                 Response r = Response::text(413, "Payload Too Large");
@@ -155,8 +175,52 @@ bool Server::read_into(Conn& c) {
             continue;
         }
         if (result == net::IoResult::WouldBlock) return true;
+        if (result == net::IoResult::Closed) {
+            // End of the peer's write side. Do NOT drop the connection: a
+            // complete request may already be buffered (a GET with an
+            // immediately half-closed socket, which is exactly what the tunnel
+            // relay produces for bodyless requests). Mark it and let process()
+            // answer, then close after the response is written.
+            c.peer_closed = true;
+            return true;
+        }
         return false;
     }
+}
+
+// Detect mode: look at the first byte without consuming it.
+//
+//   * 0x16 (TLS handshake record) -> upgrade to TLS, then run SSL_accept.
+//   * anything else              -> plain HTTP; the bytes stay in the socket and
+//                                   read_into() picks them up as usual.
+//
+// Called once per connection, after the socket reports readable.
+bool Server::peek_decide(Conn& c, std::string& error) {
+    unsigned char first = 0;
+#ifdef _WIN32
+    int n = ::recv(c.fd, reinterpret_cast<char*>(&first), 1, MSG_PEEK);
+    const bool would_block = (n <= 0) && net::would_block(net::last_error());
+#else
+    int n = static_cast<int>(::recv(c.fd, &first, 1, MSG_PEEK));
+    const bool would_block = (n < 0) && net::would_block(net::last_error());
+#endif
+    // Nothing readable yet is not an error: report it and let the poll loop come
+    // back. (Treating it as "connection died" is what killed plain-XHTTP
+    // downlinks whose first bytes had not arrived yet.)
+    if (would_block) return true;
+    if (n <= 0) {
+        error = "closed before protocol byte";
+        return false;
+    }
+    c.protocol_decided = true;
+    // 0x16 0x03 0x0x: TLS handshake record with SSLv3+ major version. A plain
+    // HTTP request always starts with a method token (A-Z), never with 0x16.
+    c.want_tls = (first == 0x16);
+    if (!c.want_tls) return true;
+    c.ssl = net::tls_new_server(tls_ctx_, c.fd, error);
+    if (!c.ssl) return false;
+    c.handshaking = true;
+    return true;
 }
 
 bool Server::handshake_step(Conn& c) {
@@ -169,6 +233,25 @@ bool Server::handshake_step(Conn& c) {
     int err = SSL_get_error(c.ssl, rc);
     if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) return true;
     return false;
+}
+
+// A client handed a TLS config that reaches a plaintext listener opens with a
+// TLS ClientHello (0x16 0x03 ...), never with an HTTP method. Waiting for a
+// "\r\n\r\n" that can never arrive parks that connection for the whole 60 s
+// idle timeout, and the user sees "it connects and then nothing happens".
+// Judging the first line as soon as it can be judged turns that into an
+// immediate 400 instead.
+static bool impossible_http_prefix(const std::string& in) {
+    if (in.empty()) return false;
+    static const std::string kPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    const std::size_t n = in.size() < kPreface.size() ? in.size() : kPreface.size();
+    if (in.compare(0, n, kPreface.substr(0, n)) == 0) return false;   // maybe an h2 preface
+    for (std::size_t i = 0; i < in.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(in[i]);
+        if (c == '\r' || c == '\n' || c == ' ') return false;       // method token ended: fine
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))) return true;
+    }
+    return false;   // only letters so far: still undecided
 }
 
 static bool parse_request(std::string& in, Request& req) {
@@ -213,15 +296,73 @@ static bool parse_request(std::string& in, Request& req) {
 }
 
 void Server::process(Conn& c) {
+    // HTTP/2 clients never send a request head: they open with
+    // "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n". Hand the connection to the h2
+    // owner (the gRPC transport) as soon as the preface is complete, and wait for
+    // the rest of it when only a prefix has arrived.
+    if (pre_takeover_) {
+        static const std::string kPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        const std::size_t n = c.in.size() < kPreface.size() ? c.in.size() : kPreface.size();
+        if (n && c.in.compare(0, n, kPreface.substr(0, n)) == 0) {
+            if (c.in.size() < kPreface.size()) return;
+            const net::socket_t tfd = c.fd;
+            SSL* tssl = c.ssl;
+            c.fd = net::kInvalid;
+            c.ssl = nullptr;
+            if (pre_takeover_(tfd, tssl, c.in)) {
+                c.detached = true;
+                c.in.clear();
+                return;
+            }
+            c.fd = tfd;
+            c.ssl = tssl;
+        }
+    }
     while (true) {
         Request req;
-        if (!parse_request(c.in, req)) return;
+        if (!parse_request(c.in, req)) {
+            // Never going to be a request: answer 400 and hang up instead of
+            // holding the socket until the idle timeout.
+            if (impossible_http_prefix(c.in)) {
+                static const char kBad[] =
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                c.out.append(kBad, sizeof(kBad) - 1);
+                c.close_after_write = true;
+                flush(c);
+            }
+            return;
+        }
+        req.peer = c.peer;
         bool keep_alive = true;
         auto conn_hdr = to_lower(req.header("connection"));
         if (req.version == "HTTP/1.0" || conn_hdr.find("close") != std::string::npos) keep_alive = false;
 
-        // WebSocket upgrade
+        // WebSocket upgrade. A plain client sends Upgrade: websocket; the
+        // Cloudflare edge instead marks the stream with
+        // cf-cloudflared-proxy-connection-upgrade: websocket and does NOT
+        // forward the standard header (cloudflared re-adds it internally).
+        // Accept both, otherwise a tunnel-fronted request is routed as ordinary
+        // HTTP and 404s.
         auto upgrade = to_lower(req.header("upgrade"));
+        if (upgrade.empty() &&
+            to_lower(req.header("cf-cloudflared-proxy-connection-upgrade")) == "websocket") {
+            upgrade = "websocket";
+        }
+        // Transports that own the connection after the request head (XHTTP's
+        // downlink GET keeps streaming, gRPC keeps an HTTP/2 connection alive)
+        // get their chance before the panel sees the request.
+        if (takeover_) {
+            const net::socket_t tfd = c.fd;
+            SSL* tssl = c.ssl;
+            c.fd = net::kInvalid;
+            c.ssl = nullptr;
+            if (takeover_(tfd, tssl, req)) {
+                c.detached = true;
+                return;
+            }
+            c.fd = tfd;
+            c.ssl = tssl;
+        }
         if (upgrade == "websocket" && ws_handler_) {
             std::string key = req.header("sec-websocket-key");
             std::string accept_src = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -269,23 +410,42 @@ void Server::process(Conn& c) {
         out += res.body;
 
         c.out += out;
-        if (!keep_alive || res.close) c.close_after_write = true;
+        // A half-closed peer cannot send another request, so this response is
+        // the last one on the connection.
+        if (!keep_alive || res.close || c.peer_closed) c.close_after_write = true;
         flush(c);
-        if (c.detached || c.close_after_write) return;
-        if (c.out.empty() && c.in.empty()) return;
+        if (c.detached) return;
+        // Closing connection: there is nothing left to parse, but any tail still
+        // in c.out must be flushed by run()'s write arm before the socket is
+        // dropped. Returning here is safe *because* run() keeps such a
+        // connection registered for POLLOUT until c->out is empty.
+        if (c.close_after_write) return;
+        // Nothing more can arrive from a half-closed peer.
+        if (c.peer_closed) return;
         if (c.in.empty()) return;
     }
 }
 
 void Server::flush(Conn& c) {
+    // Cap one write at 16 KiB. Passing the whole 1 MiB body to SSL_write makes
+    // OpenSSL encode dozens of records before returning, and on a non-blocking
+    // socket a single WANT_WRITE then loses all that work. Chunking keeps each
+    // step atomic and lets the poll loop interleave with other connections.
+    constexpr std::size_t kWriteChunk = 16 * 1024;
     while (!c.out.empty()) {
         net::IoResult result = net::IoResult::Error;
-        int n = net::tls_write(c.ssl, c.fd, c.out.data(), static_cast<int>(c.out.size()), result);
+        const int want = static_cast<int>(std::min(c.out.size(), kWriteChunk));
+        int n = net::tls_write(c.ssl, c.fd, c.out.data(), want, result);
         if (n > 0) {
             c.out.erase(0, static_cast<std::size_t>(n));
             continue;
         }
         if (result == net::IoResult::WouldBlock) return;
+        // Hard error: the peer cannot receive. Drop the tail instead of keeping
+        // it, otherwise the connection stays registered for POLLOUT and every
+        // poll() round retries a write that will never succeed (100% of a core
+        // for a peer that is already gone).
+        c.out.clear();
         c.close_after_write = true;
         return;
     }
@@ -312,13 +472,27 @@ void Server::run() {
         for (std::size_t i = 0; i < conns_.size(); ++i) {
             auto& c = conns_[i];
             if (!c || c->detached || c->fd == net::kInvalid) continue;
+            // A half-closed peer can never send again. Keeping it in the poll
+            // set made poll() return POLLIN every iteration (nothing is read any
+            // more), which burned ~50% of a core and left the socket in
+            // CLOSE-WAIT forever. Its only remaining work is flushing the
+            // response, handled by the write arm below.
+            if (c->peer_closed && c->out.empty()) continue;
             short ev = net::kRead;
             if (!c->out.empty()) ev |= net::kWrite;
             if (c->ssl && net::tls_wants_write(c->ssl)) ev |= net::kWrite;
             pfds.push_back({c->fd, ev, 0});
             map.push_back(i);
         }
-        int rc = net::poll_fds(pfds.data(), pfds.size(), 1000);
+        // Short poll when any connection still has a request already buffered
+        // (a keep-alive client that pipelined) or a response tail to push, so
+        // the next round happens immediately instead of after the idle tick.
+        int pollWait = 1000;
+        for (auto& cc : conns_) {
+            if (!cc || cc->detached) continue;
+            if (!cc->in.empty() || !cc->out.empty()) { pollWait = 1; break; }
+        }
+        int rc = net::poll_fds(pfds.data(), pfds.size(), pollWait);
         if (rc < 0) {
             int err = net::last_error();
             if (err != 0 && !net::would_block(err)) continue;
@@ -339,6 +513,28 @@ void Server::run() {
                 dead.push_back(idx);
                 continue;
             }
+            if (pfds[k].revents & (net::kHangup | net::kInvalidFd)) {
+                // Peer gone: answer whatever request is already buffered (a
+                // half-closed GET must still get its response), then drop the fd.
+                // Keeping it registered is the classic spin: poll() keeps
+                // reporting POLLHUP, no read or write arm matches, and the loop
+                // runs flat out.
+                c->peer_closed = true;
+                if (!c->close_after_write) {
+                    read_into(*c);
+                    process(*c);
+                }
+                if (c->out.empty()) dead.push_back(idx);
+                continue;
+            }
+            // Detect mode: the protocol is unknown until the first byte lands.
+            // Protocol detection happens lazily inside read_into(): peeking here
+            // raced with XHTTP's split POST/GET ordering and could strand a
+            // connection whose first byte had not arrived yet.
+            if (tls_detect_ && !c->protocol_decided) {
+                std::string derr;
+                if (!peek_decide(*c, derr)) { dead.push_back(idx); continue; }
+            }
             if (c->handshaking) {
                 if (!handshake_step(*c)) {
                     dead.push_back(idx);
@@ -348,10 +544,12 @@ void Server::run() {
             }
             if (pfds[k].revents & net::kWrite) flush(*c);
             if (pfds[k].revents & (net::kRead | net::kWrite)) {
-                if (!c->close_after_write) {
+                if (!c->close_after_write && !c->peer_closed) {
                     if (!read_into(*c)) { dead.push_back(idx); continue; }
                 }
                 process(*c);
+                // Close only after the tail is actually on the wire; otherwise
+                // the client waits for a response we still hold in c.out.
                 if (c->close_after_write && c->out.empty()) dead.push_back(idx);
             }
         }
@@ -361,6 +559,11 @@ void Server::run() {
         for (std::size_t i = 0; i < conns_.size(); ++i) {
             auto& c = conns_[i];
             if (!c || c->detached || c->fd == net::kInvalid) continue;
+            // Peer closed and the response is out: nothing left to do.
+            if (c->peer_closed && c->out.empty()) {
+                dead.push_back(i);
+                continue;
+            }
             if (c->out.empty() && !c->in.empty() && t - c->last_active > kIdleTimeoutMs) dead.push_back(i);
         }
         std::sort(dead.begin(), dead.end());

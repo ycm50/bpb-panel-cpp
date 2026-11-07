@@ -47,6 +47,19 @@ constexpr short kWrite = POLLOUT;
 constexpr short kError = POLLERR;
 #endif
 
+// The peer is gone (or the fd is bogus). These are NOT covered by kError: a
+// socket the peer closed reports POLLHUP, and a socket that was closed under us
+// reports POLLNVAL. Leaving such an fd in the poll set makes poll() return
+// immediately for ever, which is how a bare connect()+close() from a port
+// scanner used to pin a whole core.
+#ifdef _WIN32
+constexpr short kHangup = POLLHUP;
+constexpr short kInvalidFd = POLLNVAL;
+#else
+constexpr short kHangup = POLLHUP;
+constexpr short kInvalidFd = POLLNVAL;
+#endif
+
 bool init();
 void shutdown();
 bool set_nonblocking(socket_t fd);

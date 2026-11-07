@@ -1,8 +1,11 @@
 #include "sub/warp.h"
 #include "net/http_client.h"
+#include "util/log.h"
 #include "util/util.h"
 
 #include <openssl/evp.h>
+
+#include <cstdio>
 
 namespace bpb::sub {
 
@@ -42,12 +45,31 @@ bool generate_keys(WarpKeys& keys, std::string& error) {
     return true;
 }
 
-bool register_account(const WarpKeys& keys, nlohmann::json& out, std::string& error) {
+bool register_account(const WarpKeys& keys, nlohmann::json& out, std::string& error,
+                       bool dry_run) {
     nlohmann::json body = {
         {"install_id", ""},        {"fcm_token", ""},
         {"tos", iso_time_now()},   {"type", "Android"},
         {"model", "PC"},           {"locale", "en_US"},
         {"warp_enabled", true},    {"key", keys.public_key}};
+
+    if (dry_run) {
+        // No network. Log exactly what would be sent, then hand back a synthetic
+        // response shaped like the real one so the caller's parsing path (and the
+        // panel round trip) is exercised for real.
+        if (bpb::log::enabled(bpb::log::kDebug))
+            bpb::log::write(bpb::log::kDebug,
+                            "[warp][dry-run] POST https://api.cloudflareclient.com/v0a4005/reg\n"
+                            "[warp][dry-run] body = %s",
+                            body.dump().c_str());
+        out = nlohmann::json{
+            {"config",
+             {{"client_id", "dryRun"},
+              {"interface", {{"addresses", {{"v6", "2606:4700:110:0000:0000:0000:0000:0001"}}}}},
+              {"peers", nlohmann::json::array(
+                            {{{"public_key", "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="}}})}}}};
+        return true;
+    }
 
     net::httpc::Response res;
     if (!net::httpc::post("https://api.cloudflareclient.com/v0a4005/reg", body.dump(), res, error,
@@ -70,13 +92,14 @@ bool register_account(const WarpKeys& keys, nlohmann::json& out, std::string& er
 
 } // namespace
 
-bool fetch_warp_accounts(nlohmann::json& accounts, std::string& error) {
+bool fetch_warp_accounts(nlohmann::json& accounts, std::string& error, bool dry_run) {
     nlohmann::json result = nlohmann::json::array();
-    for (int i = 0; i < 2; ++i) {
+    const int want = dry_run ? 1 : 2;  // one synthetic account is enough for a dry run
+    for (int i = 0; i < want; ++i) {
         WarpKeys keys;
         if (!generate_keys(keys, error)) return false;
         nlohmann::json reg;
-        if (!register_account(keys, reg, error)) return false;
+        if (!register_account(keys, reg, error, dry_run)) return false;
         try {
             std::string v6 = reg["config"]["interface"]["addresses"]["v6"].get<std::string>();
             std::string client_id = reg["config"]["client_id"].get<std::string>();
