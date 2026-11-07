@@ -1,7 +1,7 @@
 services:
   bpb:
     build: .
-    image: bpb-native:1.0.0
+    image: bpb-native:1.0.2
     container_name: bpb
     restart: unless-stopped
     volumes:

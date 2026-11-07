@@ -168,11 +168,17 @@ json build_tls(const json& s, const std::string& security, bool is_fragment, boo
     tls["enabled"] = true;
     tls["server_name"] = sni;
     tls["record_fragment"] = is_fragment;
-    tls["insecure"] = allow_insecure;
+    // Self-signed listener: sing-box has no pin field for this transport, so a
+    // certificate the operator generated is trusted by skipping verification.
+    tls["insecure"] = allow_insecure || !pinned_cert(s).empty();
     if (!alpn.empty()) {
         std::vector<std::string> alpns;
         for (auto& a : split(alpn, ',')) {
-            if (a != "h2") alpns.push_back(a);
+            // "h2" is dropped for websocket (sing-box then negotiates whatever
+            // the CDN offers), but gRPC *is* HTTP/2 — asking for anything else
+            // makes the client speak h1.1 and the server refuse the stream.
+            if (a == "h2" && alpn != "h2") continue;
+            alpns.push_back(a);
         }
         tls["alpn"] = alpns;
     }
@@ -260,27 +266,51 @@ json build_outbound_base(const std::string& tag, const std::string& type, const 
 
 json build_ws_outbound(const json& s, const std::string& protocol, const std::string& remark,
                        const std::string& address, int port, const std::string& domain,
-                       bool is_fragment) {
+                       bool is_fragment, const std::string& transport_kind = "ws") {
     std::string upstream_server;
     if (s.contains("upstreamParams") && s["upstreamParams"].is_object()) {
         upstream_server = s["upstreamParams"].value("upstreamServer", std::string());
     }
     auto sni_host = select_sni_host(s, address, domain);
-    json transport = build_transport("ws", "none", generate_ws_path(protocol), sni_host.host, "", 2560);
-    bool is_tls = is_https(s, port) || (!upstream_server.empty() && address == upstream_server);
+    const bool is_grpc = (transport_kind == "grpc");
+    json transport =
+        is_grpc
+            ? build_transport("grpc", "", "", "", "vlg", 0)
+            : build_transport("ws", "none",
+                              generate_ws_path(protocol, s.value("vlUUID", std::string())),
+                              sni_host.host, "",
+                              // Early data is VLESS/VMess only; Trojan and
+                              // Shadowsocks inbounds ignore Sec-WebSocket-Protocol.
+                              (protocol == "vless" || protocol == "vmess") ? 2560 : 0);
+    bool is_tls = port_uses_tls(s, domain, port) ||
+                  (!upstream_server.empty() && address == upstream_server);
     json tls = is_tls ? build_tls(s, "tls", is_fragment, sni_host.allow_insecure, sni_host.sni,
                                   flag(s, "enableECH") && !is_fragment, str(s, "echServerName"),
-                                  "http/1.1", str(s, "fingerprint", "chrome"))
+                                  is_grpc ? "h2" : "http/1.1", str(s, "fingerprint", "chrome"))
                       : json();
 
+    // sing-box spells the credential per protocol: vless/vmess carry a uuid,
+    // trojan and ss carry a password. A uuid on a trojan outbound is rejected at
+    // import ("password is required"), which is what made a trojan-only build
+    // produce an unusable subscription even after the protocol filter was fixed.
     json fields = json::object();
-    if (protocol == "vless") {
-        fields["uuid"] = str(s, "vlUUID");
+    const std::string cred = str(s, "vlUUID");
+    if (protocol == "trojan") {
+        fields["password"] = cred;
+    } else if (protocol == "shadowsocks") {
+        // The inbound fixes the cipher (aes-256-gcm); see shadowsocks_ws.cpp.
+        fields["method"] = "aes-256-gcm";
+        fields["password"] = cred;
+    } else {
+        fields["uuid"] = cred;
         fields["packet_encoding"] = "";
         fields["network"] = "tcp";
-    } else {
-        fields["password"] = str(s, "trPass");
-        fields["network"] = "tcp";
+        if (protocol == "vmess") {
+            // sing-box: alter_id 0, security auto (AES-128-GCM); the ws transport
+            // already carries max_early_data / early_data_header_name.
+            fields["security"] = "auto";
+            fields["alter_id"] = 0;
+        }
     }
     return build_outbound_base(remark, protocol, address, port, flag(s, "enableTFO"), fields, tls,
                                transport, false);
@@ -583,10 +613,18 @@ json build_config(const json& s, const json& outbounds, const json& endpoints,
 
     json outs = json::array();
     for (auto& o : outbounds) outs.push_back(o);
-    outs.push_back({{"type", "selector"},
-                    {"tag", std::string(CHECK) + " Selector"},
-                    {"outbounds", selector_tags},
-                    {"interrupt_exist_connections", false}});
+    // A selector with an empty "outbounds" list is a hard error in sing-box
+    // ("initialize outbound[0]: missing tags"), not a cosmetic one. It is
+    // reachable: a Shadowsocks-only deployment now emits no proxies at all (see
+    // the skip note above), and any future protocol whose outbound sing-box
+    // cannot express would do the same. Emit the tail only when there is at
+    // least one proxy to point at.
+    if (!selector_tags.empty()) {
+        outs.push_back({{"type", "selector"},
+                        {"tag", std::string(CHECK) + " Selector"},
+                        {"outbounds", selector_tags},
+                        {"interrupt_exist_connections", false}});
+    }
     outs.push_back({{"type", "direct"}, {"tag", "direct"}, {"domain_resolver", "dns-direct"}});
     config["outbounds"] = outs;
 
@@ -680,14 +718,11 @@ bool build_sb_custom(const json& s, bool is_fragment, std::string& out_json, std
     std::string custom_domain = str(s, "customDomain");
     std::vector<std::string> domains{main_domain};
     if (!custom_domain.empty()) domains.push_back(custom_domain);
+    // Direct mode: one address, one port (see sub/common.h access model).
+    if (access_mode_direct(s)) domains.assign(1, direct_host(s));
 
     auto protocols = get_protocols(s);
-    std::vector<int> ports;
-    if (s.contains("ports") && s["ports"].is_array()) {
-        for (auto& p : s["ports"]) {
-            if (p.is_number_integer()) ports.push_back(p.get<int>());
-        }
-    }
+    const std::vector<std::string> transports = get_transports(s);
 
     std::string upstream_server;
     int upstream_port = 0;
@@ -707,11 +742,7 @@ bool build_sb_custom(const json& s, bool is_fragment, std::string& out_json, std
     json outbounds = json::array();
 
     for (auto& domain : domains) {
-        std::vector<int> total_ports;
-        bool is_workers_dev = ends_with(domain, "workers.dev");
-        for (int port : ports) {
-            if ((!is_fragment && is_workers_dev) || is_https(s, port)) total_ports.push_back(port);
-        }
+        std::vector<int> total_ports = effective_ports(s, domain);
         auto hosts = get_config_addresses(s, domain, is_fragment, error);
         if (hosts.empty()) return false;
 
@@ -723,7 +754,24 @@ bool build_sb_custom(const json& s, bool is_fragment, std::string& out_json, std
         bool is_custom = (!custom_domain.empty() && domain == custom_domain);
 
         for (auto& protocol : protocols) {
-            if (protocol != "vless" && protocol != "trojan") continue;
+            // Every entry is servable: get_protocols() already intersected the
+            // configured list with the compile-time table. The old "vless or
+            // vmess only" filter dropped Trojan and Shadowsocks, so a build that
+            // carries them produced an empty subscription.
+            //
+            // XHTTP and gRPC are transports on VLESS, handled below via
+            // `transports`, not protocols of their own.
+            if (protocol == "vless-xhttp" || protocol == "vless-grpc") continue;
+            // sing-box's shadowsocks outbound is a bare TCP protocol: it has no
+            // "tls" field and no "transport" field at all (its only extra
+            // transport is a SIP003 plugin). This project's Shadowsocks inbound
+            // is WebSocket-framed, so sing-box simply cannot dial it -- and the
+            // decoder rejects the WHOLE file on the first unknown key:
+            //   FATAL decode config: outbounds[6].tls: json: unknown field "tls"
+            // which made the entire subscription unimportable, not just that
+            // node. Skip it here; xray and Clash.Meta both do support ss over
+            // ws+tls and get their copies from their own generators.
+            if (protocol == "shadowsocks") continue;
             int protocol_index = 1;
             for (int port : total_ports) {
                 for (auto& host : hosts) {
@@ -731,24 +779,43 @@ bool build_sb_custom(const json& s, bool is_fragment, std::string& out_json, std
                     bool host_is_upstream = (!upstream_server.empty() && host == upstream_server);
                     if (port_is_upstream != host_is_upstream) continue;
 
-                    std::string tag = generate_remark(s, protocol_index, port, host, protocol, domain,
-                                                      is_fragment, false);
-                    outbounds.push_back(build_ws_outbound(s, protocol, tag, host, port, domain, is_fragment));
+                    // One outbound per enabled transport; sing-box has no XHTTP,
+                    // so only gRPC is added on top of the websocket entries.
+                    //
+                    // gRPC is a VLESS transport: the server hook gives the stream
+                    // to parse_vless(), so a Trojan/VMess client dialing /vlg
+                    // hangs (measured). Restrict the extra transport to VLESS.
+                    // WebSocket is the only transport a non-VLESS client can
+                    // use here; every build that carries trojan/vmess/ss also
+                    // carries the /vl upgrade, so naming it directly is safe.
+                    const std::vector<std::string> proto_transports =
+                        protocol == "vless" ? transports : std::vector<std::string>{"ws"};
+                    for (const std::string& tr : proto_transports) {
+                        if (tr == "xhttp") continue;
+                        std::string tag = generate_remark(s, protocol_index, port, host, protocol,
+                                                          domain, is_fragment, false) +
+                                          transport_suffix(tr);
+                        outbounds.push_back(
+                            build_ws_outbound(s, protocol, tag, host, port, domain, is_fragment, tr));
 
-                    for (auto& g : tag_group) {
-                        if (g.first == (is_custom ? best_ping_d : best_ping)) g.second.push_back(tag);
-                    }
-
-                    if (is_chain) {
-                        std::string chain_tag = generate_remark(s, protocol_index, port, host, protocol,
-                                                                domain, is_fragment, true);
-                        json chain = chain_outbound;
-                        chain["tag"] = chain_tag;
-                        chain["detour"] = tag;
-                        outbounds.push_back(chain);
                         for (auto& g : tag_group) {
-                            if (g.first == (is_custom ? best_ping_d_chain : best_ping_chain))
-                                g.second.push_back(chain_tag);
+                            if (g.first == (is_custom ? best_ping_d : best_ping))
+                                g.second.push_back(tag);
+                        }
+
+                        if (is_chain) {
+                            std::string chain_tag =
+                                generate_remark(s, protocol_index, port, host, protocol, domain,
+                                                is_fragment, true) +
+                                transport_suffix(tr);
+                            json chain = chain_outbound;
+                            chain["tag"] = chain_tag;
+                            chain["detour"] = tag;
+                            outbounds.push_back(chain);
+                            for (auto& g : tag_group) {
+                                if (g.first == (is_custom ? best_ping_d_chain : best_ping_chain))
+                                    g.second.push_back(chain_tag);
+                            }
                         }
                     }
                     ++protocol_index;

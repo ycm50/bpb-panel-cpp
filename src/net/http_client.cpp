@@ -312,7 +312,7 @@ bool request(const std::string& method,
 
     std::string req = method + " " + u.path + " HTTP/1.1\r\n";
     req += "Host: " + u.host + (u.port == 80 || u.port == 443 ? "" : ":" + std::to_string(u.port)) + "\r\n";
-    req += "User-Agent: bpb-native/1.0.0\r\nAccept-Encoding: identity\r\nConnection: close\r\n";
+    req += "User-Agent: bpb-native/1.0.2\r\nAccept-Encoding: identity\r\nConnection: close\r\n";
     bool has_ct = false;
     bool has_accept = false;
     for (auto& [k, v] : headers) {

@@ -172,7 +172,11 @@ json build_tls(const json& s, const std::string& protocol, const std::string& se
     out["tls"] = true;
     out[protocol == "trojan" ? "sni" : "servername"] = sni;
     if (!fp.empty()) out["client-fingerprint"] = (fp == "randomized") ? "random" : fp;
-    out["skip-cert-verify"] = allow_insecure;
+    // Self-signed listener: Clash Meta has no certificate pinning for VLESS, so
+    // the honest option is to skip verification for a certificate the operator
+    // generated themselves. Xray clients get the stronger pinnedPeerCertSha256
+    // instead (see xray.cpp).
+    out["skip-cert-verify"] = allow_insecure || !pinned_cert(s).empty();
 
     if (security == "tls") {
         if (!alpn.empty()) {
@@ -262,31 +266,61 @@ json build_outbound(const std::string& name, const std::string& type, const std:
 }
 
 json build_ws_outbound(const json& s, const std::string& protocol, const std::string& remark,
-                       const std::string& address, int port, const std::string& domain) {
+                       const std::string& address, int port, const std::string& domain,
+                       const std::string& transport_kind = "ws") {
     std::string upstream_server;
     if (s.contains("upstreamParams") && s["upstreamParams"].is_object()) {
         upstream_server = s["upstreamParams"].value("upstreamServer", std::string());
     }
-    bool is_tls = is_https(s, port) || (!upstream_server.empty() && address == upstream_server);
-    if (protocol == "trojan" && !is_tls) return json();
+    bool is_tls = port_uses_tls(s, domain, port) ||
+                  (!upstream_server.empty() && address == upstream_server);
 
     auto sni_host = select_sni_host(s, address, domain);
+    // gRPC is HTTP/2 only; websocket has to stay on h1.1 because that is the
+    // protocol this server upgrades on.
+    const bool is_grpc = (transport_kind == "grpc");
     json tls = is_tls ? build_tls(s, protocol, "tls", sni_host.allow_insecure, sni_host.sni,
-                                  flag(s, "enableECH"), str(s, "echServerName"), "http/1.1",
+                                  flag(s, "enableECH"), str(s, "echServerName"),
+                                  is_grpc ? "h2" : "http/1.1",
                                   str(s, "fingerprint", "chrome"))
                       : json::object();
-    json transport = build_transport("ws", "", generate_ws_path(protocol), sni_host.host, "", 2560);
+    // Early data (the trailing 2560) is a VLESS/VMess extension carried in
+    // Sec-WebSocket-Protocol; the Trojan and Shadowsocks inbounds do not read it,
+    // so advertising it there produced a client that sends an empty frame the
+    // server never answers (measured: egress 000 with ed, 200 without).
+    const bool supports_early_data = (protocol == "vless" || protocol == "vmess");
+    json transport = is_grpc
+                         ? build_transport("grpc", "", "", "", "vlg", 0)
+                         : build_transport("ws", "",
+                                           generate_ws_path(protocol, s.value("vlUUID", std::string())),
+                                           sni_host.host, "",
+                                           supports_early_data ? 2560 : 0);
 
+    // Clash.Meta spells the same credential differently per protocol: vless and
+    // vmess carry a uuid, trojan and ss carry a password. Sending a uuid to a
+    // trojan proxy is not a link a client can dial -- it fails at import.
     json fields = json::object();
-    if (protocol == "vless") {
-        fields["uuid"] = str(s, "vlUUID");
-        fields["packet-encoding"] = "";
-        fields["encryption"] = "";
+    const std::string cred = str(s, "vlUUID");
+    std::string out_type = protocol;
+    if (protocol == "shadowsocks") out_type = "ss";
+    if (protocol == "trojan") {
+        fields["password"] = cred;
+    } else if (protocol == "shadowsocks") {
+        // The inbound fixes the cipher, so the subscription must name the same one.
+        fields["cipher"] = "aes-256-gcm";
+        fields["password"] = cred;
     } else {
-        fields["password"] = str(s, "trPass");
+        fields["uuid"] = cred;
+        fields["packet-encoding"] = "";
+        if (protocol == "vmess") {
+            fields["cipher"] = "auto";
+            fields["alterId"] = 0;
+        } else {
+            fields["encryption"] = "";
+        }
     }
-    return build_outbound(remark, protocol, address, port, flag(s, "enableIPv6"), flag(s, "enableTFO"),
-                          tls, transport, fields);
+    return build_outbound(remark, out_type, address, port, flag(s, "enableIPv6"),
+                          flag(s, "enableTFO"), tls, transport, fields);
 }
 
 json build_warp_outbound(const json& s, const json& account, const std::string& remark,
@@ -618,14 +652,11 @@ bool build_clash_custom(const json& s, std::string& out_json, std::string& error
     std::string custom_domain = str(s, "customDomain");
     std::vector<std::string> domains{main_domain};
     if (!custom_domain.empty()) domains.push_back(custom_domain);
+    // Direct mode: one address, one port (see sub/common.h access model).
+    if (access_mode_direct(s)) domains.assign(1, direct_host(s));
 
     auto protocols = get_protocols(s);
-    std::vector<int> ports;
-    if (s.contains("ports") && s["ports"].is_array()) {
-        for (auto& p : s["ports"]) {
-            if (p.is_number_integer()) ports.push_back(p.get<int>());
-        }
-    }
+    const std::vector<std::string> transports = get_transports(s);
     std::string upstream_server;
     int upstream_port = 0;
     if (s.contains("upstreamParams") && s["upstreamParams"].is_object()) {
@@ -643,11 +674,7 @@ bool build_clash_custom(const json& s, std::string& out_json, std::string& error
     json outbounds = json::array();
 
     for (auto& domain : domains) {
-        std::vector<int> total_ports;
-        bool is_workers_dev = ends_with(domain, "workers.dev");
-        for (int port : ports) {
-            if (is_workers_dev || is_https(s, port)) total_ports.push_back(port);
-        }
+        std::vector<int> total_ports = effective_ports(s, domain);
         auto hosts = get_config_addresses(s, domain, false, error);
         if (hosts.empty()) return false;
 
@@ -659,7 +686,14 @@ bool build_clash_custom(const json& s, std::string& out_json, std::string& error
         bool is_custom = (!custom_domain.empty() && domain == custom_domain);
 
         for (auto& protocol : protocols) {
-            if (protocol != "vless" && protocol != "trojan") continue;
+            // Every entry is servable: get_protocols() already intersected the
+            // configured list with the compile-time table. The old "vless or
+            // vmess only" filter dropped Trojan and Shadowsocks, so a build that
+            // carries them produced an empty subscription.
+            //
+            // XHTTP and gRPC are transports on VLESS, handled below via
+            // `transports`, not protocols of their own.
+            if (protocol == "vless-xhttp" || protocol == "vless-grpc") continue;
             int protocol_index = 1;
             for (int port : total_ports) {
                 for (auto& host : hosts) {
@@ -667,26 +701,45 @@ bool build_clash_custom(const json& s, std::string& out_json, std::string& error
                     bool host_is_upstream = (!upstream_server.empty() && host == upstream_server);
                     if (port_is_upstream != host_is_upstream) continue;
 
-                    std::string tag =
-                        generate_remark(s, protocol_index, port, host, protocol, domain, false, false);
-                    json outbound = build_ws_outbound(s, protocol, tag, host, port, domain);
-                    if (outbound.is_null()) continue;
+                    // One outbound per enabled transport; Clash.Meta has no XHTTP
+                    // at all, so only gRPC is added here (get_transports already
+                    // drops the ones this binary cannot serve).
+                    //
+                    // gRPC is a VLESS transport: the server hook gives the stream
+                    // to parse_vless(), so a Trojan/VMess/ss client dialing /vlg
+                    // hangs (measured). Restrict the extra transport to VLESS.
+                    // WebSocket is the only transport a non-VLESS client can
+                    // use here; every build that carries trojan/vmess/ss also
+                    // carries the /vl upgrade, so naming it directly is safe.
+                    const std::vector<std::string> proto_transports =
+                        protocol == "vless" ? transports : std::vector<std::string>{"ws"};
+                    for (const std::string& tr : proto_transports) {
+                        if (tr == "xhttp") continue;
+                        std::string tag = generate_remark(s, protocol_index, port, host, protocol,
+                                                          domain, false, false) +
+                                          transport_suffix(tr);
+                        json outbound = build_ws_outbound(s, protocol, tag, host, port, domain, tr);
+                        if (outbound.is_null()) continue;
 
-                    outbounds.push_back(outbound);
-                    for (auto& g : tag_group) {
-                        if (g.first == (is_custom ? best_ping_d : best_ping)) g.second.push_back(tag);
-                    }
-
-                    if (is_chain) {
-                        std::string chain_tag = generate_remark(s, protocol_index, port, host, protocol,
-                                                                domain, false, true);
-                        json chain = chain_outbound;
-                        chain["name"] = chain_tag;
-                        chain["dialer-proxy"] = tag;
-                        outbounds.push_back(chain);
+                        outbounds.push_back(outbound);
                         for (auto& g : tag_group) {
-                            if (g.first == (is_custom ? best_ping_d_chain : best_ping_chain))
-                                g.second.push_back(chain_tag);
+                            if (g.first == (is_custom ? best_ping_d : best_ping))
+                                g.second.push_back(tag);
+                        }
+
+                        if (is_chain) {
+                            std::string chain_tag =
+                                generate_remark(s, protocol_index, port, host, protocol, domain,
+                                                false, true) +
+                                transport_suffix(tr);
+                            json chain = chain_outbound;
+                            chain["name"] = chain_tag;
+                            chain["dialer-proxy"] = tag;
+                            outbounds.push_back(chain);
+                            for (auto& g : tag_group) {
+                                if (g.first == (is_custom ? best_ping_d_chain : best_ping_chain))
+                                    g.second.push_back(chain_tag);
+                            }
                         }
                     }
                     ++protocol_index;

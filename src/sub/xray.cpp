@@ -37,8 +37,21 @@ bool flag(const json& s, const char* key) {
     return s.contains(key) && s[key].is_boolean() && s[key].get<bool>();
 }
 
+// Numbers arrive as numbers from the panel's own JSON, but a settings.json that
+// went through a form submission can carry them as strings ("count": "5").
+// nlohmann::json::value<int>() throws type_error.302 on those, which used to
+// take a whole subscription down with it, so both spellings are accepted here.
 int num(const json& s, const char* key, int fallback = 0) {
-    if (s.contains(key) && s[key].is_number()) return s[key].get<int>();
+    if (!s.contains(key)) return fallback;
+    const json& v = s[key];
+    if (v.is_number_integer()) return v.get<int>();
+    if (v.is_number()) return static_cast<int>(v.get<double>());
+    if (v.is_string()) {
+        const std::string text = v.get<std::string>();
+        if (text.empty()) return fallback;
+        return std::atoi(text.c_str());
+    }
+    if (v.is_boolean()) return v.get<bool>() ? 1 : 0;
     return fallback;
 }
 
@@ -109,6 +122,11 @@ json build_tls_settings(const json& s, const std::string& server_name, const std
     json j = json::object();
     j["serverName"] = server_name;
     j["fingerprint"] = fp;
+    // Self-signed deployment: the client trusts the pinned certificate instead
+    // of a CA. Xray 26.x removed allowInsecure in favour of exactly this, so a
+    // config that still carried allowInsecure would be refused outright.
+    const std::string pin = pinned_cert(s);
+    if (!pin.empty()) j["pinnedPeerCertSha256"] = pin;
     if (!alpn.empty()) {
         std::vector<std::string> parts;
         for (auto& p : split(alpn, ',')) parts.push_back(p);
@@ -201,7 +219,12 @@ json build_udp_noises(const json& s) {
             }
             entry["delay"] = noise.value("delay", std::string());
         }
-        int count = noise.value("count", 1);
+        // Through num(): the panel submits numbers but a settings.json that went
+        // through a form round-trip carries them as strings ("count": "5"), and
+        // value<int>() throws on those -- that took the fragment and warp-pro
+        // xray subscriptions down with a 500.
+        int count = num(noise, "count", 1);
+        if (count < 0) count = 0;
         for (int i = 0; i < count; ++i) list.push_back(entry);
     }
     return list;
@@ -235,42 +258,90 @@ json build_final_mask(const json& s, bool is_fragment, bool is_udp_noise, const 
 json build_ws_outbound(const json& s, const std::string& tag, const std::string& protocol,
                        const std::string& address, int port, const std::string& domain,
                        bool is_fragment, const std::string& frag_length = "",
-                       const std::string& frag_interval = "") {
+                       const std::string& frag_interval = "",
+                       const std::string& transport_kind = "ws") {
     std::string upstream_server;
     if (s.contains("upstreamParams") && s["upstreamParams"].is_object()) {
         upstream_server = s["upstreamParams"].value("upstreamServer", std::string());
     }
-    bool is_tls = is_https(s, port) || (!upstream_server.empty() && address == upstream_server);
+    bool is_tls = port_uses_tls(s, domain, port) ||
+                  (!upstream_server.empty() && address == upstream_server);
     auto sni_host = select_sni_host(s, address, domain);
 
     bool enable_ech = flag(s, "enableECH") && !is_fragment;
+    // Transport selection. WebSocket is the default and the only one the panel
+    // has always emitted; XHTTP and gRPC exist because a client blocked on
+    // websocket upgrades sometimes gets through as plain POST/GET or gRPC.
+    // The paths must match what the inbounds mount (see src/inbound/registry.cpp):
+    // XHTTP on "/vlx/<session>", gRPC on "/vlg/Tun".
+    const std::string kind = transport_kind;
     json stream = json::object();
-    stream["network"] = "ws";
-    json transport = build_transport("ws", "", generate_ws_path(protocol) + "?ed=2560", sni_host.host,
-                                     "", "", "");
-    for (auto& [k, v] : transport.items()) stream[k] = v;
+    if (kind == "xhttp" || kind == "splithttp") {
+        stream["network"] = "xhttp";
+        json transport = build_transport("xhttp", "", "/vlx", sni_host.host, "", "packet-up", "");
+        for (auto& [k, v] : transport.items()) stream[k] = v;
+    } else if (kind == "grpc") {
+        stream["network"] = "grpc";
+        json transport = build_transport("grpc", "", "", "", "vlg", "multi", "");
+        for (auto& [k, v] : transport.items()) stream[k] = v;
+    } else {
+        stream["network"] = "ws";
+        // Early data is a VLESS/VMess extension: the first stream bytes ride in
+        // Sec-WebSocket-Protocol. The Trojan and Shadowsocks inbounds never read
+        // that header, so a "?ed=2560" there makes the client send an empty
+        // frame the server does not answer -- measured on the live box: 000 with
+        // ed, 200 without, same host/password.
+        const bool supports_early_data = (protocol == "vless" || protocol == "vmess");
+        std::string ws_path = generate_ws_path(protocol, s.value("vlUUID", std::string()));
+        if (supports_early_data) ws_path += "?ed=2560";
+        json transport = build_transport("ws", "", ws_path, sni_host.host, "", "", "");
+        for (auto& [k, v] : transport.items()) stream[k] = v;
+    }
     stream["security"] = is_tls ? "tls" : "none";
     if (is_tls) {
+        // gRPC rides on HTTP/2 (ALPN h2). Everything else must ask for h1.1: a
+        // client that negotiates h2 for XHTTP would need our server to speak
+        // HTTP/2 for that transport too.
         stream["tlsSettings"] = build_tls_settings(s, sni_host.sni, str(s, "fingerprint", "chrome"),
-                                                   "http/1.1", enable_ech, str(s, "echServerName"));
+                                                   kind == "grpc" ? "h2" : "http/1.1", enable_ech,
+                                                   str(s, "echServerName"));
     }
     stream["sockopt"] = build_sockopt(true, flag(s, "enableTFO"), "UseIP", "");
     json final_mask = build_final_mask(s, is_fragment, false, frag_length, frag_interval);
     if (!final_mask.is_null()) stream["finalmask"] = final_mask;
 
+    // The credential is the panel UUID for every protocol this server speaks (see
+    // inbound/proto/trojan_ws.cpp and shadowsocks_ws.cpp: one UUID per panel,
+    // used verbatim as the password). Only the shape of the settings object
+    // differs, and the wrong shape is not a link a client can use: VLESS/VMess
+    // take a "vnext" entry with a users array, Trojan and Shadowsocks take a
+    // "servers" entry with a flat password.
     json out = json::object();
     out["protocol"] = protocol;
-    if (protocol == "vless") {
-        out["settings"] = {{"vnext",
-                            json::array({{{"address", address},
-                                          {"port", port},
-                                          {"users", json::array({{{"id", str(s, "vlUUID")},
-                                                                  {"encryption", "none"}}})}}})}};
-    } else {
+    if (protocol == "trojan") {
         out["settings"] = {{"servers",
                             json::array({{{"address", address},
                                           {"port", port},
-                                          {"password", str(s, "trPass")}}})}};
+                                          {"password", str(s, "vlUUID")}}})}};
+    } else if (protocol == "shadowsocks") {
+        // The inbound fixes the cipher (src/inbound/proto/shadowsocks_ws.cpp:
+        // "method is fixed to aes-256-gcm"), so a subscription that advertises
+        // anything else would hand the client a key-derivation mismatch.
+        out["settings"] = {{"servers",
+                            json::array({{{"address", address},
+                                          {"port", port},
+                                          {"method", "aes-256-gcm"},
+                                          {"password", str(s, "vlUUID")}}})}};
+    } else {
+        // VMess authenticates with the same UUID but its own user object: alterId
+        // 0 and security "auto" (AES-128-GCM), which is what this inbound speaks.
+        const json user = (protocol == "vmess")
+                              ? json{{"id", str(s, "vlUUID")}, {"alterId", 0}, {"security", "auto"}}
+                              : json{{"id", str(s, "vlUUID")}, {"encryption", "none"}};
+        out["settings"] = {{"vnext",
+                            json::array({{{"address", address},
+                                          {"port", port},
+                                          {"users", json::array({user})}}})}};
     }
     out["streamSettings"] = stream;
     out["tag"] = tag;
@@ -916,7 +987,18 @@ void add_best_ping_configs(json& configs, const std::string& s_json, const json&
 }
 
 void add_best_fragment_configs(json& configs, const json& s, const json& chain_proxy) {
-    std::string main_domain = str(s, "mainDomain");
+    // The fragment profile is a fixed set of outbounds against ONE entrance, and
+    // that entrance is whatever the subscription would dial anyway: the edge
+    // hostname on 443 in tunnel mode, the advertised address/port in direct
+    // mode. Hard-coding 443 here is what kept the "Smart Fragment" profile
+    // pointing at a TLS edge that direct mode does not have.
+    const std::string main_domain =
+        access_mode_direct(s) ? direct_host(s) : str(s, "mainDomain");
+    int main_port = 443;
+    {
+        auto ports = effective_ports(s, main_domain);
+        if (!ports.empty()) main_port = ports.front();
+    }
     int delay_min = num(s, "fragmentDelayMin", 1);
     int delay_max = num(s, "fragmentDelayMax", 1);
     bool is_chain = !chain_proxy.is_null();
@@ -926,13 +1008,20 @@ void add_best_fragment_configs(json& configs, const json& s, const json& chain_p
                                   "60-70", "70-80", "80-90", "90-100", "10-30", "20-40", "30-50",
                                   "40-60", "50-70", "60-80", "70-90", "80-100", "100-200"};
 
+    // The fragment profile must use a protocol this binary actually serves. It
+    // used to be hard-coded to "vless" regardless of the build, so a
+    // --protocol trojan binary emitted a VLESS outbound -- a node no client can
+    // use against a server that only answers /tr.
+    const auto fragment_protocols = get_protocols(s);
+    const std::string frag_proto =
+        fragment_protocols.empty() ? std::string("vless") : fragment_protocols.front();
     for (int i = 0; i < 20; ++i) {
         std::string tag = "proxy-" + std::to_string(i + 1);
         if (is_chain) {
             outbounds.push_back(modify_outbound(chain_proxy, "chain-" + std::to_string(i + 1), tag));
         }
-        outbounds.push_back(build_ws_outbound(s, tag, "vless", main_domain, 443, main_domain, true,
-                                              frags[i],
+        outbounds.push_back(build_ws_outbound(s, tag, frag_proto, main_domain, main_port, main_domain,
+                                              true, frags[i],
                                               std::to_string(delay_min) + "-" + std::to_string(delay_max)));
     }
 
@@ -967,15 +1056,14 @@ bool build_xray_custom(const json& s, bool is_fragment, std::string& out_json, s
     std::string custom_domain = str(s, "customDomain");
     std::vector<std::string> domains{main_domain};
     if (!custom_domain.empty()) domains.push_back(custom_domain);
+    // Direct mode has exactly one address and one port; the custom domain is
+    // not a second entrance, it is the name of that same entrance.
+    const bool is_direct = access_mode_direct(s);
+    if (is_direct) domains.assign(1, direct_host(s));
 
     auto protocols = get_protocols(s);
-
-    std::vector<int> ports;
-    if (s.contains("ports") && s["ports"].is_array()) {
-        for (auto& p : s["ports"]) {
-            if (p.is_number_integer()) ports.push_back(p.get<int>());
-        }
-    }
+    // Websocket plus whichever extra transports the panel switches turned on.
+    const std::vector<std::string> transports = get_transports(s);
 
     std::string upstream_server;
     int upstream_port = 0;
@@ -992,11 +1080,9 @@ bool build_xray_custom(const json& s, bool is_fragment, std::string& out_json, s
         json proxies = json::array();
         json chains = json::array();
 
-        std::vector<int> total_ports;
-        bool is_workers_dev = ends_with(domain, "workers.dev");
-        for (int port : ports) {
-            if ((!is_fragment && is_workers_dev) || is_https(s, port)) total_ports.push_back(port);
-        }
+        // tunnel: the edge's https ports from settings.ports. direct: the one
+        // port this process bound -- effective_ports() decides, not a whitelist.
+        std::vector<int> total_ports = effective_ports(s, domain);
 
         auto hosts = get_config_addresses(s, domain, is_fragment, error);
         if (hosts.empty()) return false;
@@ -1009,7 +1095,16 @@ bool build_xray_custom(const json& s, bool is_fragment, std::string& out_json, s
         for (auto& h : hosts) total_hosts.push_back(h);
 
         for (auto& protocol : protocols) {
-            if (protocol != "vless" && protocol != "trojan") continue;
+            // get_protocols() already intersected the configured list with the
+            // compile-time table, so every entry here can be served. The old
+            // hard-coded "vless or vmess only" filter silently dropped Trojan
+            // and Shadowsocks: a --protocol trojan binary listed the inbound,
+            // accepted protocols=trojan in the panel, and then produced a
+            // subscription with no node in it at all.
+            //
+            // XHTTP and gRPC are not separate protocols; they are extra
+            // transports on VLESS, so they arrive through `transports` below.
+            if (protocol == "vless-xhttp" || protocol == "vless-grpc") continue;
             int protocol_index = 1;
             for (int port : total_ports) {
                 for (auto& host : hosts) {
@@ -1017,27 +1112,52 @@ bool build_xray_custom(const json& s, bool is_fragment, std::string& out_json, s
                     bool host_is_upstream = (!upstream_server.empty() && host == upstream_server);
                     if (port_is_upstream != host_is_upstream) continue;
 
-                    json outbound = build_ws_outbound(s, "proxy", protocol, host, port, domain, is_fragment);
-                    json proxy = modify_outbound(outbound, "proxy-" + std::to_string(index));
-                    proxies.push_back(proxy);
+                    // One entry per enabled transport. Websocket always comes
+                    // first and keeps the plain remark; the extra ones get a
+                    // suffix so a client's outbound names stay unique.
+                    //
+                    // XHTTP and gRPC are VLESS transports and nothing else: this
+                    // project's hooks hand the stream straight to
+                    // parse_vless() (see src/inbound/proto/vless_grpc.cpp and
+                    // vless_xhttp.cpp), so a Trojan or VMess client that dials
+                    // /vlg has its bytes fed to the VLESS parser and dies.
+                    // Measured: an xray Trojan-outbound gRPC config connects, the
+                    // server accepts the stream, and then the dial hangs with no
+                    // reply -- a node that looks configured and never works.
+                    // WebSocket is the only transport a non-VLESS client can
+                    // use here; every build that carries trojan/vmess/ss also
+                    // carries the /vl upgrade, so naming it directly is safe.
+                    const std::vector<std::string> proto_transports =
+                        protocol == "vless" ? transports : std::vector<std::string>{"ws"};
+                    for (const std::string& tr : proto_transports) {
+                        json outbound = build_ws_outbound(s, "proxy", protocol, host, port, domain,
+                                                          is_fragment, "", "", tr);
+                        json proxy = modify_outbound(outbound, "proxy-" + std::to_string(index));
+                        proxies.push_back(proxy);
 
-                    std::string remark =
-                        generate_remark(s, protocol_index, port, host, protocol, domain, is_fragment, false);
-                    configs.push_back(build_config(s, remark, json::array({outbound}), false, false, false,
-                                                   false, false, {host}));
+                        std::string remark = generate_remark(s, protocol_index, port, host, protocol,
+                                                             domain, is_fragment, false) +
+                                             transport_suffix(tr);
+                        configs.push_back(build_config(s, remark, json::array({outbound}), false,
+                                                       false, false, false, false, {host}));
 
-                    if (!chain_outbound.is_null()) {
-                        std::string chain_remark =
-                            generate_remark(s, protocol_index, port, host, protocol, domain, is_fragment, true);
-                        configs.push_back(build_config(s, chain_remark,
-                                                       json::array({chain_outbound, outbound}), false, true,
-                                                       false, false, false, {host}));
-                        chains.push_back(modify_outbound(chain_outbound, "chain-" + std::to_string(index),
-                                                         "proxy-" + std::to_string(index)));
+                        if (!chain_outbound.is_null()) {
+                            std::string chain_remark =
+                                generate_remark(s, protocol_index, port, host, protocol, domain,
+                                                is_fragment, true) +
+                                transport_suffix(tr);
+                            configs.push_back(build_config(s, chain_remark,
+                                                           json::array({chain_outbound, outbound}),
+                                                           false, true, false, false, false, {host}));
+                            chains.push_back(modify_outbound(chain_outbound,
+                                                             "chain-" + std::to_string(index),
+                                                             "proxy-" + std::to_string(index)));
+                        }
+
+                        ++index;
                     }
 
                     ++protocol_index;
-                    ++index;
                 }
             }
         }
