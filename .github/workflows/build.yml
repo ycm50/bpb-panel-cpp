@@ -148,18 +148,45 @@ jobs:
         if: matrix.arch != 'amd64'
         uses: docker/setup-qemu-action@v3
 
+      # ccache across runs: every cell recompiles the same ~70 translation units,
+      # so most of the matrix is redundant work. The cache lives on the host
+      # (./.ccache) and is bind-mounted into the container, because the object
+      # files themselves are built in /tmp/b and thrown away with the container.
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          # The protocol is in the key so each cell saves its own entries, but
+          # the restore-keys are ordered broadest-last: a same-protocol cache is
+          # the best match, then any protocol of this architecture (measured
+          # 64.8% hits when switching protocols, because most translation units
+          # do not use the per-protocol BPB_HAVE_* macros at all), then nothing.
+          key: ccache-linux-${{ matrix.arch }}-${{ matrix.protocol }}-${{ github.sha }}
+          restore-keys: |
+            ccache-linux-${{ matrix.arch }}-${{ matrix.protocol }}-
+            ccache-linux-${{ matrix.arch }}-
+
       - name: "Build static binary (inbound: ${{ matrix.protocol }})"
         run: |
           set -euo pipefail
-          mkdir -p dist
+          mkdir -p dist .ccache
+          # The container runs as root and writes into the mount; the cache
+          # action at the end of the job runs as the runner user and only needs
+          # to read, so a plain 0755 tree is enough.
+          chmod 755 .ccache
           docker run --rm --platform ${{ matrix.platform }} \
-            -v "$PWD:/src" -w /src alpine:3.22 sh -c '
+            -v "$PWD:/src" -w /src \
+            -e CCACHE_DIR=/src/.ccache \
+            -e CCACHE_COMPILERCHECK=content \
+            -e CCACHE_MAXSIZE=100M \
+            alpine:3.22 sh -c '
               set -e
-              apk add --no-cache g++ musl-dev cmake samurai \
+              apk add --no-cache g++ musl-dev cmake samurai ccache \
                       openssl-dev openssl-libs-static zlib-dev zlib-static >/dev/null
               cmake -S . -B /tmp/b -G Ninja -DCMAKE_BUILD_TYPE=Release -DBPB_STATIC=ON \
                     -DBPB_INBOUNDS=${{ matrix.protocol }}
               cmake --build /tmp/b
+              ccache -s | grep -E "Hits|Misses|Cache size" || true
               strip /tmp/b/bpb
               cp /tmp/b/bpb dist/bpb-linux-${{ matrix.arch }}-${{ matrix.protocol }}
             '
@@ -191,18 +218,36 @@ jobs:
         if: matrix.arch != 'amd64'
         uses: docker/setup-qemu-action@v3
 
+      # Shares no cache with the per-protocol cells on purpose: -DBPB_INBOUNDS=all
+      # produces different command lines (and a bigger link), so a separate key
+      # keeps each entry honest instead of thrashing one pool.
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-linux-${{ matrix.arch }}-all-${{ github.sha }}
+          restore-keys: |
+            ccache-linux-${{ matrix.arch }}-all-
+            ccache-linux-${{ matrix.arch }}-
+
       - name: Build static binary (all inbounds)
         run: |
           set -euo pipefail
-          mkdir -p dist
+          mkdir -p dist .ccache
+          chmod 755 .ccache
           docker run --rm --platform ${{ matrix.platform }} \
-            -v "$PWD:/src" -w /src alpine:3.22 sh -c '
+            -v "$PWD:/src" -w /src \
+            -e CCACHE_DIR=/src/.ccache \
+            -e CCACHE_COMPILERCHECK=content \
+            -e CCACHE_MAXSIZE=100M \
+            alpine:3.22 sh -c '
               set -e
-              apk add --no-cache g++ musl-dev cmake samurai \
+              apk add --no-cache g++ musl-dev cmake samurai ccache \
                       openssl-dev openssl-libs-static zlib-dev zlib-static >/dev/null
               cmake -S . -B /tmp/b -G Ninja -DCMAKE_BUILD_TYPE=Release -DBPB_STATIC=ON \
                     -DBPB_INBOUNDS=all
               cmake --build /tmp/b
+              ccache -s | grep -E "Hits|Misses|Cache size" || true
               strip /tmp/b/bpb
               cp /tmp/b/bpb dist/bpb-linux-${{ matrix.arch }}-all
             '
@@ -238,13 +283,33 @@ jobs:
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-openssl
             mingw-w64-ucrt-x86_64-zlib
+            ccache
+
+      # msys2/setup-msys2 caches downloaded packages itself, but not compiled
+      # objects. Same idea as the Linux jobs; correctness does not depend on the
+      # key, because ccache hashes the whole command line (which is where the
+      # per-protocol BPB_HAVE_* -D lives) -- the key only decides which entries
+      # get restored first.
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: C:\ccache
+          key: ccache-windows-x86_64-${{ matrix.protocol }}-${{ github.sha }}
+          restore-keys: |
+            ccache-windows-x86_64-${{ matrix.protocol }}-
+            ccache-windows-x86_64-
 
       - name: Configure and build
         shell: msys2 {0}
         run: |
+          export CCACHE_DIR=/c/ccache
+          export CCACHE_COMPILERCHECK=content
+          export CCACHE_MAXSIZE=100M
+          mkdir -p "$CCACHE_DIR"
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
                 -DBPB_INBOUNDS=${{ matrix.protocol }}
           cmake --build build
+          ccache -s | grep -E "Hits|Misses|Cache size" || true
 
       - name: Collect artifact
         shell: msys2 {0}

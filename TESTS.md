@@ -1722,3 +1722,46 @@ if (!inbound::has("vless-grpc")) body["proxySettings"]["enableGRPC"] = false;
 判据：POST 两个开关为 `true`，再 GET `/panel/settings`，值与上表一致；同时订阅里不含
 该二进制无法服务的传输。
 
+## 21. 编译缓存（ccache）
+
+`CMakeLists.txt` 里 `BPB_CCACHE`（默认 ON）会在 `find_program(ccache)` 找到工具时把
+`CMAKE_<LANG>_COMPILER_LAUNCHER` 指向它。找不到就打印一行 not found 并照常编译，
+不是错误。
+
+### 21a. 开关本身
+
+| 配置 | 配置期输出 | `build.ninja` 里出现 ccache |
+|---|---|---|
+| 默认（装了 ccache） | `-- ccache: found at /usr/bin/ccache ...` | 是 |
+| `-DBPB_CCACHE=OFF` | 无 ccache 行 | **否** |
+| 没装 ccache | `-- ccache: not found, building without a compiler cache` | 否 |
+
+判据：`grep -c ccache build/build.ninja` 在 OFF 时必须为 0。
+
+### 21b. 真实收益（8 核，`-DBPB_INBOUNDS=vless`，67 个编译单元）
+
+| 场景 | 耗时 | 命中率 |
+|---|---|---|
+| 新目录 + 空缓存 | 17–18 s | 0 % |
+| 新目录 + 缓存里已有同协议 | **1–2 s** | 100 % |
+| 新目录 + 缓存里只有另一个协议 | **5 s** | 64.8 % |
+
+第三行是关键：`BPB_HAVE_*` 经 `add_compile_definitions` 作用于整个目录，命令行因此
+每个协议都不同；但只有 `main.cpp`、`inbound/registry.cpp`、`inbound/proto/grpc.cpp`、
+`util/crash.cpp` 真的用了这些宏，其余照样命中。CI 的回退键设计就是基于这个实测。
+
+### 21c. 正确性
+
+ccache 的键包含完整命令行，而协议差异就写在 `-DBPB_HAVE_<PROTO>` 里，所以**不存在**
+「换了协议却吃到上一个协议的目标文件」这种情况。验证方法：两个协议交替各编三遍，
+产物大小与启动行的 `inbounds:` 始终对应本次 `-DBPB_INBOUNDS`。
+
+### 21d. CI 里必须确认的三件事
+
+1. `alpine:3.22` 的 `main` 里 **每个架构都有 ccache**（已核对 aarch64 / armv7 / x86 /
+   riscv64 全是 `4.11.3-r1`）；MSYS2 的包名是 **`ccache`**（msys 仓库），不是
+   `mingw-w64-ucrt-x86_64-ccache`；
+2. 缓存目录必须先 `mkdir -p .ccache` 再 bind-mount，容器以 root 写入、runner 用户读取，
+   所以给 0755 就够；
+3. 缓存只存 `./.ccache`，**不存 `build/`**：对象文件建在容器内的 `/tmp/b` 并随容器丢弃。
+

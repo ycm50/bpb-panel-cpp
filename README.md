@@ -250,6 +250,32 @@ try/catch，于是 `std::terminate`。旧脚本的 sed 只匹配裸数字，静�
 （不要手写 `g++` 单行命令：它拿不到 lwIP 的 include 路径，而且源文件分层
 `src/inbound/proto/` 之后通配符会漏文件。）
 
+### 编译缓存（ccache）
+
+装了 [ccache](https://ccache.dev/) 就**自动启用**，不用改命令：
+
+    apt install ccache            # Debian/Ubuntu
+    pacman -S mingw-w64-ucrt-x86_64-ccache   # MSYS2（CI 用的是 msys/ccache）
+
+配置期会打印一行 `ccache: found at ...`；没装就打印 `ccache: not found` 并正常编译。
+要临时关掉（例如对比纯编译耗时）用 `-DBPB_CCACHE=OFF`。
+
+命中率实测（本机 8 核，`-DBPB_INBOUNDS=vless`，67 个编译单元）：
+
+| 场景 | 耗时 | 命中 |
+|---|---|---|
+| 新目录、空缓存 | 17–18 s | 0 % |
+| 新目录、缓存已有同协议 | **1–2 s** | 100 % |
+| 新目录、缓存里只有**另一个协议** | **5 s** | 64.8 % |
+
+最后一行是这个项目特别的地方：`BPB_HAVE_*` 是 `add_compile_definitions` 作用在
+整个目录上的，所以每个编译单元的命令行都不同；但真正用到这些宏的只有
+`main.cpp`、`inbound/registry.cpp`、`inbound/proto/grpc.cpp`、`util/crash.cpp`
+四个文件，剩下的照样命中。这也是 CI 里矩阵缓存按架构而不是按协议隔离的原因。
+
+缓存目录用 `CCACHE_DIR` 指定；不指定时是 `~/.cache/ccache`（Windows 是
+`%LOCALAPPDATA%\ccache`）。CI 里挂的是 `./.ccache`。
+
 ### Windows（MSYS2 UCRT64）
 
     cmake -S . -B build-win -G Ninja -DCMAKE_CXX_COMPILER=A:/msys64/ucrt64/bin/g++.exe
@@ -1187,6 +1213,23 @@ WARP 出口（含 `warp=on` 实测）、资源占用、隧道重连、多架构�
 产物在 **Alpine（musl）** 里构建，所以代码不能依赖 glibc 专有头：`<execinfo.h>`
 （`backtrace()`）在 musl 上不存在，`src/util/crash.cpp` 用 `__has_include` 探测缺失时
 自动退化成"只打印信号、不打印栈"，不会因此编不过。
+
+### 构建缓存
+
+每个 job 都有一步 `Restore compiler cache`（`actions/cache@v4` + ccache）：
+
+| job | 缓存键 | 落盘位置 |
+|---|---|---|
+| `linux` | `ccache-linux-<arch>-<协议>-<sha>` | `./.ccache`，bind-mount 进容器的 `/src/.ccache` |
+| `linux-all` | `ccache-linux-<arch>-all-<sha>`，回退键含 `ccache-linux-<arch>-` | 同上 |
+| `windows` | `ccache-windows-x86_64-<协议>-<sha>` | `C:\ccache`，MSYS2 里是 `/c/ccache` |
+
+回退键故意写得比主键宽：同协议的同架构缓存最好，其次是**同架构的任意协议**缓存
+（实测换协议仍能吃到 64.8% 命中），最后才从零开始。这不是猜的——用
+`BPB_HAVE_*` 的只有四个文件，大部分编译单元跨协议完全相同。
+
+对象文件仍然建在容器内的 `/tmp/b` 并随容器丢弃；存进缓存的是 ccache 自己的
+压缩产物，所以 `actions/cache` 存的是 `./.ccache` 而不是 `build/`。
 
 **不产出也不发布容器镜像。**
 

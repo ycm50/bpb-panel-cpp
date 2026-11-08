@@ -13,3 +13,5 @@ tmpscripts/
 dist/
 node_modules/
 *.log
+# ccache's default location when a local build sets CCACHE_DIR=.ccache
+.ccache/

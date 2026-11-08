@@ -28,6 +28,30 @@ endif()
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
 
+# --- compiler cache ---------------------------------------------------------
+# The CI matrix is 5 architectures x N protocols, and every cell recompiles the
+# same ~70 translation units, so most of the wall time is redundant work. ccache
+# keys entries on the full command line, which already includes the per-protocol
+# BPB_HAVE_* -D flags, so a cache hit can never mix two builds up.
+#
+# Default ON when the tool is there: a hit costs a couple of milliseconds of
+# hashing, a cold miss costs nothing. -DBPB_CCACHE=OFF disables it for a
+# one-off timing run.
+option(BPB_CCACHE "Use ccache as the compiler launcher when it is available" ON)
+if(BPB_CCACHE)
+  find_program(BPB_CCACHE_PROGRAM ccache)
+  if(BPB_CCACHE_PROGRAM)
+    message(STATUS "ccache: found at ${BPB_CCACHE_PROGRAM} (set -DBPB_CCACHE=OFF to disable)")
+    # CMAKE_<LANG>_COMPILER_LAUNCHER is honoured by Ninja and Makefile
+    # generators alike, so this works on Linux, Windows/MSYS2 and inside the
+    # CI container without touching a single compile command.
+    set(CMAKE_C_COMPILER_LAUNCHER "${BPB_CCACHE_PROGRAM}")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${BPB_CCACHE_PROGRAM}")
+  else()
+    message(STATUS "ccache: not found, building without a compiler cache")
+  endif()
+endif()
+
 set(CMAKE_CXX_FLAGS_RELEASE "-O2 -ffunction-sections -fdata-sections")
 set(CMAKE_C_FLAGS_RELEASE "-O2 -ffunction-sections -fdata-sections")
 

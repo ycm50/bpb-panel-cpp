@@ -8,3 +8,4 @@ tmpscripts/
 *.exe
 *.o
 *.log
+.ccache/
