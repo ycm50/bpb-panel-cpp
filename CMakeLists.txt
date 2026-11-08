@@ -30,25 +30,36 @@ find_package(ZLIB REQUIRED)
 
 # --- compiler cache ---------------------------------------------------------
 # The CI matrix is 5 architectures x N protocols, and every cell recompiles the
-# same ~70 translation units, so most of the wall time is redundant work. ccache
-# keys entries on the full command line, which already includes the per-protocol
-# BPB_HAVE_* -D flags, so a cache hit can never mix two builds up.
+# same ~70 translation units, so most of the wall time is redundant work. Any
+# compiler cache keys entries on the full command line, which already includes
+# the per-protocol BPB_HAVE_* -D flags, so a hit can never mix two builds up.
 #
-# Default ON when the tool is there: a hit costs a couple of milliseconds of
-# hashing, a cold miss costs nothing. -DBPB_CCACHE=OFF disables it for a
-# one-off timing run.
-option(BPB_CCACHE "Use ccache as the compiler launcher when it is available" ON)
+# Default ON when a tool is there: a hit costs milliseconds of hashing, a cold
+# miss costs nothing. -DBPB_CCACHE=OFF disables it for a one-off timing run.
+option(BPB_CCACHE "Use a compiler cache when one is available" ON)
 if(BPB_CCACHE)
-  find_program(BPB_CCACHE_PROGRAM ccache)
+  # MSYS2 ships both, but its ccache cannot open a Windows-style compiler path:
+  #   ccache: error: Could not find compiler "A:\msys64\ucrt64\bin\c++.exe" in PATH
+  # which is exactly what CMake hands the launcher on Windows (measured with
+  # MSYS2 ccache 4.14.1: the POSIX spelling of the same path works, the
+  # backslash one does not). sccache is a native mingw binary and takes it
+  # as-is, so on Windows it is preferred and ccache is only the fallback.
+  if(WIN32)
+    find_program(BPB_CCACHE_PROGRAM NAMES sccache ccache)
+  else()
+    find_program(BPB_CCACHE_PROGRAM NAMES ccache sccache)
+  endif()
   if(BPB_CCACHE_PROGRAM)
-    message(STATUS "ccache: found at ${BPB_CCACHE_PROGRAM} (set -DBPB_CCACHE=OFF to disable)")
+    get_filename_component(BPB_CACHE_NAME "${BPB_CCACHE_PROGRAM}" NAME)
+    message(STATUS "compiler cache: ${BPB_CACHE_NAME} at ${BPB_CCACHE_PROGRAM}"
+                   " (set -DBPB_CCACHE=OFF to disable)")
     # CMAKE_<LANG>_COMPILER_LAUNCHER is honoured by Ninja and Makefile
     # generators alike, so this works on Linux, Windows/MSYS2 and inside the
     # CI container without touching a single compile command.
     set(CMAKE_C_COMPILER_LAUNCHER "${BPB_CCACHE_PROGRAM}")
     set(CMAKE_CXX_COMPILER_LAUNCHER "${BPB_CCACHE_PROGRAM}")
   else()
-    message(STATUS "ccache: not found, building without a compiler cache")
+    message(STATUS "compiler cache: none found, building without a cache")
   endif()
 endif()
 

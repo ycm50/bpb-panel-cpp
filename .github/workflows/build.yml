@@ -283,33 +283,40 @@ jobs:
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-openssl
             mingw-w64-ucrt-x86_64-zlib
-            ccache
+            mingw-w64-ucrt-x86_64-sccache
 
       # msys2/setup-msys2 caches downloaded packages itself, but not compiled
-      # objects. Same idea as the Linux jobs; correctness does not depend on the
-      # key, because ccache hashes the whole command line (which is where the
-      # per-protocol BPB_HAVE_* -D lives) -- the key only decides which entries
-      # get restored first.
+      # objects. sccache, not ccache: MSYS2's ccache refuses the Windows-style
+      # compiler path CMake passes ("Could not find compiler
+      # A:\msys64\ucrt64\bin\c++.exe in PATH"), which failed all six Windows
+      # jobs in run #38 while every Linux job passed. sccache is a native mingw
+      # binary and takes that path as-is (verified locally with UCRT64).
+      # Correctness does not depend on the key -- the cache hashes the whole
+      # command line, per-protocol BPB_HAVE_* flags included -- it only decides
+      # which entries are restored first.
       - name: Restore compiler cache
         uses: actions/cache@v4
         with:
-          path: C:\ccache
-          key: ccache-windows-x86_64-${{ matrix.protocol }}-${{ github.sha }}
+          path: C:\sccache
+          key: sccache-windows-x86_64-${{ matrix.protocol }}-${{ github.sha }}
           restore-keys: |
-            ccache-windows-x86_64-${{ matrix.protocol }}-
-            ccache-windows-x86_64-
+            sccache-windows-x86_64-${{ matrix.protocol }}-
+            sccache-windows-x86_64-
 
       - name: Configure and build
         shell: msys2 {0}
         run: |
-          export CCACHE_DIR=/c/ccache
-          export CCACHE_COMPILERCHECK=content
-          export CCACHE_MAXSIZE=100M
-          mkdir -p "$CCACHE_DIR"
+          export SCCACHE_DIR='C:/sccache'
+          export SCCACHE_CACHE_SIZE=100M
+          mkdir -p "$SCCACHE_DIR"
+          # sccache is a native Windows binary: SCCACHE_DIR has to be a Windows
+          # path. The MSYS /c/sccache form is not understood and sccache then
+          # silently uses %LOCALAPPDATA% instead, leaving this directory empty
+          # for the cache action to save (measured with sccache 0.19.0).
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
                 -DBPB_INBOUNDS=${{ matrix.protocol }}
           cmake --build build
-          ccache -s | grep -E "Hits|Misses|Cache size" || true
+          sccache --show-stats | grep -E "Cache hits|Cache misses|hits rate" || true
 
       - name: Collect artifact
         shell: msys2 {0}

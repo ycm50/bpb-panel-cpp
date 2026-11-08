@@ -1722,23 +1722,26 @@ if (!inbound::has("vless-grpc")) body["proxySettings"]["enableGRPC"] = false;
 判据：POST 两个开关为 `true`，再 GET `/panel/settings`，值与上表一致；同时订阅里不含
 该二进制无法服务的传输。
 
-## 21. 编译缓存（ccache）
+## 21. 编译缓存（ccache / sccache）
 
-`CMakeLists.txt` 里 `BPB_CCACHE`（默认 ON）会在 `find_program(ccache)` 找到工具时把
-`CMAKE_<LANG>_COMPILER_LAUNCHER` 指向它。找不到就打印一行 not found 并照常编译，
+`CMakeLists.txt` 里的 `BPB_CCACHE`（默认 ON）会探测一块编译器缓存并把它设为
+`CMAKE_<LANG>_COMPILER_LAUNCHER`：Windows 上顺序是 `sccache ccache`，其余平台是
+`ccache sccache`。都找不到就打印一行 `compiler cache: none found` 并照常编译，
 不是错误。
 
 ### 21a. 开关本身
 
-| 配置 | 配置期输出 | `build.ninja` 里出现 ccache |
+| 配置 | 配置期输出 | `build.ninja` 里有 launcher |
 |---|---|---|
-| 默认（装了 ccache） | `-- ccache: found at /usr/bin/ccache ...` | 是 |
-| `-DBPB_CCACHE=OFF` | 无 ccache 行 | **否** |
-| 没装 ccache | `-- ccache: not found, building without a compiler cache` | 否 |
+| 默认（装了工具） | `-- compiler cache: ccache at /usr/bin/ccache ...` | 是 |
+| `-DBPB_CCACHE=OFF` | 无 cache 行 | **否** |
+| 一个都没有 | `-- compiler cache: none found, building without a cache` | 否 |
 
 判据：`grep -c ccache build/build.ninja` 在 OFF 时必须为 0。
 
-### 21b. 真实收益（8 核，`-DBPB_INBOUNDS=vless`，67 个编译单元）
+### 21b. 真实收益
+
+Linux / ccache，8 核，`-DBPB_INBOUNDS=vless`，67 个编译单元：
 
 | 场景 | 耗时 | 命中率 |
 |---|---|---|
@@ -1746,9 +1749,48 @@ if (!inbound::has("vless-grpc")) body["proxySettings"]["enableGRPC"] = false;
 | 新目录 + 缓存里已有同协议 | **1–2 s** | 100 % |
 | 新目录 + 缓存里只有另一个协议 | **5 s** | 64.8 % |
 
-第三行是关键：`BPB_HAVE_*` 经 `add_compile_definitions` 作用于整个目录，命令行因此
-每个协议都不同；但只有 `main.cpp`、`inbound/registry.cpp`、`inbound/proto/grpc.cpp`、
-`util/crash.cpp` 真的用了这些宏，其余照样命中。CI 的回退键设计就是基于这个实测。
+Windows / sccache，MSYS2 UCRT64 16.2.0，同样 71 个目标：
+
+| 场景 | 耗时 | 命中率 |
+|---|---|---|
+| 新目录 + 空缓存 | 18 s | 0 % |
+| 新目录 + 缓存已有同协议 | **0–1 s** | 100 % |
+
+第三行是 Linux 那栏的关键：`BPB_HAVE_*` 经 `add_compile_definitions` 作用于整个目录，
+命令行因此每个协议都不同；但只有 `main.cpp`、`inbound/registry.cpp`、
+`inbound/proto/grpc.cpp`、`util/crash.cpp` 真的用了这些宏，其余照样命中。
+CI 的回退键设计就是基于这个实测。
+
+### 21b-2. Windows 必须用 sccache，不能用 ccache
+
+MSYS2 的 ccache 打不开 Windows 风格的编译器路径，而 CMake 交给 launcher 的正是这种：
+
+```
+ccache A:\msys64\ucrt64\bin\c++.exe   -O3 -DNDEBUG ... -c ...
+ccache: error: Could not find compiler "A:\msys64\ucrt64\bin\c++.exe" in PATH
+```
+
+复现与验证（本机 UCRT64）：
+
+| 写法 | 结果 |
+|---|---|
+| `ccache "A:\msys64\ucrt64\bin\c++.exe" --version` | **失败** |
+| `ccache /ucrt64/bin/c++.exe --version` | 成功 |
+| `ccache c++ --version`（走 PATH） | 成功 |
+| `sccache` + 同一个 Windows 路径 | 成功，且能命中 |
+
+CI run #38 就是这个：**6 个 Windows job 全红，Linux 21 个全绿**。
+
+### 21b-3. `SCCACHE_DIR` 必须是 Windows 路径
+
+写成 MSYS 的 `/c/sccache` 时 sccache **不报错**，而是静默回落到
+`%LOCALAPPDATA%\Mozilla\sccache\cache`，于是 `actions/cache` 存的是一个空目录，
+下一轮永远命不中。用 `sccache --show-stats` 里的 `Cache location` 一行确认：
+
+```
+Cache location   Local disk: "C:/sccache"     # 正确
+Cache location   Local disk: "C:/Users/.../Mozilla/sccache/cache"   # SCCACHE_DIR 被忽略
+```
 
 ### 21c. 正确性
 
@@ -1759,9 +1801,11 @@ ccache 的键包含完整命令行，而协议差异就写在 `-DBPB_HAVE_<PROTO
 ### 21d. CI 里必须确认的三件事
 
 1. `alpine:3.22` 的 `main` 里 **每个架构都有 ccache**（已核对 aarch64 / armv7 / x86 /
-   riscv64 全是 `4.11.3-r1`）；MSYS2 的包名是 **`ccache`**（msys 仓库），不是
-   `mingw-w64-ucrt-x86_64-ccache`；
-2. 缓存目录必须先 `mkdir -p .ccache` 再 bind-mount，容器以 root 写入、runner 用户读取，
-   所以给 0755 就够；
-3. 缓存只存 `./.ccache`，**不存 `build/`**：对象文件建在容器内的 `/tmp/b` 并随容器丢弃。
+   riscv64 全是 `4.11.3-r1`）；MSYS2 侧要装 **`mingw-w64-ucrt-x86_64-sccache`**，
+   而 `/usr/bin/ccache` 那条路在 Windows 上不可用（见 21b-2）；
+2. Linux 的缓存目录必须先 `mkdir -p .ccache` 再 bind-mount，容器以 root 写入、runner
+   用户读取，所以给 0755 就够；Windows 的 `SCCACHE_DIR` 必须是 `C:/sccache`
+   （见 21b-3）；
+3. 缓存只存 `./.ccache`（Windows 是 `C:\sccache`），**不存 `build/`**：对象文件建在
+   容器内的 `/tmp/b` 并随容器丢弃。
 
