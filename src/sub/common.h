@@ -74,6 +74,28 @@ bool port_uses_tls(const nlohmann::json& s, const std::string& domain, int port)
 // Host a client dials when the tunnel is not the entrance.
 std::string direct_host(const nlohmann::json& s);
 
+// The address the subscription in *this response* should advertise.
+//
+// "Published" (mainDomain / directHost) is a stored guess: the process cannot
+// know the name the outside world used to reach it. The request does know -- the
+// browser asked for http://<public-host>:<public-port>/<sp>/sub/... -- so a name
+// that is neither loopback nor RFC1918 is adopted for this response only, and
+// never written back. That keeps the subscription honest for a reverse proxy or
+// an IP that changes, without letting one stray Host header poison the stored
+// value for everybody else (the tunnel-domain incident).
+//
+// Returns an empty string when the request carries nothing usable; the caller
+// then falls back to the published value.
+//
+// The NAME only: a "host:port" header is split, because the two are used in
+// different places (the port belongs in the URL, the name in Host/SNI). Passing
+// "name:port" around as one string put the port into the ws "host=" parameter
+// and into the SNI, which is not a valid hostname.
+std::string host_from_request(const std::string& host_header);
+
+// Port that came with the request Host header, or 0 when it carried none.
+int port_from_request(const std::string& host_header);
+
 bool is_domain(const std::string& address);
 bool is_ipv4(const std::string& address);
 bool is_ipv6(const std::string& address);

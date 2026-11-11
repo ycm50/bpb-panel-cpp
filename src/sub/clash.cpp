@@ -654,6 +654,10 @@ bool build_clash_custom(const json& s, std::string& out_json, std::string& error
     if (!custom_domain.empty()) domains.push_back(custom_domain);
     // Direct mode: one address, one port (see sub/common.h access model).
     if (access_mode_direct(s)) domains.assign(1, direct_host(s));
+    // The response's own address wins: the request knows the name the outside
+    // world used, the stored value is only a guess (see host_from_request).
+    const std::string requested = s.value("requestHost", std::string());
+    if (!requested.empty()) domains.assign(1, requested);
 
     auto protocols = get_protocols(s);
     const std::vector<std::string> transports = get_transports(s);

@@ -227,6 +227,32 @@ int main(int argc, char** argv) {
     // hard-coded port whitelist), which is how a --tls-cert-less listener ended
     // up advertising security=tls.
     store.set_listen_facts(host, port, !tls_cert.empty() && !tls_key.empty());
+    // A panel with no credential is an open node: the subscription URL is the
+    // whole secret, so anyone who learns the domain gets the account. Provision
+    // one before the listener opens, and print it exactly once -- there is no
+    // other moment where a generated password can reach the operator.
+    {
+        std::string generated;
+        std::string pwd_error;
+        if (!bpb::app::passwd::ensure_credential(store.dir(), store.config().accEmail, generated,
+                                                 pwd_error)) {
+            std::fprintf(stderr,
+                         "cannot provision a panel password (%s); refusing to serve an "
+                         "unauthenticated panel\n", pwd_error.c_str());
+            return 1;
+        }
+        if (!generated.empty()) {
+            // Straight to stdout on purpose: this is the only copy the operator
+            // will ever see, so it must not depend on --log being raised.
+            std::printf("\n");
+            std::printf("  panel password : %s\n", generated.c_str());
+            std::printf("  (generated once; change it with: bpb --passwd <new-password>)\n");
+            std::printf("  subscription URLs end with &passwd=<the same value>\n");
+            std::printf("\n");
+            std::fflush(stdout);
+            bpb::log::info("panel password generated for a fresh install");
+        }
+    }
     if (!store.save(error)) {
         std::fprintf(stderr, "settings save failed: %s\n", error.c_str());
         return 1;

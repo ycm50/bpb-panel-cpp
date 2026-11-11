@@ -2629,10 +2629,20 @@ async function fetchIPInfo() {
     stopWaiting(icons);
 }
 
+// The panel password is part of the subscription URL: /sub/* is never
+// anonymous. The literal placeholder is shown so the operator can paste their own
+// value in; the panel does not know the password (only its hash is on disk).
+const PASSWD_PLACEHOLDER = '{passwd}';
+
 function generateSubUrl(type, core, tag) {
     const url = new URL(`./sub/${type}`, window.location.href);
     url.searchParams.append('app', core);
     url.hash = `💦 BPB ${tag}`;
+    // Appended by hand, not through searchParams: that would percent-encode the
+    // braces and the operator would be looking at "passwd=%7Bpasswd%7D", which is
+    // not the thing they are being asked to replace. Braces are legal in a query
+    // string in practice and every client passes them through verbatim.
+    url.search += (url.search ? '&' : '?') + 'passwd=' + PASSWD_PLACEHOLDER;
 
     // '&&', not the original single '&': bitwise AND only produced the right
     // answer because type is never the empty string.
@@ -3732,6 +3742,16 @@ function renderSubscriptions(subscriptions) {
         const header = elm('h3', { textContent: label });
         const summary = elm('summary', {}, header);
         const section = elm('details', {}, summary);
+        // Every URL in this table ends with passwd={passwd}: the subscription is
+        // not readable without the panel password, and the panel only stores its
+        // hash -- so the placeholder is the honest form. Say so once, above the
+        // table, instead of leaving the operator to discover it from a 401.
+        section.appendChild(elm('p', {
+            className: 'field-hint',
+            innerHTML: '订阅链接里的 <code>passwd={passwd}</code> 需替换为你在命令行设置的' +
+                '面板密码（<code>bpb --passwd &lt;密码&gt;</code> 设置的那个）。' +
+                '未设置过时，首次启动会在终端打印一次性随机密码。'
+        }));
         const table = elm('table', {}, categories.map(({ core, clients }) => {
             const clientSection = elm('td', {}, clients.map(client => {
                 const icon = createIcon('verified');

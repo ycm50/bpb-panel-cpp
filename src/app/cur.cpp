@@ -91,9 +91,10 @@ void describe(Instance& inst) {
 
     const std::string quick = read_file(inst.data_dir + "/tunnel-quick.json");
     const std::string quick_host = json_string(quick, "hostname");
+    const bool quick_verified = json_bool(quick, "usable");
     if (!quick_host.empty()) {
         inst.domain = quick_host;
-        inst.source = "quick tunnel";
+        inst.source = quick_verified ? "quick tunnel" : "quick tunnel (not yet published)";
     } else if (!main_domain.empty() && main_domain != "localhost") {
         inst.domain = main_domain;
         inst.source = "mainDomain";

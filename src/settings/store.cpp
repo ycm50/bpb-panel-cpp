@@ -292,6 +292,12 @@ void Store::apply_relay_budget() {
 bool Store::save(std::string& error) {
     set_transport_switches(kv_.value("enableXHTTP", false), kv_.value("enableGRPC", false));
     apply_relay_budget();
+    // "requestHost" is a per-request fact the subscription handler parks in the
+    // settings view so the generators can read it (see app.cpp). It must never
+    // reach disk: a value that came from one client's Host header would then
+    // outlive the request and rewrite everybody else's links.
+    kv_.erase("requestHost");
+    kv_.erase("requestPort");
     nlohmann::json j;
     j["proxySettings"] = kv_;
     j["warpAccounts"] = warps_;

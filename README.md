@@ -567,11 +567,11 @@ bpb 自己启动时不再重复喊，要看随时查面板或
 | `/<sp>/sub/share-settings` | 设置导出（base64） |
 | `/<sp>/dns-query` | DoH 反向代理 |
 | `/<sp>/qrcode?data=` | PNG 二维码（仅限同源地址） |
-| `/<sp>/panel/warp-status` | 出栈状态（后端类型、ready、账号数、是否 dry run） |
+| `/<sp>/panel/warp-status` | 出栈状态（后端类型、ready、账号数、是否 dry run、`socks=` 监听状态） |
 | `/<sp>/panel/warp-register` | 注册 WARP 账号（**默认 dry run**，返回 `saved:false` 表示未写账号池） |
 | `/<sp>/panel/tunnel-status` | 隧道状态：`running/connected/registered`、`hostname`/`url`、`hostnames`（ingress 全部主机名）、`mainDomain`（订阅当前域名） |
 | `/<sp>/panel/tunnel-wake` / `tunnel-sleep` | 唤醒 / 休眠（都返回与 status 同构的最新状态） |
-| `/<sp>/panel/update-warp`、`/<sp>/telegram/{setup,remove,webhook}` | WARP 账号、Telegram |
+| `/<sp>/panel/update-warp` | WARP 账号 |
 | `/vl` | VLESS over WebSocket（支持 `?ed=` early data） |
 | `/tr` | Trojan over WebSocket（`hex(SHA224(uuid))` 作口令） |
 | `/ss` | Shadowsocks over WebSocket（SIP004，固定 aes-256-gcm） |
@@ -779,6 +779,32 @@ Cloudflare 侧表现为 502/530。现在：
 失效，而是**整个订阅无法导入**：`FATAL decode config: outbounds[6].tls: json: unknown field "tls"`。
 xray 和 Clash.Meta 都支持 ss over ws+tls，各有各的。
 
+### `ss://` 链接曾经全是「延迟 -1」
+
+SIP002 的 URI 只定义 `host`、`port`、`cipher`，**没有任何字段能表达 WebSocket**。
+传输方式必须写进 `plugin` 参数，而 v2rayN / sing-box 解析 ss 时只看 `plugin`，
+把 `type=`、`host=`、`path=`、`security=` 全部丢掉。之前就是这么发的，结果：
+
+- 导入看起来正常，节点名、地址、端口都对
+- 客户端按**裸 TCP Shadowsocks** 去连 `:443`
+- 服务端在等 WebSocket 升级，两边都等对方先说话
+- 所有测速一律 **延迟 -1（不可达）**
+
+现在改为 `?plugin=v2ray-plugin;mode=websocket;host=<域名>;path=<路径>[;tls];mux=0`。
+
+转义规则只有一个依据——v2rayN 自己的写法和读法：
+
+```
+写：pluginArgs += "mode=websocket;"          // key 与 value 之间的 = 不转义
+    path.Replace("=", "\=")                 // 只转义 value 内部
+读：t.StartsWith("path=")                    // 按裸 = 匹配
+    pathValue.Replace("\=", "=")            // 再还原
+```
+
+所以**只有 value 内部的 `=` 和 `,` 加反斜杠**，分隔用的 `=` 必须留裸的。
+一开始把整个 `key=value` 都转义了，生成 `mode\=websocket`，任何客户端都匹配不上
+`mode=`，症状完全相同。
+
 ## 为什么隧道下没有 XHTTP 和 gRPC
 
 这两个传输需要**开放式响应流**：XHTTP 的下行是一条永不结束的 `GET`（`text/event-stream`），
@@ -909,6 +935,21 @@ tls: failed to verify certificate: x509: cannot validate certificate for 203.88.
 - `start_wg_outbound()` 也据实报错，不再假成功。
 
 所以 `warp=off` 现在只有一个解释：账号池是空的，去点一下「续期」/「注册」。
+
+### 出栈怎么用
+
+隧道起来之后，除了入栈代理会自动把境外流量送进 WARP，还给本机留了一个
+SOCKS5 端点（`wgOutbound.bindHost` + `wgOutbound.socksPort`，默认
+`127.0.0.1:11080`）：
+
+```bash
+curl --socks5-hostname 127.0.0.1:11080 https://www.cloudflare.com/cdn-cgi/trace
+# ip=104.28.x.x  warp=on
+```
+
+只实现 `CONNECT`：隧道里只有 lwIP 的 TCP，`BIND` 与 `UDP ASSOCIATE` 一律回
+`0x07`。握手没成功时端口根本不会打开，`warp-status` 的 `socks=` 字段会说
+`stopped` —— 「配了却连不上」和「没配」必须能分开。
 ### 面板里的注册（默认 dry run）
 
 `warpRegisterDryRun` 默认 **`true`**：
@@ -965,7 +1006,15 @@ tls: failed to verify certificate: x509: cannot validate certificate for 203.88.
 > 排查顺序：先看 `/<sp>/panel/warp-status`。`session=up` 但 `tx` 狂涨、`rx` 不动
 > → 对端已丢包；`tx/rx` 大致平衡但业务不通 → 回头看第 6、7 条。
 
-9. **隧道里 `Host` 永远是回源地址**：CF edge 把公网域名放在 HTTP/2 的 `:authority`
+9. **`wgOutboundSocks` 是个空承诺**：`bindHost` / `socksPort` 从第一版就写在设置里，
+   面板把两者拼成 `wgOutboundSocks` 回显，但**从来没有任何代码监听那个端口**。
+   `warp-status` 说 `ready=true`，`curl --socks5 127.0.0.1:11080` 却是
+   `Connection refused` —— 配了却不能用，比没配更误导。
+   现在 `src/net/wg_socks.cpp` 在握手成功后才起 listeners（握手失败立刻关掉，
+   不留一个接受连接却拒绝的中转站），只实现 CONNECT：隧道里只有 lwIP 的 TCP，
+   BIND 与 UDP ASSOCIATE 回 `0x07`。吊销路径同样接上 `stop_wg_outbound()`。
+
+10. **隧道里 `Host` 永远是回源地址**：CF edge 把公网域名放在 HTTP/2 的 `:authority`
    伪头里，而回源循环的第一行就是 `if (k[0] == ':') continue`，把这个伪头一起丢了。
    源站于是只看到 `OriginStream` 从 `cfg.originHost` 补的 `Host: 127.0.0.1:8080`，
    凡是判断"我现在被谁访问"的逻辑全错 —— 最直接的表现是面板二维码在隧道模式下对
@@ -973,7 +1022,7 @@ tls: failed to verify certificate: x509: cannot validate certificate for 203.88.
    修法是**在跳过伪头之前**先把 `:authority` 还原成 `Host`，cloudflared 也是这么做的。
    顺序很关键：写在循环末尾等于没写，因为 `continue` 已经跳过了。
 
-10. **`MemoryMax` 和进程里的预算各说各话**：unit 里是常量 40M，`relayPoolBudgetMb`
+11. **`MemoryMax` 和进程里的预算各说各话**：unit 里是常量 40M，`relayPoolBudgetMb`
     却是独立的一份，两者毫无关系。100 MB 的小鸡上一波下载正好把 40M 撑满，
     systemd 直接 OOM 杀掉整个进程 —— 一次断掉**所有**会话，而不是拒绝最新的那个。
     现在上限只有一个来源：`bpb --mem-default`（默认 64）→ 安装脚本写进 unit 和

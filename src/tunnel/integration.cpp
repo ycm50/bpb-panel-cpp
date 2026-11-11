@@ -106,7 +106,13 @@ bool quick_tunnel_register(const std::string& dataDir, std::string& token,
                 // dropped produces a connector that reports "registered" while
                 // the domain answers 530 -- the exact state that made an
                 // installation look healthy and every client hang.
-                if (!cached_host.empty()) {
+                // "not resolving right now" is not the same as "dead": a name
+                // adopted a few seconds ago is still propagating. Only a name
+                // that was already marked unusable on a previous run is treated
+                // as dead, so a restart right after a registration still reuses
+                // the tunnel instead of registering yet another one.
+                if (!cached_host.empty() && j.contains("usable") &&
+                    j["usable"].is_boolean() && !j["usable"].get<bool>()) {
                     std::string probe_error;
                     if (!hostname_resolves(cached_host, probe_error)) {
                         bpb::log::error(
@@ -170,11 +176,18 @@ bool quick_tunnel_register(const std::string& dataDir, std::string& token,
     }
 
     if (!dataDir.empty()) {
-        nlohmann::json out = {{"token", token}, {"hostname", usable ? hostname : std::string()}};
-        if (!out["hostname"].get<std::string>().empty()) {
-            // Recorded so a later start can tell a fresh cache from a stale one.
-            out["updated_at"] = static_cast<std::int64_t>(std::time(nullptr));
-        }
+        // The hostname is recorded even when it does not resolve yet.
+        //
+        // Withholding it meant the cache was useless for the one thing it is
+        // read for: 'bpb --cur' falls back to this file, so during the 1-2 minute
+        // window in which a brand-new quick tunnel name is still NXDOMAIN it
+        // reported no domain at all, while the process was already serving that
+        // name. `usable` is stored next to it so a reader can tell "registered,
+        // not yet propagated" from "confirmed".
+        nlohmann::json out = {{"token", token},
+                              {"hostname", hostname},
+                              {"usable", usable},
+                              {"updated_at", static_cast<std::int64_t>(std::time(nullptr))}};
         std::ofstream f(dataDir + "/tunnel-quick.json", std::ios::trunc);
         if (f) f << out.dump(2);
     }
@@ -330,34 +343,23 @@ bool start_from_store(Store& store, bool& started, std::string& error) {
             std::string probe_error;
             // Retry, do not judge on the first look: a name the API just handed
             // out is regularly NXDOMAIN for a minute or two and perfectly good
-            // after that (measured). 5 tries x 3 s covers the observed gap
-            // without holding the panel's save request for long.
+            // after that (measured). 5 tries x 3 s covers most of the gap.
+            //
+            // A name that is STILL not resolving is adopted anyway.
+            //
+            // This used to be a hard gate: the fresh name was discarded and the
+            // previous domain kept. That is how 'bpb --res' ended up publishing a
+            // dead tunnel domain for the whole 15 s probe window -- and, when the
+            // previous name had already been reclaimed by the edge, forever, until
+            // the box was rebooted and a fresh registration raced past the window.
+            // The connector is already serving the new name, so the previous
+            // domain is the one that is certainly wrong; publishing the new one a
+            // minute early is strictly better than publishing the old one forever.
             if (!hostname_usable(hostname, 5, 3000, probe_error)) {
-                const std::string previous = store.config().mainDomain;
-                bpb::log::error("[cf-tunnel] refusing the unusable hostname %s (%s)",
-                                hostname.c_str(), probe_error.c_str());
-                if (!previous.empty() && previous != "localhost" &&
-                    previous != hostname) {
-                    std::string prev_error;
-                    if (hostname_usable(previous, 2, 1000, prev_error)) {
-                        bpb::log::warn("[cf-tunnel] keeping the previous domain %s instead",
-                                       previous.c_str());
-                        hostname = previous;
-                    } else {
-                        bpb::log::error("[cf-tunnel] previous domain %s is also dead (%s); "
-                                        "publishing no domain",
-                                        previous.c_str(), prev_error.c_str());
-                        hostname.clear();
-                    }
-                } else {
-                    bpb::log::error(
-                        "[cf-tunnel] NO USABLE PUBLIC DOMAIN: the registration produced no "
-                        "resolvable hostname. Subscriptions keep publishing \"%s\", which "
-                        "clients cannot reach. Re-register with the panel's 唤醒 button, or "
-                        "switch to a named tunnel (cfTunnel.token) for a stable domain.",
-                        previous.c_str());
-                    hostname.clear();
-                }
+                bpb::log::warn(
+                    "[cf-tunnel] %s is not published yet (%s); adopting it anyway -- the "
+                    "connector is already serving this name and the previous domain is dead",
+                    hostname.c_str(), probe_error.c_str());
             }
         }
         quick = true;

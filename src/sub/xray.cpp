@@ -1060,6 +1060,10 @@ bool build_xray_custom(const json& s, bool is_fragment, std::string& out_json, s
     // not a second entrance, it is the name of that same entrance.
     const bool is_direct = access_mode_direct(s);
     if (is_direct) domains.assign(1, direct_host(s));
+    // The response's own address wins: the request knows the name the outside
+    // world used, the stored value is only a guess (see host_from_request).
+    const std::string requested = s.value("requestHost", std::string());
+    if (!requested.empty()) domains.assign(1, requested);
 
     auto protocols = get_protocols(s);
     // Websocket plus whichever extra transports the panel switches turned on.

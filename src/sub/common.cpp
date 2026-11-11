@@ -178,8 +178,91 @@ std::string direct_host(const nlohmann::json& s) {
     return host;
 }
 
+namespace {
+
+bool is_loopback_host(const std::string& h) {
+    return h == "localhost" || h.rfind("127.", 0) == 0 || h == "::1" || h == "[::1]";
+}
+
+// RFC1918 + the other ranges that never reach a client from outside.
+bool is_private_ipv4(const std::string& h) {
+    if (!is_ipv4(h)) return false;
+    const auto parts = split(h, '.');
+    const int a = std::atoi(parts[0].c_str());
+    const int b = std::atoi(parts[1].c_str());
+    if (a == 10) return true;
+    if (a == 192 && b == 168) return true;
+    if (a == 172 && b >= 16 && b <= 31) return true;
+    if (a == 169 && b == 254) return true;
+    if (a == 0 || a >= 224) return true;
+    return false;
+}
+
+} // namespace
+
+namespace {
+
+// Splits "name", "name:port" or "[v6]:port". A bare IPv6 literal has several
+// colons, so only an all-numeric tail after the last colon counts as a port.
+void split_host_header(const std::string& host_header, std::string& name, int& port) {
+    name = trim(host_header);
+    port = 0;
+    if (name.empty()) return;
+    const auto colon = name.rfind(':');
+    if (colon != std::string::npos) {
+        const std::string tail = name.substr(colon + 1);
+        if (!tail.empty() && tail.size() <= 5 &&
+            tail.find_first_not_of("0123456789") == std::string::npos) {
+            const int parsed = std::atoi(tail.c_str());
+            if (parsed > 0 && parsed <= 65535) {
+                name = name.substr(0, colon);
+                port = parsed;
+            }
+        }
+    }
+    if (!name.empty() && name.front() == '[' && name.back() == ']')
+        name = name.substr(1, name.size() - 2);
+    name = trim(name);
+}
+
+} // namespace
+
+std::string host_from_request(const std::string& host_header) {
+    std::string name;
+    int port = 0;
+    split_host_header(host_header, name, port);
+    (void)port;
+    if (name.empty()) return {};
+    // Anything only this machine can use is not a published address: publishing
+    // it would produce links that work for exactly one host.
+    if (is_loopback_host(name)) return {};
+    if (is_ipv4(name) && is_private_ipv4(name)) return {};
+    return name;
+}
+
+int port_from_request(const std::string& host_header) {
+    std::string name;
+    int port = 0;
+    split_host_header(host_header, name, port);
+    if (name.empty()) return 0;
+    if (is_loopback_host(name)) return 0;
+    if (is_ipv4(name) && is_private_ipv4(name)) return 0;
+    return port;
+}
+
 std::vector<int> effective_ports(const nlohmann::json& s, const std::string& domain) {
     std::vector<int> out;
+    // The port the client used to fetch this subscription beats every stored
+    // guess: behind a port mapping the bind port is not the public one, and the
+    // request is the only thing that knows. Direct mode only -- with a tunnel
+    // the port is always 443 and the request may have arrived on 80.
+    if (access_mode_direct(s) && s.contains("requestPort") && s["requestPort"].is_number_integer()) {
+        const int requested = s["requestPort"].get<int>();
+        if (requested > 0 && requested <= 65535) {
+            out.push_back(requested);
+            return out;
+        }
+    }
     if (access_mode_direct(s)) {
         // Exactly one truth: the port this process bound. Anything else is a
         // port nothing is listening on, which is what made direct mode look
@@ -436,7 +519,15 @@ std::vector<std::string> get_config_addresses(const nlohmann::json& s, const std
     // there is no edge, so those entries are third-party hosts that can never
     // reach this server -- publishing them produced nodes that look fine in an
     // import and always time out. Exactly one address is real here.
-    if (access_mode_direct(s)) return {direct_host(s)};
+    //
+    // That address is `domain`, not direct_host(): every caller has already
+    // resolved the precedence (request host > stored value) into this argument,
+    // and reading the store again here silently discarded the request host --
+    // the name the client actually dialled -- in favour of a stale stored one.
+    if (access_mode_direct(s)) {
+        if (!domain.empty() && domain != "localhost") return {domain};
+        return {direct_host(s)};
+    }
 
     bool enable_ipv6 = s.value("enableIPv6", false);
     auto clean_ips = to_string_list(s, "cleanIPs");

@@ -73,24 +73,46 @@ bool App::write_file(const std::string& path, const std::string& data) {
     return static_cast<bool>(f);
 }
 
-// Extracts the panel into <data>/assets on first run.
+// Extracts the panel into <data>/assets on first run, and refreshes it when the
+// binary carries a different copy.
 //
 // The pages are compiled into the binary so a lone executable still works, but
 // keeping them *only* in there meant every CSS or icon tweak needed a rebuild
-// and a redeploy. Writing them out once gives the same single-file start while
-// making the deployed copy editable; existing files are never overwritten, so
-// local edits survive upgrades.
+// and a redeploy. Writing them out gives the same single-file start while making
+// the deployed copy editable.
+//
+// "Never overwrite" was the original rule, to protect local edits. It also meant
+// a deployed panel silently kept serving the previous release's JavaScript after
+// an upgrade: the file existed, so nothing was written, and a feature added to
+// the embedded page (a new query parameter, a changed request shape) simply did
+// not appear on any installed box while working perfectly in a fresh data
+// directory. Refresh whenever the content differs, and keep the local edit as
+// <name>.bak rather than losing it.
 bool App::extract_assets(const std::string& dir, std::string& error) {
     static const char* kPages[] = {"panel", "login", "error"};
     bool wroteAny = false;
     for (const char* page : kPages) {
         const std::string path = dir + "/" + page + "/index.html";
-        std::error_code ec;
-        if (std::filesystem::exists(path, ec)) continue;
         std::size_t len = 0;
         const char* data = assets::page(page, len);
         if (!data || len == 0) continue;
-        if (!write_file(path, std::string(data, len))) {
+        const std::string embedded(data, len);
+        const std::string existing = read_text(path);
+        if (existing == embedded) continue;
+        if (!existing.empty()) {
+            // Somebody may have tailored this copy. Keep it next to the file
+            // instead of discarding it -- an upgrade that silently reverted the
+            // operator's own CSS would be worse than the stale-page bug this
+            // refresh exists to fix.
+            if (!write_file(path + ".bak", existing)) {
+                bpb::log::warn("[assets] keeping the local %s; cannot write the backup copy",
+                               path.c_str());
+                continue;
+            }
+            bpb::log::info("[assets] %s differs from the embedded copy; the local one is now "
+                           "%s.bak", path.c_str(), path.c_str());
+        }
+        if (!write_file(path, embedded)) {
             // A read-only data directory must not be fatal: the embedded copy
             // is still served, only local editing is unavailable.
             bpb::log::warn("[assets] could not write %s, serving the embedded copy",
@@ -780,6 +802,8 @@ http::Response App::update_settings(const http::Request& req) {
 
 http::Response App::reset_settings() {
     store_.kv() = Store::default_kv();
+    store_.kv().erase("requestHost");
+    store_.kv().erase("requestPort");
     std::string error;
     if (!store_.save(error)) return json_err(500, error);
     return json_ok(store_.merged());
@@ -1152,9 +1176,47 @@ http::Response App::handle(const http::Request& req) {
         // for http://<public-host>:<public-port>/<sp>/sub/... -- so when no
         // public address was configured by hand, adopt it for this request.
         adopt_request_host(store_, req);
-        std::string kind = path.substr((sp + "/sub/").size());
+        // A subscription is never anonymous: the URL carries the panel password
+        // as its last query parameter. Without this every node on the box is
+        // public to whoever learns the domain, which is the whole reason the
+        // panel has a password at all.
         auto params = req.params();
+        {
+            const std::string supplied = params.count("passwd") ? params["passwd"] : std::string();
+            if (supplied.empty()) {
+                return http::Response::text(401,
+                    "subscription requires the panel password: append &passwd=<password>\n");
+            }
+            if (store_.has_pwd() && !app::passwd::verify_password(store_.dir(), supplied)) {
+                return http::Response::text(401, "subscription password is wrong\n");
+            }
+        }
+        std::string kind = path.substr((sp + "/sub/").size());
         std::string client = params.count("app") ? params["app"] : std::string();
+        // Hand the generators the address this very request used. Stored in the
+        // settings view rather than a separate argument so every builder (raw,
+        // xray, sing-box, clash, warp) sees it without threading a parameter
+        // through six signatures.
+        {
+            const std::string host_header = req.header("host");
+            const std::string requested = sub::host_from_request(host_header);
+            const int requested_port = sub::port_from_request(host_header);
+            if (!requested.empty()) store_.kv()["requestHost"] = requested;
+            else store_.kv().erase("requestHost");
+            if (!requested.empty() && requested_port > 0)
+                store_.kv()["requestPort"] = requested_port;
+            else store_.kv().erase("requestPort");
+        }
+        // "requestHost" is a per-request fact smuggled through the settings view so
+        // every generator sees it without a new parameter on six signatures. It
+        // must never be persisted, so the next save() strips it.
+        struct RequestHostGuard {
+            bpb::Store& s;
+            ~RequestHostGuard() {
+                s.kv().erase("requestHost");
+                s.kv().erase("requestPort");
+            }
+        } request_host_guard{store_};
 
         if (kind == "share-settings") {
             nlohmann::json shared = store_.kv();

@@ -1,6 +1,8 @@
 #include "net/wg_outbound.h"
 
+#include "net/wg_socks.h"
 #include "net/wg_stack.h"
+#include "util/log.h"
 #include "util/util.h"
 
 #include <chrono>
@@ -39,6 +41,7 @@ bool start_wg_outbound(Store& store, std::string& error) {
     // endpoint or the reserved bytes, and reusing the running netif/socket
     // would keep serving the stale session.
     if (WgStack::instance().running()) WgStack::instance().stop();
+    stop_wg_socks();
     const auto& kv = store.kv();
 
     bool enabled = false;
@@ -120,13 +123,42 @@ bool start_wg_outbound(Store& store, std::string& error) {
     // initiation to the socket used to mean "enabled" was printed even when the
     // handshake never completed, so a dead tunnel looked healthy while every
     // connection quietly used a direct socket.
+    bool up = false;
     for (int waited = 0; waited < 6000; waited += 100) {
-        if (stack.ready()) return true;
+        if (stack.ready()) {
+            up = true;
+            break;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    error = "wireguard handshake did not complete within 6s "
-            "(endpoint unreachable, or the stored WARP account is no longer valid)";
-    return false;
+    if (!up) {
+        // A failed handshake tears the listener down as well, otherwise the
+        // SOCKS port keeps accepting and answering 0x01/0x05 -- a dead endpoint
+        // that looks alive from the outside.
+        stop_wg_socks();
+        error = "wireguard handshake did not complete within 6s "
+                "(endpoint unreachable, or the stored WARP account is no longer valid)";
+        return false;
+    }
+
+    // Publish the tunnel as a local SOCKS5 endpoint.
+    //
+    // bindHost/socksPort have been in the settings document (and echoed back as
+    // "wgOutboundSocks") since the beginning with nothing behind them, so the
+    // documented way to use the outbound by hand was a connection refused while
+    // the status page said ready. A listener that cannot be opened is reported
+    // but does not fail the start: the inbound proxies reach the tunnel through
+    // wg_outbound_ready() and are unaffected.
+    const std::string bind_host =
+        kv["wgOutbound"].value("bindHost", std::string("127.0.0.1"));
+    const int socks_port = kv["wgOutbound"].value("socksPort", 11080);
+    std::string socks_error;
+    if (start_wg_socks(bind_host, socks_port, socks_error)) {
+        bpb::log::info("wireguard outbound socks: %s", wg_socks_status().c_str());
+    } else {
+        bpb::log::warn("wireguard outbound socks not started: %s", socks_error.c_str());
+    }
+    return true;
 }
 
 bool apply_wg_outbound(Store& store, std::string& error) {
@@ -151,13 +183,22 @@ bool wg_outbound_ready() {
 
 void stop_wg_outbound() {
     std::lock_guard<std::mutex> lk(g_wg_mutex);
+    // Let go of the listener before the stack goes away: a SOCKS connection that
+    // is mid-relay would otherwise call into a stopped lwIP and crash.
+    stop_wg_socks();
     WgStack::instance().stop();
 }
 
 std::string wg_outbound_status() {
     auto& stack = WgStack::instance();
-    if (!stack.running()) return "stopped";
-    return stack.describe();
+    // The socks listener is what an operator can actually reach, so its state is
+    // reported even when the tunnel is down: "stack never started, port closed"
+    // and "stack running, port failed to bind" are different answers, and a
+    // status line that silently omits the field for the first case makes the
+    // second one impossible to spot.
+    const std::string socks = " socks=" + wg_socks_status();
+    if (!stack.running()) return "stopped" + socks;
+    return stack.describe() + socks;
 }
 
 } // namespace bpb::net

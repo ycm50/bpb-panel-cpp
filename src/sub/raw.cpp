@@ -126,21 +126,57 @@ static std::string shadowsocks_link(const std::string& address, int port, const 
     // Same reason as trojan above: the Shadowsocks inbound has no early-data
     // support, so an ed= in the path breaks the handshake.
     std::string path = generate_ws_path("shadowsocks", password);
-    std::vector<std::string> params;
-    params.push_back("type=ws");
-    params.push_back("host=" + url_encode(sni_host.host));
-    params.push_back("path=" + url_encode(path));
-    params.push_back("security=" + std::string(is_tls ? "tls" : "none"));
-    if (is_tls) {
-        params.push_back("sni=" + url_encode(sni_host.sni));
-        params.push_back("fp=" + url_encode(fingerprint));
-        params.push_back("alpn=http%2F1.1");
-        // Same self-signed reason as trojan above.
-        if (!cert_pin.empty()) params.push_back("pcs=" + url_encode(cert_pin));
-    }
-    std::string url = "ss://" + userinfo + "@" + address + ":" + std::to_string(port) + "?" +
-                      join(params, "&");
-    url += "#" + encode_fragment(remark);
+
+    // A Shadowsocks URI has no way to say "WebSocket" by itself. SIP002 only
+    // defines host, port and cipher in the URI; the transport travels in a
+    // "plugin" parameter, and v2rayN/sing-box both drop type=/host=/path=/
+    // security= on the floor for ss:// -- they read only "plugin". Publishing
+    // those four keys produced a node that imported cleanly and then dialled
+    // raw TCP at :443, which is a Shadowsocks-over-TLS handshake against a plain
+    // WebSocket listener: every probe reported "latency -1".
+    //
+    // The plugin name the ecosystem settled on is v2ray-plugin, whose option
+    // string is what the client passes to its own websocket transport.
+    //
+    // The pin cannot travel here: v2ray-plugin's option for a certificate is
+    // certRaw=<base64 DER>, and a SHA-256 fingerprint is not a certificate. So
+    // ss:// is only correct on a tunnel, where the edge presents a publicly
+    // trusted certificate and no pin is needed (the pin only exists for the
+    // self-signed direct listener). Callers get an empty string in that case so
+    // the protocol is simply omitted instead of published as a dead node.
+    if (!cert_pin.empty()) return {};
+
+    // Escaping rule, taken from v2rayN's own writer and reader, which is the
+    // implementation every client here has to agree with:
+    //
+    //     pluginArgs += "mode=websocket;";        // key=value separator is BARE
+    //     var path = path.Replace("=", "\\=")... // only the VALUE is escaped
+    //     var pathValue = path.Replace("path=", "");        // reader
+    //     pathValue.Replace("\\=", "=")...                  // reader unescapes
+    //
+    // So '=' and ',' inside a value get a backslash, and the key/value '=' that
+    // introduces the value does not. Escaping the whole "key=value" would emit
+    // "mode\\=websocket", which no reader matches against "mode=".
+    std::string plugin_opts;
+    auto push = [&](const std::string& key, const std::string& value) {
+        if (!plugin_opts.empty()) plugin_opts += ';';
+        plugin_opts += key;
+        plugin_opts += '=';
+        for (char c : value) {
+            if (c == '=' || c == ',' || c == '\\') plugin_opts += '\\';
+            plugin_opts += c;
+        }
+    };
+    push("mode", "websocket");
+    push("host", sni_host.host);
+    push("path", path);
+    if (is_tls) plugin_opts += ";tls";
+    plugin_opts += ";mux=0";
+    (void)fingerprint;
+
+    std::string url = "ss://" + userinfo + "@" + address + ":" + std::to_string(port) +
+                      "?plugin=" + url_encode("v2ray-plugin;" + plugin_opts) + "#" +
+                      encode_fragment(remark);
     return url;
 }
 
@@ -196,9 +232,13 @@ SubResult build_raw_configs(const nlohmann::json& s, const std::string& client) 
 
     // Direct mode dials the address the panel advertises, not the edge hostname
     // mainDomain may still be holding from a previous tunnel session.
+    // The response's own address wins: the request knows the name the outside
+    // world used, the stored value is only a guess (see host_from_request).
+    const std::string requested = s.value("requestHost", std::string());
     std::vector<std::string> domains{main_domain};
     if (!custom_domain.empty()) domains.push_back(custom_domain);
     if (access_mode_direct(s)) domains.assign(1, direct_host(s));
+    if (!requested.empty()) domains.assign(1, requested);
 
     auto protocols = get_protocols(s);
     // A raw line is handed to whatever client the caller names, so the transport
@@ -273,9 +313,12 @@ SubResult build_raw_configs(const nlohmann::json& s, const std::string& client) 
                         continue;
                     }
                     if (proto == "shadowsocks") {
-                        vl_confs += shadowsocks_link(addr, port, sni_host, remark, is_tls, vl_uuid,
-                                                     fingerprint, pin) +
-                                    "\n";
+                        // Empty means "this node cannot be expressed", not
+                        // "emit a blank line": a subscription with a stray
+                        // newline imports as a broken entry.
+                        const std::string link = shadowsocks_link(
+                            addr, port, sni_host, remark, is_tls, vl_uuid, fingerprint, pin);
+                        if (!link.empty()) vl_confs += link + "\n";
                         continue;
                     }
                     // XHTTP/gRPC are transports on VLESS and are emitted below by

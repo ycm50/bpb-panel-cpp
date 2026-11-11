@@ -133,6 +133,26 @@ bool verify(const std::string& data_dir, const std::string& user, const std::str
     return crypto::constant_time_equals(hash_password(entry.salt, password), entry.hash);
 }
 
+bool verify_password(const std::string& data_dir, const std::string& password) {
+    Entry entry;
+    if (!load(data_dir, entry)) return false;
+    return crypto::constant_time_equals(hash_password(entry.salt, password), entry.hash);
+}
+
+bool ensure_credential(const std::string& data_dir, const std::string& user,
+                       std::string& generated, std::string& error) {
+    generated.clear();
+    Entry entry;
+    if (load(data_dir, entry)) return true;  // already provisioned; never rotate
+
+    // 24 hex chars = 96 bits. Long enough that guessing is hopeless, short
+    // enough to type from 'bpb --cur'-style output on a phone.
+    const std::string password = crypto::random_hex(12);
+    if (!save(data_dir, user.empty() ? "admin" : user, password, error)) return false;
+    generated = password;
+    return true;
+}
+
 int run_cli(const std::string& data_dir, int port, const std::vector<std::string>& args,
             bool check_only) {
     const std::string path = path_for(data_dir);

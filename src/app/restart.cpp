@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <fstream>
+#include <sstream>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -214,9 +216,90 @@ void print_command(const ProcInfo& info) {
     if (!info.cwd.empty()) std::printf("  cwd    : %s\n", info.cwd.c_str());
 }
 
+std::string read_text_file(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) return {};
+    std::stringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+// Crude but sufficient for the two flat files this file reads (config.json and
+// tunnel-quick.json): the first "key": "value" occurrence.
+std::string json_field(const std::string& body, const char* key) {
+    if (body.empty()) return {};
+    const std::string needle = std::string("\"") + key + "\"";
+    auto at = body.find(needle);
+    if (at == std::string::npos) return {};
+    at = body.find(':', at + needle.size());
+    if (at == std::string::npos) return {};
+    at = body.find('"', at);
+    if (at == std::string::npos) return {};
+    const auto end = body.find('"', at + 1);
+    if (end == std::string::npos) return {};
+    return body.substr(at + 1, end - at - 1);
+}
+
+// Prints the public domain the restarted instance ended up with.
+//
+// `bpb --res` used to return the moment systemctl did, which is before the new
+// process has registered a quick tunnel -- for the next 10-15 s both `--cur` and
+// every subscription still named the old (already reclaimed) domain. Waiting here
+// makes the command mean what it looks like: "restarted, and this is the address
+// it now serves".
+//
+// Bounded and best-effort: a named tunnel can take longer than a quick one, and a
+// box with no tunnel at all must not hang. On timeout the last known value is
+// printed, which is still more useful than silence.
+std::string data_dir_of(const ProcInfo& info) {
+    for (std::size_t i = 1; i + 1 < info.argv.size(); ++i) {
+        if (info.argv[i] == "--data") return info.argv[i + 1];
+    }
+    return {};
+}
+
+void wait_for_domain(const ProcInfo& info, const std::string& previous) {
+    const std::string data_dir = data_dir_of(info);
+    if (data_dir.empty()) return;
+
+    constexpr int kTries = 60;  // 60 x 500 ms = 30 s
+    std::string last;
+    for (int attempt = 0; attempt < kTries; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        const std::string domain = json_field(read_text_file(data_dir + "/config.json"), "mainDomain");
+        if (domain.empty() || domain == "localhost") continue;
+        last = domain;
+        // "Done" means a name this run actually settled on, not merely "a domain
+        // is configured": before the new process registers, config.json still
+        // holds the PREVIOUS domain, and printing that is exactly the stale value
+        // this wait exists to eliminate. For a quick tunnel the fresh name also
+        // lands in tunnel-quick.json, so agreement between the two is the signal.
+        const std::string quick_host =
+            json_field(read_text_file(data_dir + "/tunnel-quick.json"), "hostname");
+        const bool fresh = (domain != previous) ||
+                           (!quick_host.empty() && quick_host == domain) ||
+                           (previous.empty() && !domain.empty());
+        if (fresh) {
+            std::printf("  public domain: %s\n", domain.c_str());
+            std::fflush(stdout);
+            return;
+        }
+    }
+    if (!last.empty() && last != previous) {
+        std::printf("  public domain: %s (still settling)\n", last.c_str());
+    } else {
+        std::printf("  (no new public domain after 30 s; check: bpb --cur)\n");
+    }
+    std::fflush(stdout);
+}
+
 int restart_one(const ProcInfo& info) {
     print_command(info);
 
+    // Captured before the restart so the wait below can tell the new domain from
+    // the one that was already configured (see wait_for_domain).
+    const std::string previous_domain =
+        json_field(read_text_file(data_dir_of(info) + "/config.json"), "mainDomain");
     const std::string unit = unit_from_cgroup(info.cgroup);
     if (!unit.empty() && unit_exists(unit)) {
         // Owned by systemd: restart the unit. Killing the pid and hoping the
@@ -230,6 +313,7 @@ int restart_one(const ProcInfo& info) {
             std::fprintf(stderr, "error: systemctl restart %s failed (exit %d)\n", unit.c_str(), rc);
             return 1;
         }
+        wait_for_domain(info, previous_domain);
         return 0;
     }
     if (!unit.empty()) {
@@ -295,6 +379,7 @@ int restart_one(const ProcInfo& info) {
         return 1;
     }
     std::printf("  started pid %d with the same arguments\n", static_cast<int>(pid));
+    wait_for_domain(info, previous_domain);
     return 0;
 }
 
