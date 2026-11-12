@@ -59,6 +59,7 @@ jobs:
       linux_matrix: ${{ steps.list.outputs.linux_matrix }}
       combined: ${{ steps.list.outputs.combined }}
       linux_matrix_all: ${{ steps.list.outputs.linux_matrix_all }}
+      src_hash: ${{ steps.list.outputs.src_hash }}
     steps:
       - uses: actions/checkout@v4
       - id: list
@@ -112,6 +113,18 @@ jobs:
             done
           done
           echo "linux_matrix=[$combos]" >> "$GITHUB_OUTPUT"
+
+          # 源码指纹：只对被编译的东西取哈希，不用 github.sha。
+          #
+          # key 里放 sha 意味着"每 commit 必冷启动"，而 ccache/sccache 本来就是按
+          # 内容寻址的，多出来的 sha 不提供任何正确性。改 README、改 workflow、
+          # 改 assets 都不该让 42 个 cell 重新编译。
+          # 取哈希的内容 = 真正参与编译的目录 + 构建脚本；排序后再算，避免
+          # git ls-tree 的顺序在不同版本间变化带来无谓的失效。
+          src_hash="$( { git ls-tree -r HEAD -- src third_party CMakeLists.txt cmake 2>/dev/null || true; } \
+                       | LC_ALL=C sort | sha256sum | cut -c1-16)"
+          echo "src_hash=$src_hash" >> "$GITHUB_OUTPUT"
+          echo "source fingerprint: $src_hash"
           echo "building: $list"
 
   # --- 并行度：不要给 cmake --build 传 -j -------------------------------------
@@ -161,10 +174,25 @@ jobs:
           # the best match, then any protocol of this architecture (measured
           # 64.8% hits when switching protocols, because most translation units
           # do not use the per-protocol BPB_HAVE_* macros at all), then nothing.
-          key: ccache-linux-${{ matrix.arch }}-${{ matrix.protocol }}-${{ github.sha }}
+          #
+          # Two details that cost real hit rate if you "clean them up":
+          #
+          # 1. The "--" around the protocol. restore-keys are PREFIX matches, so
+          #    "ccache-linux-amd64-vless-" also matches "…-vless-xhttp-<sha>" and
+          #    "…-vless-grpc-<sha>". GitHub hands back whichever was saved most
+          #    recently, and both of those cells compile more files than plain
+          #    vless does. Measured: the vless cell restored the vless-grpc cache
+          #    in run #40 (56.9% hits) and the vless-xhttp cache in run #39
+          #    (65.8%) -- never its own. "--" cannot be crossed by "-", so
+          #    "vless--" now only ever matches vless.
+          # 2. The hash is the SOURCE fingerprint from plan, not github.sha. A
+          #    sha in the key means every commit starts cold, including commits
+          #    that only touched a README; ccache already keys on content, so the
+          #    sha adds no correctness and costs the whole matrix.
+          key: ccache-linux-${{ matrix.arch }}--${{ matrix.protocol }}--${{ needs.plan.outputs.src_hash }}
           restore-keys: |
-            ccache-linux-${{ matrix.arch }}-${{ matrix.protocol }}-
-            ccache-linux-${{ matrix.arch }}-
+            ccache-linux-${{ matrix.arch }}--${{ matrix.protocol }}--
+            ccache-linux-${{ matrix.arch }}--
 
       - name: "Build static binary (inbound: ${{ matrix.protocol }})"
         run: |
@@ -225,10 +253,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .ccache
-          key: ccache-linux-${{ matrix.arch }}-all-${{ github.sha }}
+          key: ccache-linux-${{ matrix.arch }}--all--${{ needs.plan.outputs.src_hash }}
           restore-keys: |
-            ccache-linux-${{ matrix.arch }}-all-
-            ccache-linux-${{ matrix.arch }}-
+            ccache-linux-${{ matrix.arch }}--all--
+            ccache-linux-${{ matrix.arch }}--
 
       - name: Build static binary (all inbounds)
         run: |
@@ -298,10 +326,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: C:\sccache
-          key: sccache-windows-x86_64-${{ matrix.protocol }}-${{ github.sha }}
+          # Same "--" separator as the Linux side, for the same reason: a prefix
+          # match on "vless-" also selects the vless-xhttp and vless-grpc caches,
+          # and the cell that compiled the most files wins the race. The hash is
+          # the source fingerprint, not the commit sha (see plan).
+          key: sccache-windows-x86_64--${{ matrix.protocol }}--${{ needs.plan.outputs.src_hash }}
           restore-keys: |
-            sccache-windows-x86_64-${{ matrix.protocol }}-
-            sccache-windows-x86_64-
+            sccache-windows-x86_64--${{ matrix.protocol }}--
+            sccache-windows-x86_64--
 
       - name: Configure and build
         shell: msys2 {0}
