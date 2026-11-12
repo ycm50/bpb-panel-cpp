@@ -1297,6 +1297,14 @@ table tr:not(:last-child) {
                             </div>
                         </div>
                         <div class="form-control">
+                            <span>入栈协议</span>
+                            <div>
+                                <div id="protocol-select" class="checkbox-container inner-container"></div>
+                                <small id="protocol-hint" class="field-hint">只列出这个二进制编译进去的协议；
+                                    至少选一个，否则订阅为空。</small>
+                            </div>
+                        </div>
+                        <div class="form-control">
                             <span>额外传输</span>
                             <div>
                                 <div id="extra-transports" class="checkbox-container inner-container">
@@ -2307,6 +2315,17 @@ const [
     'input[type=checkbox]'
 ].map(query => proxyForm.querySelectorAll(query));
 
+// Panel label for each inbound this build may carry. Declared up here because
+// validateSettings() (further down) and renderProtocols() both read it, and a
+// const declared next to one of them is not visible to the other at the time
+// the first call happens.
+const PROTOCOL_LABELS = {
+    vless: 'VLESS',
+    trojan: 'Trojan',
+    shadowsocks: 'Shadowsocks',
+    vmess: 'VMess'
+};
+
 // XHTTP and gRPC only work when something speaks their protocol end to end. A
 // Cloudflare Tunnel does not: the edge rewrites every request into a plain
 // HTTP/1.1 round trip, so a gRPC h2c preface never reaches the origin and an
@@ -2551,6 +2570,10 @@ function renderPanel(proxySettings, subscriptions, clients) {
         });
     });
 
+    if (typeof proxySettings.protocols === 'string') {
+        globalThis.__lastProtocols = proxySettings.protocols;
+    }
+    renderProtocols(proxySettings.protocols);
     renderPorts(ports.map(Number));
     renderNoises(xrayUdpNoises);
     renderSubscriptions(subscriptions);
@@ -3245,6 +3268,20 @@ function validateSettings() {
         form[elm.id] = formData.has(elm.id);
     });
 
+    // The protocol checkboxes are named "protocol-<id>" rather than carrying an
+    // id of their own: "protocols" is one comma-separated string on the server,
+    // not four independent booleans, and a checkbox group cannot express that.
+    // Collect them here so the payload keeps the shape update-settings expects.
+    const picked = Object.keys(PROTOCOL_LABELS).filter(id => formData.has('protocol-' + id));
+    if (picked.length) {
+        form.protocols = picked.join(',');
+    } else if (Array.isArray(globalThis.binaryInbounds) && globalThis.binaryInbounds.length) {
+        // An empty tick set produces an empty subscription. Keep the stored value
+        // rather than saving a list the generator cannot use -- same rule the
+        // port list follows two blocks up.
+        form.protocols = globalThis.__lastProtocols || 'vless';
+    }
+
     // Belt and braces: a disabled checkbox is not submitted, but a stale tab or a
     // hand-rolled request could still post both switches together with the
     // tunnel. The tunnel wins -- it is the one that actually carries traffic --
@@ -3639,6 +3676,56 @@ function addNoise(isManual, noiseIndex, udpNoise) {
 
     document.getElementById('noises').append(container);
     if (isManual) handleProxyFormChanges(true);
+}
+
+// Which inbound protocols the subscription should contain.
+//
+// The binary decides what it CAN serve (settings.inbounds comes from the
+// compile-time table); this list decides what it SHOULD serve. Without a UI for
+// it, "protocols" stayed at its default "vless" for ever, so an all-inbounds
+// binary with four working endpoints still produced vless-only subscriptions --
+// the operator had to hand-edit settings.json to get anything else.
+//
+// Only the four websocket protocols appear: vless-xhttp and vless-grpc are
+// transports on VLESS with their own switches right below, and emiting both as
+// separate checkboxes here would let one node be described twice.
+function renderProtocols(current) {
+    const box = document.getElementById('protocol-select');
+    const hint = document.getElementById('protocol-hint');
+    if (!box) return;
+    const compiled = Array.isArray(globalThis.binaryInbounds) ? globalThis.binaryInbounds : null;
+    const wanted = String(current || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+    box.innerHTML = '';
+    const ids = Object.keys(PROTOCOL_LABELS).filter(id => !compiled || compiled.includes(id));
+    if (ids.length === 0) {
+        box.textContent = '这个二进制没有编入任何 websocket 协议';
+        return;
+    }
+    const fragment = document.createDocumentFragment();
+    ids.forEach(id => {
+        const checkbox = elm('input', {
+            type: 'checkbox',
+            name: 'protocol-' + id,
+            value: 'true',
+            // A settings file that predates this control has no list at all:
+            // tick whatever the binary can serve, which is what "all" meant on
+            // the install these builds ship with.
+            checked: wanted.length ? wanted.includes(id) : true
+        });
+        const label = elm('label', { htmlFor: 'protocol-' + id, textContent: PROTOCOL_LABELS[id] });
+        fragment.appendChild(elm('div', { className: 'checkbox-wrapper' }, [checkbox, label]));
+    });
+    box.appendChild(fragment);
+    if (hint && compiled) {
+        const missing = Object.keys(PROTOCOL_LABELS).filter(id => !compiled.includes(id));
+        hint.textContent = missing.length
+            ? '此二进制未编入 ' + missing.map(i => PROTOCOL_LABELS[i]).join(' / ') +
+              '；勾选的协议只在这个范围内有效。'
+            : '只列出这个二进制编译进去的协议；至少选一个，否则订阅为空。';
+    }
 }
 
 function renderPorts(ports) {

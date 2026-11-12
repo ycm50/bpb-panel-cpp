@@ -606,9 +606,21 @@ http::Response App::update_settings(const http::Request& req) {
                 wanted += v.get<std::string>();
             }
         }
+        // vless-xhttp / vless-grpc are transports, not protocols: inbound::has()
+        // reports them, so a client that posts the whole inbound table back would
+        // store "vless,vless-xhttp" and get_protocols() would then emit the same
+        // node twice (once as plain vless, once through the transport loop).
+        // They are selected by enableXHTTP / enableGRPC instead.
         std::string kept;
-        for (const std::string& proto : split(wanted, ',')) {
+        for (const std::string& raw : split(wanted, ',')) {
+            const std::string proto = sub::base_protocol(raw);
+            if (proto == "vless-xhttp" || proto == "vless-grpc") continue;
             if (!inbound::has(proto)) continue;
+            bool duplicate = false;
+            for (const std::string& have : split(kept, ',')) {
+                if (have == proto) duplicate = true;
+            }
+            if (duplicate) continue;
             if (!kept.empty()) kept += ',';
             kept += proto;
         }
