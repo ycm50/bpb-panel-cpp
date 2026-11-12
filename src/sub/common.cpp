@@ -562,16 +562,30 @@ SniHost select_sni_host(const nlohmann::json& s, const std::string& address,
         out.sni = s.value("customCdnSni", std::string());
         out.host = s.value("customCdnHost", std::string());
         out.allow_insecure = true;
-    } else if (access_mode_direct(s)) {
-        // Direct transport: there is no Cloudflare edge in front, so the
-        // randomly-cased hostname that exists to dodge SNI blocklists only made
-        // the config look fronted and sent every bug report chasing a TLS
-        // problem that does not exist.
-        out.sni = domain;
-        out.host = domain;
-        out.allow_insecure = false;
     } else {
-        out.sni = random_upper_case(domain);
+        // Mixed case in the SNI is the whole point: TLS treats the server name
+        // case-insensitively, but a DPI box matching a literal hostname is not
+        // required to, and Cloudflare accepts the mixed form. It is re-rolled on
+        // every subscription fetch, so a blocklist that learned one spelling has
+        // to learn it again.
+        //
+        // This used to be tunnel-only. Direct mode pinned the SNI to the plain
+        // domain on the theory that a mixed-case name "looks fronted" and sends
+        // people chasing a TLS problem that does not exist -- but the same
+        // argument applies to the edge case it was already enabled for, and an
+        // operator running a self-signed listener has exactly the same reason to
+        // want the SNI not to match a literal string. It is a per-request choice
+        // now (settings.randomizeSni), defaulting on.
+        // `flag()` lives in the three format builders, not here; the panel may
+        // also hand the value over as the string "true" after a form round-trip,
+        // so accept both shapes.
+        bool randomize = true;
+        if (s.contains("randomizeSni")) {
+            const auto& v = s["randomizeSni"];
+            if (v.is_boolean()) randomize = v.get<bool>();
+            else if (v.is_string()) randomize = (v.get<std::string>() == "true");
+        }
+        out.sni = randomize ? random_upper_case(domain) : domain;
         out.host = domain;
         out.allow_insecure = false;
     }

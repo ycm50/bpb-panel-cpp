@@ -20,6 +20,7 @@ static const char* kDefaultKvJson = R"({
   "antiSanctionDNS": "178.22.122.100",
   "fakeDNS": false,
   "enableIPv6": false,
+  "randomizeSni": true,
   "allowLANConnection": false,
   "logLevel": "warning",
   "customDomain": "",

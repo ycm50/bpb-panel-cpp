@@ -1331,6 +1331,18 @@ table tr:not(:last-child) {
                             </div>
                         </div>
                         <div class="form-control">
+                            <label for="randomizeSni">SNI 随机大小写</label>
+                            <div class="select-wrapper">
+                                <select id="randomizeSni" name="randomizeSni">
+                                    <option value="true">启用</option>
+                                    <option value="false">禁用</option>
+                                </select>
+                            </div>
+                            <small class="field-hint">每次拉取订阅都重新随机化 SNI 的大小写，
+                                同一份订阅里每个节点各一套。TLS 按规范忽略大小写，
+                                按字面串匹配的 DPI 规则则必须重新学习。</small>
+                        </div>
+                        <div class="form-control">
                             <label for="allowLANConnection">允许局域网连接</label>
                             <div class="select-wrapper">
                                 <select id="allowLANConnection" name="allowLANConnection">

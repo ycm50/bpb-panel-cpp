@@ -276,7 +276,6 @@ SubResult build_raw_configs(const nlohmann::json& s, const std::string& client) 
 
         for (int port : total_ports) {
             for (auto& addr : addrs) {
-                auto sni_host = select_sni_host(s, addr, domain);
                 bool port_is_upstream = (port == upstream_port);
                 bool addr_is_upstream = (!upstream_server.empty() && addr == upstream_server);
                 if (port_is_upstream != addr_is_upstream) continue;
@@ -285,6 +284,12 @@ SubResult build_raw_configs(const nlohmann::json& s, const std::string& client) 
                               (!upstream_server.empty() && addr == upstream_server);
 
                 for (auto& proto : protocols) {
+                    // Re-rolled per NODE, not per address: the SNI is inside the
+                    // node, so two protocols (or two ports) behind the same
+                    // address must not share one spelling. Sharing it was the
+                    // reason four vless nodes from one subscription all carried
+                    // an identical SNI even with randomization on.
+                    auto sni_host = select_sni_host(s, addr, domain);
                     std::string remark =
                         generate_remark(s, proxy_index, port, addr, proto, domain, false, false);
                     // Each protocol has its own share format. The old code only
